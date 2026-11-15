@@ -1,0 +1,1219 @@
+.volis-badge {
+  position: absolute;
+  right: 8px;
+  bottom: 6px;
+  font-size: 10px;
+  line-height: 1.2;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--background-primary);
+  color: var(--text-faint);
+  opacity: 0.55;
+  pointer-events: none;
+  user-select: none;
+  z-index: 50;
+  white-space: nowrap;
+  transition: opacity 120ms ease;
+}
+
+.canvas-node:hover .volis-badge {
+  opacity: 0.95;
+  color: var(--text-muted);
+}
+
+.volis-badge.is-stale {
+  color: var(--text-error);
+  opacity: 0.9;
+}
+
+.volis-editor-modal .volis-editor-meta {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  margin-bottom: 8px;
+}
+
+.volis-editor-modal textarea.volis-editor-input {
+  width: 100%;
+  min-height: 180px;
+  resize: vertical;
+  font-family: var(--font-text);
+  font-size: var(--font-text-size);
+  line-height: var(--line-height-normal);
+}
+
+.volis-editor-modal .volis-editor-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.volis-preview {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  max-height: 240px;
+  overflow: auto;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 12px;
+  white-space: pre-wrap;
+}
+
+.volis-inline {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  background: var(--canvas-background, var(--background-primary));
+  border: none;
+  border-radius: inherit;
+  box-shadow: none;
+}
+
+.volis-inline-input,
+.volis-inline-input:focus,
+.volis-inline-input:focus-visible {  flex: 1;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  border: none !important;
+  border-radius: 0 !important;
+  outline: none !important;
+  box-shadow: none !important;
+  background: transparent !important;
+  color: var(--text-normal);
+  font-family: var(--font-text);
+  font-size: var(--font-text-size);
+  line-height: var(--line-height-normal);
+  overflow: auto;
+  resize: none;
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+/* Keep the selected look while editing: the canvas swaps the node into an
+   editing state whose border is thinner and paler than the selected one. */
+.canvas-node.volis-editing .canvas-node-container {
+  border-width: 2px !important;
+  border-color: var(--interactive-accent) !important;
+}
+
+.canvas-node.volis-editing {
+  --canvas-node-border-width: 2px;
+  --canvas-node-border-color: var(--interactive-accent);
+}
+/* ── Card board view ─────────────────────────────────── */
+
+.volis-board-host {
+  padding: 0 !important;
+  overflow: hidden;
+}
+
+.volis-board {
+  --volis-bg: #f7f6f2;
+  --volis-dot: #d9d5cc;
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background-color: var(--volis-bg);
+  background-image: radial-gradient(circle, var(--volis-dot) 1px, transparent 1px);
+  background-size: 24px 24px;
+  cursor: default;
+  touch-action: none;
+}
+
+.theme-dark .volis-board {
+  --volis-bg: #1e2023;
+  --volis-dot: #33373c;
+}
+
+.volis-board.is-panning {
+  cursor: grabbing;
+}
+
+.volis-board.is-dragging-node {
+  cursor: grabbing;
+}
+
+.volis-board.is-drop-target::after {
+  content: "";
+  position: absolute;
+  inset: 8px;
+  border: 1px dashed var(--interactive-accent);
+  border-radius: 10px;
+  pointer-events: none;
+}
+
+.volis-world {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
+  will-change: transform;
+}
+
+.volis-bnode {
+  position: absolute;
+  top: 0;
+  left: 0;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  min-height: 46px;
+  padding: 8px 10px;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.07);
+  color: var(--text-normal);
+  font-size: var(--font-text-size);
+  line-height: var(--line-height-normal);
+  z-index: 2;
+  cursor: grab;
+  user-select: none;
+}
+
+.volis-bnode:hover {
+  border-color: var(--background-modifier-border-hover);
+}
+
+.volis-bnode.is-selected {
+  border-color: var(--interactive-accent);
+  box-shadow: 0 0 0 1px var(--interactive-accent), 0 2px 10px rgba(0, 0, 0, 0.1);
+}
+
+.volis-bnode.is-file {
+  display: block;
+  padding: 0;
+  overflow: hidden;
+  border-radius: 8px;
+}
+
+.volis-bnode-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+
+.volis-bnode-body::-webkit-scrollbar {
+  width: 4px;
+}
+
+.volis-bnode-body::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.volis-bnode-body::-webkit-scrollbar-thumb {
+  border-radius: 2px;
+  background: var(--background-modifier-border);
+}
+
+.volis-bnode-body .markdown-rendered {
+  background: transparent;
+  padding: 0;
+}
+
+.volis-bnode-body p:first-child {
+  margin-top: 0;
+}
+
+.volis-bnode-body p:last-child {
+  margin-bottom: 0;
+}
+
+.volis-bnode-meta {
+  flex: 0 0 auto;
+  margin: 2px 0 -5px;
+  color: var(--text-faint);
+  font-size: 9px;
+  line-height: 1.2;
+  letter-spacing: 0.02em;
+}
+
+.volis-bnode-placeholder {
+  color: var(--text-faint);
+  font-size: 12px;
+  padding: 4px 0;
+}
+
+.volis-bnode-media {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border: none;
+  pointer-events: none;
+}
+
+.volis-bnode.is-doc {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 6px;
+  min-height: 90px;
+}
+
+.volis-bnode-doc-icon {
+  color: var(--text-faint);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+}
+
+.volis-bnode-doc-name {
+  font-size: 13px;
+  color: var(--text-normal);
+  word-break: break-all;
+}
+
+.volis-board-toolbar {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 5px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  background: var(--background-primary);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.08);
+}
+
+.volis-board-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-primary);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.volis-board-btn:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.volis-board-btn:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+.volis-board-btn:disabled:hover {
+  background: var(--background-primary);
+  color: var(--text-muted);
+}
+
+.volis-board-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+.volis-board-sep {
+  height: 1px;
+  margin: 2px 5px;
+  background: var(--background-modifier-border);
+}
+
+.volis-board-zoom {
+  position: absolute;
+  right: 14px;
+  bottom: 12px;
+  z-index: 5;
+  color: var(--text-faint);
+  font-size: 11px;
+  pointer-events: none;
+}
+
+.volis-board-hint {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 1;
+  transform: translate(-50%, -50%);
+  color: var(--text-faint);
+  font-size: 13px;
+  pointer-events: none;
+  user-select: none;
+}
+
+.volis-board-hint.is-hidden {
+  display: none;
+}
+
+/* ── Board extras ────────────────────────────────────── */
+
+.volis-select-box {
+  position: absolute;
+  z-index: 4;
+  border: 1px solid var(--interactive-accent);
+  border-radius: 2px;
+  background: rgba(120, 130, 140, 0.1);
+  pointer-events: none;
+}
+
+.volis-board.is-space {
+  cursor: grab;
+}
+
+.volis-board.is-space.is-panning {
+  cursor: grabbing;
+}
+
+.volis-board-hint {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 2;
+  transform: translate(-50%, -50%);
+  padding: 18px 26px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 12px;
+  background: var(--background-primary);
+  text-align: center;
+  pointer-events: none;
+  user-select: none;
+  box-shadow: 0 2px 14px rgba(0, 0, 0, 0.06);
+}
+
+.volis-hint-title {
+  margin-bottom: 6px;
+  color: var(--text-normal);
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.volis-hint-sub {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.volis-bnode.is-file.is-doc-text {
+  padding: 14px 16px;
+  overflow: hidden;
+  background: var(--background-primary);
+}
+
+.volis-media-modal {
+  width: min(90vw, 1100px);
+  height: min(85vh, 820px);
+}
+
+.volis-media-modal .modal-content {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: calc(100% - 46px);
+}
+
+.volis-media-image,
+.volis-media-video,
+.volis-media-pdf {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border: none;
+}
+
+.volis-media-pdf {
+  width: 100%;
+  height: 100%;
+}
+
+/* ── Selection frame & media extras ──────────────────── */
+
+.volis-selection-frame {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 3;
+  border: 2px solid var(--interactive-accent);
+  border-radius: 6px;
+  pointer-events: none;
+}
+
+.volis-selection-frame::before,
+.volis-selection-frame::after {
+  content: "";
+  position: absolute;
+  width: 9px;
+  height: 9px;
+  border: 2px solid var(--interactive-accent);
+  border-radius: 50%;
+  background: var(--background-primary);
+}
+
+.volis-selection-frame::before {
+  left: -6px;
+  top: -6px;
+}
+
+.volis-selection-frame::after {
+  right: -6px;
+  bottom: -6px;
+}
+
+.volis-selection-frame.is-hidden {
+  display: none;
+}
+
+.volis-bnode.is-doc-text {
+  display: flex;
+  flex-direction: column;
+}
+
+.volis-bnode-doc-head {
+  flex: 0 0 auto;
+  margin-bottom: 6px;
+  color: var(--inline-title-color, var(--text-normal));
+  font-family: var(--inline-title-font, var(--font-text));
+  font-size: var(--inline-title-size, 1.15em);
+  font-weight: var(--inline-title-weight, 700);
+  line-height: 1.25;
+}
+
+.volis-bnode-doc-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  font-size: var(--font-text-size, 16px);
+  line-height: var(--line-height-normal, 1.6);
+}
+
+.volis-bnode-doc-body h1 {
+  margin: 0.3em 0 0.4em;
+  font-size: 1.45em;
+  line-height: 1.25;
+}
+
+.volis-bnode-doc-body h2 {
+  margin: 0.3em 0 0.4em;
+  font-size: 1.3em;
+  line-height: 1.25;
+}
+
+.volis-bnode-doc-body h3 {
+  margin: 0.3em 0 0.4em;
+  font-size: 1.15em;
+  line-height: 1.3;
+}
+
+.volis-bnode-play {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.5);
+  transform: translate(-50%, -50%);
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.volis-bnode-play::before {
+  content: "";
+  margin-left: 4px;
+  border-left: 13px solid #fff;
+  border-top: 8px solid transparent;
+  border-bottom: 8px solid transparent;
+}
+
+
+.volis-bnode.is-playing {
+  cursor: default;
+}
+
+.volis-bnode.is-playing .volis-bnode-media {
+  pointer-events: auto;
+}
+
+.volis-bnode-play.is-hidden {
+  display: none;
+}
+
+.volis-inline-host {
+  position: relative;
+}
+
+.volis-md-editor {
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+}
+
+.volis-md-title {
+  flex: 0 0 auto;
+  width: 100%;
+  margin: 0 !important;
+  padding: 0;
+  border: none !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  outline: none !important;
+}
+
+.volis-md-title.inline-title {
+  color: var(--inline-title-color, var(--h1-color, var(--text-normal)));
+  font-family: var(--inline-title-font, var(--font-text));
+  font-size: var(--inline-title-size, var(--h1-size, 1.8em));
+  font-weight: var(--inline-title-weight, var(--h1-weight, 700));
+  line-height: var(--inline-title-line-height, 1.2);
+}
+
+.volis-md-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 0 !important;
+  font-family: var(--font-text) !important;
+  font-size: var(--font-text-size) !important;
+  line-height: var(--line-height-normal) !important;
+}
+
+.volis-bnode-media {
+  transition: opacity 140ms ease;
+}
+
+.volis-bnode-media.is-loading {
+  opacity: 0;
+}
+
+/* ── Node toolbar ────────────────────────────────────── */
+
+.volis-node-toolbar {
+  position: absolute;
+  z-index: 10;
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-primary);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12);
+}
+
+.volis-node-toolbar.is-hidden {
+  display: none;
+}
+
+.volis-tool-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.volis-tool-btn:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.volis-tool-btn.is-danger:hover {
+  background: rgba(214, 78, 78, 0.12);
+  color: var(--text-error);
+}
+
+.volis-tool-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+.volis-tool-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.volis-tool-btn:disabled:hover {
+  background: transparent;
+  color: var(--text-muted);
+}
+
+/* The header bar of a board tab uses the same paper colour as the canvas,
+   without touching any of its borders or controls. */
+.volis-board-leaf {
+  --volis-board-bg: #f7f6f2;
+}
+
+.theme-dark .volis-board-leaf {
+  --volis-board-bg: #1e2023;
+}
+
+.volis-board-leaf,
+.volis-board-leaf .view-header,
+.volis-board-leaf .view-header-title-container,
+.volis-board-leaf .view-header-nav-buttons,
+.volis-board-leaf .view-content {
+  background-color: var(--volis-board-bg) !important;
+}
+
+
+/* ── Resize handle ───────────────────────────────────── */
+
+.volis-resize-handle {
+  position: absolute;
+  z-index: 3;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+.volis-bnode.is-selected .volis-resize-handle {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* corners: visible dots */
+.volis-resize-handle[data-dir="nw"],
+.volis-resize-handle[data-dir="ne"],
+.volis-resize-handle[data-dir="sw"],
+.volis-resize-handle[data-dir="se"] {
+  width: 12px;
+  height: 12px;
+  border: none;
+  background: transparent;
+}
+
+.volis-resize-handle[data-dir="nw"] {
+  left: 1px;
+  top: 1px;
+  cursor: nwse-resize;
+}
+
+.volis-resize-handle[data-dir="ne"] {
+  right: 1px;
+  top: 1px;
+  cursor: nesw-resize;
+}
+
+.volis-resize-handle[data-dir="sw"] {
+  left: 1px;
+  bottom: 1px;
+  cursor: nesw-resize;
+}
+
+.volis-resize-handle[data-dir="se"] {
+  right: 1px;
+  bottom: 1px;
+  cursor: nwse-resize;
+}
+
+/* edges: invisible hit strips */
+.volis-resize-handle[data-dir="n"],
+.volis-resize-handle[data-dir="s"] {
+  left: 12px;
+  right: 12px;
+  height: 7px;
+  cursor: ns-resize;
+}
+
+.volis-resize-handle[data-dir="n"] {
+  top: 0;
+}
+
+.volis-resize-handle[data-dir="s"] {
+  bottom: 0;
+}
+
+.volis-resize-handle[data-dir="w"],
+.volis-resize-handle[data-dir="e"] {
+  top: 12px;
+  bottom: 12px;
+  width: 7px;
+  cursor: ew-resize;
+}
+
+.volis-resize-handle[data-dir="w"] {
+  left: 0;
+}
+
+.volis-resize-handle[data-dir="e"] {
+  right: 0;
+}
+
+.volis-board.is-resizing,
+.volis-board.is-resizing .volis-bnode {
+  cursor: default;
+}
+
+/* ── Connections ─────────────────────────────────────── */
+
+.volis-edges {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 1;
+  width: 1px;
+  height: 1px;
+  pointer-events: none;
+}
+
+.volis-edge-hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 18px;
+  pointer-events: stroke;
+  cursor: pointer;
+}
+
+.volis-edge {
+  fill: none;
+  stroke: var(--text-faint);
+  stroke-width: 1.8px;
+  pointer-events: none;
+}
+
+.volis-edge-group:hover .volis-edge {
+  stroke: var(--text-muted);
+}
+
+.volis-edge-group.is-selected .volis-edge {
+  stroke: var(--interactive-accent);
+  stroke-width: 2.8px;
+}
+
+.volis-edge.is-preview {
+  stroke: var(--interactive-accent);
+  stroke-dasharray: 5 4;
+  pointer-events: none;
+}
+
+.volis-port {
+  position: absolute;
+  z-index: 5;
+  width: 13px;
+  height: 13px;
+  border: 2px solid var(--background-primary);
+  border-radius: 50%;
+  background: var(--interactive-accent);
+  opacity: 0;
+  cursor: crosshair;
+  transform: translate(-50%, -50%);
+  transition: opacity 100ms ease;
+}
+
+.volis-port.is-top {
+  left: 50%;
+  top: 0;
+}
+
+.volis-port.is-bottom {
+  left: 50%;
+  top: 100%;
+}
+
+.volis-port.is-left {
+  left: 0;
+  top: 50%;
+}
+
+.volis-port.is-right {
+  left: 100%;
+  top: 50%;
+}
+
+.volis-bnode:hover .volis-port,
+.volis-bnode.is-link-target .volis-port {
+  opacity: 1;
+}
+
+.volis-board.is-linking {
+  cursor: crosshair;
+}
+
+/* Larger grab area around each connection dot, invisibly. */
+.volis-port::before {
+  content: "";
+  position: absolute;
+  inset: -11px;
+  border-radius: 50%;
+}
+
+/* ── Insert panel ────────────────────────────────────── */
+
+.volis-insert-panel {
+  position: absolute;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  width: 328px;
+  max-height: 340px;
+  overflow: hidden;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 12px;
+  background: var(--background-primary);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.14);
+}
+
+.volis-insert-head {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.volis-insert-head-icon {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  color: var(--text-faint);
+}
+
+.volis-insert-head-icon svg {
+  width: 15px;
+  height: 15px;
+}
+
+.volis-insert-input {
+  flex: 1 1 auto;
+  width: 100%;
+  height: 22px;
+  padding: 0 !important;
+  border: none !important;
+  border-radius: 0;
+  background: transparent !important;
+  box-shadow: none !important;
+  color: var(--text-normal);
+  font-size: 13.5px;
+  outline: none !important;
+}
+
+.volis-insert-input:focus {
+  border: none !important;
+  box-shadow: none !important;
+  outline: none !important;
+}
+
+.volis-insert-input::placeholder {
+  color: var(--text-faint);
+}
+
+.volis-insert-list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 5px;
+}
+
+.volis-insert-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 7px 9px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.volis-insert-item:hover {
+  background: var(--background-modifier-hover);
+}
+
+.volis-insert-item.is-active {
+  background: var(--background-modifier-hover);
+  box-shadow: inset 2px 0 0 var(--interactive-accent);
+}
+
+.volis-insert-item-icon {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 18px;
+  color: var(--text-faint);
+}
+
+.volis-insert-item.is-active .volis-insert-item-icon {
+  color: var(--interactive-accent);
+}
+
+.volis-insert-item-icon svg {
+  width: 14px;
+  height: 14px;
+}
+
+.volis-insert-item-body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.volis-insert-title {
+  overflow: hidden;
+  color: var(--text-normal);
+  font-size: 13px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.volis-insert-sub {
+  margin-top: 1px;
+  overflow: hidden;
+  color: var(--text-faint);
+  font-size: 11px;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.volis-insert-foot {
+  flex: 0 0 auto;
+  padding: 6px 12px 8px;
+  border-top: 1px solid var(--background-modifier-border);
+  color: var(--text-faint);
+  font-size: 10.5px;
+  letter-spacing: 0.01em;
+}
+
+/* ── Colour swatches ─────────────────────────────────── */
+
+.volis-color-pop {
+  position: absolute;
+  z-index: 15;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 9px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 9px;
+  background: var(--background-primary);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.14);
+}
+
+.volis-swatch {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 50%;
+  box-shadow: none;
+  cursor: pointer;
+}
+
+.volis-swatch[data-color="red"] {
+  background: #d9534f;
+}
+
+.volis-swatch[data-color="orange"] {
+  background: #e08a2e;
+}
+
+.volis-swatch[data-color="yellow"] {
+  background: #c9a227;
+}
+
+.volis-swatch[data-color="green"] {
+  background: #639922;
+}
+
+.volis-swatch[data-color="teal"] {
+  background: #1d9e75;
+}
+
+.volis-swatch[data-color="blue"] {
+  background: #378add;
+}
+
+.volis-swatch[data-color="purple"] {
+  background: #7f77dd;
+}
+
+.volis-swatch:hover {
+  transform: scale(1.12);
+}
+
+.volis-swatch.is-clear {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  color: var(--text-faint);
+}
+
+.volis-swatch.is-clear svg {
+  width: 12px;
+  height: 12px;
+}
+
+.volis-swatch.is-custom {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border-color: var(--background-modifier-border);
+  background: conic-gradient(
+    from 90deg,
+    #f87171,
+    #fbbf24,
+    #a3e635,
+    #34d399,
+    #38bdf8,
+    #818cf8,
+    #c084fc,
+    #f87171
+  );
+  cursor: pointer;
+}
+
+.volis-swatch.is-custom:hover {
+  transform: scale(1.12);
+}
+
+.volis-swatch.is-custom input[type="color"] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  opacity: 0;
+  cursor: pointer;
+}
+
+/* ── Edge toolbar ────────────────────────────────────── */
+
+.volis-edge-toolbar {
+  position: absolute;
+  z-index: 12;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 7px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  background: var(--background-primary);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+}
+
+.volis-edge-toolbar.is-hidden {
+  display: none;
+}
+
+.volis-edge-dot {
+  position: relative;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 50%;
+  box-shadow: none;
+  cursor: pointer;
+}
+
+.volis-edge-dot:hover {
+  transform: scale(1.12);
+}
+
+.volis-edge-dot.is-custom {
+  overflow: hidden;
+  border-color: var(--background-modifier-border);
+  background: conic-gradient(
+    from 90deg,
+    #f87171,
+    #fbbf24,
+    #a3e635,
+    #34d399,
+    #38bdf8,
+    #818cf8,
+    #c084fc,
+    #f87171
+  );
+}
+
+.volis-edge-dot.is-custom input[type="color"] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: none;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.volis-edge-sep {
+  width: 1px;
+  height: 18px;
+  margin: 0 2px;
+  background: var(--background-modifier-border);
+}
+
+.volis-rename-input {
+  width: 100%;
+  margin-bottom: 12px;
+}
+
+/* ── Groups ──────────────────────────────────────────── */
+
+.volis-bnode.is-group {
+  z-index: 0;
+  padding: 0;
+  background: rgba(120, 130, 140, 0.05);
+  border: 1.5px dashed var(--background-modifier-border-hover);
+  border-radius: 10px;
+  box-shadow: none;
+}
+
+.volis-bnode.is-group:hover {
+  border-color: var(--text-faint);
+}
+
+.volis-bnode.is-group.is-selected {
+  border-color: var(--interactive-accent);
+}
+
+.volis-group-label {
+  position: absolute;
+  top: -21px;
+  left: 10px;
+  box-sizing: border-box;
+  width: 176px;
+  max-width: calc(100% - 20px);
+  height: 34px;
+  padding: 0 12px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: var(--volis-board-bg, var(--background-primary));
+  box-shadow: none;
+  color: var(--group-tint, var(--text-muted));
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 32px;
+  outline: none;
+  cursor: text;
+}
+
+.volis-group-label:hover {
+  border-color: var(--background-modifier-border);
+}
+
+.volis-group-label:focus {
+  border-color: var(--interactive-accent);
+  background: var(--background-primary);
+  color: var(--text-normal);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}

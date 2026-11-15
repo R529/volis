@@ -1,0 +1,9 @@
+{
+  "id": "volis",
+  "name": "Volis",
+  "version": "0.2.0",
+  "minAppVersion": "1.13.0",
+  "description": "Turns block-reference cards on canvas into first-class objects with inline editing, quick actions and live sync.",
+  "author": "Lak",
+  "isDesktopOnly": true
+}
