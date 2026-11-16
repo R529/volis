@@ -417,6 +417,15 @@ export default class VolisPlugin extends Plugin {
 
   private registerCommands(): void {
     this.addCommand({
+      id: "find-node",
+      name: "在白板中查找节点",
+      callback: () => {
+        const view = this.getCanvasView();
+        if (view) view.openNodeSearch();
+      },
+    });
+
+    this.addCommand({
       id: "insert-node",
       name: "搜索或新建节点",
       callback: () => {

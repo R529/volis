@@ -60,6 +60,11 @@ interface BoxDrag {
 
 type ResizeDir = "n" | "s" | "e" | "w" | "ne" | "nw" | "se" | "sw";
 
+interface GuideLine {
+  axis: "x" | "y";
+  pos: number;
+}
+
 interface ResizeDrag {
   type: "resize";
   pointerId: number;
@@ -108,12 +113,20 @@ export class BoardView extends TextFileView {
   private saveTimer: number | null = null;
   private frameEl: HTMLElement | null = null;
   private edgesEl: SVGSVGElement | null = null;
+  private minimapEl: HTMLElement | null = null;
+  private minimapSvg: SVGSVGElement | null = null;
+  private minimapDragging = false;
   private selectedEdgeId: string | null = null;
+  private nodeText = new Map<string, string>();
+  private searchPanel: HTMLElement | null = null;
+  private searchOutside: ((evt: MouseEvent) => void) | null = null;
   private clipboard: BoardNode[] = [];
   private clipboardEdges: BoardEdge[] = [];
   private lastPointerWorld: { x: number; y: number } | null = null;
   private insertPanel: HTMLElement | null = null;
   private edgeBar: HTMLElement | null = null;
+  private alignPop: HTMLElement | null = null;
+  private alignOutside: ((evt: MouseEvent) => void) | null = null;
   private colorPop: HTMLElement | null = null;
   private colorOutside: ((evt: MouseEvent) => void) | null = null;
   private panelOutside: ((evt: MouseEvent) => void) | null = null;
@@ -134,6 +147,7 @@ export class BoardView extends TextFileView {
   private rawFallback: string | null = null;
   private resizeObserver: ResizeObserver | null = null;
   private lastSize = { w: 0, h: 0 };
+  private moreBtn: HTMLButtonElement | null = null;
   private undoBtn: HTMLButtonElement | null = null;
   private redoBtn: HTMLButtonElement | null = null;
   private staleIds = new Set<string>();
@@ -308,7 +322,7 @@ export class BoardView extends TextFileView {
       return button;
     };
 
-    addButton("more-vertical", "更多", (evt) => this.showBoardMenu(evt));
+    this.moreBtn = addButton("more-vertical", "更多", (evt) => this.showBoardMenu(evt));
     toolbar.createDiv({ cls: "volis-board-sep" });
     addButton("plus", "放大", () => this.zoomBy(1.2));
     addButton("minus", "缩小", () => this.zoomBy(1 / 1.2));
@@ -324,6 +338,16 @@ export class BoardView extends TextFileView {
     this.toolbarEl = this.root.createDiv({ cls: "volis-node-toolbar is-hidden" });
     this.toolbarEl.addEventListener("pointerdown", (evt) => evt.stopPropagation());
     this.toolbarEl.addEventListener("dblclick", (evt) => evt.stopPropagation());
+
+    this.minimapEl = this.root.createDiv({ cls: "volis-minimap is-hidden" });
+
+    const miniSvg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    miniSvg.classList.add("volis-minimap-svg");
+    this.minimapEl.appendChild(miniSvg);
+    this.minimapSvg = miniSvg;
+
+    this.minimapEl.addEventListener("pointerdown", this.onMinimapDown);
+    this.minimapEl.addEventListener("dblclick", (evt) => evt.stopPropagation());
 
     this.edgeBar = this.root.createDiv({ cls: "volis-edge-toolbar is-hidden" });
     this.edgeBar.addEventListener("pointerdown", (evt) => evt.stopPropagation());
@@ -563,6 +587,156 @@ export class BoardView extends TextFileView {
     return `#${[blend(r), blend(g), blend(b)]
       .map((value) => value.toString(16).padStart(2, "0"))
       .join("")}`;
+  }
+
+  private closeAlignPop(): void {
+    if (this.alignOutside) {
+      document.removeEventListener("mousedown", this.alignOutside, true);
+      this.alignOutside = null;
+    }
+    this.alignPop?.remove();
+    this.alignPop = null;
+  }
+
+  private showAlignPop(nodes: BoardNode[], evt: MouseEvent): void {
+    this.closeAlignPop();
+    if (nodes.length < 2) return;
+
+    const pop = this.root.createDiv({ cls: "volis-align-pop" });
+    this.alignPop = pop;
+    pop.addEventListener("pointerdown", (event) => event.stopPropagation());
+
+    const actions: Array<{ icon: string; label: string; run: () => void }> = [
+      { icon: "align-start-vertical", label: "左对齐", run: () => this.alignNodes(nodes, "left") },
+      { icon: "align-center-vertical", label: "水平居中", run: () => this.alignNodes(nodes, "hcenter") },
+      { icon: "align-end-vertical", label: "右对齐", run: () => this.alignNodes(nodes, "right") },
+      { icon: "align-horizontal-distribute-center", label: "水平等距", run: () => this.distributeNodes(nodes, "h") },
+      { icon: "align-start-horizontal", label: "上对齐", run: () => this.alignNodes(nodes, "top") },
+      { icon: "align-center-horizontal", label: "垂直居中", run: () => this.alignNodes(nodes, "vcenter") },
+      { icon: "align-end-horizontal", label: "下对齐", run: () => this.alignNodes(nodes, "bottom") },
+      { icon: "align-vertical-distribute-center", label: "垂直等距", run: () => this.distributeNodes(nodes, "v") },
+    ];
+
+    for (const action of actions) {
+      const button = pop.createEl("button", {
+        cls: "volis-tool-btn",
+        attr: { "aria-label": action.label },
+      });
+      setIcon(button, action.icon);
+      button.addEventListener("click", () => action.run());
+    }
+
+    const rect = this.root.getBoundingClientRect();
+    const width = 168;
+    pop.style.left = `${Math.round(Math.max(8, Math.min(evt.clientX - rect.left - 40, rect.width - width - 8)))}px`;
+    pop.style.top = `${Math.round(Math.max(8, evt.clientY - rect.top + 12))}px`;
+
+    this.alignOutside = (event: MouseEvent) => {
+      const target = event.target as Node | null;
+      if (target && pop.contains(target)) return;
+      this.closeAlignPop();
+    };
+    document.addEventListener("mousedown", this.alignOutside, true);
+  }
+
+  private applyNodeGeometry(node: BoardNode): void {
+    const el = this.nodeEls.get(node.id);
+    if (!el) return;
+
+    el.style.transform = `translate3d(${node.x}px, ${node.y}px, 0)`;
+    el.style.width = `${node.width}px`;
+    if (node.height) el.style.height = `${node.height}px`;
+  }
+
+  private afterLayout(): void {
+    this.renderEdges();
+    this.updateFrame();
+    this.pushHistory();
+    this.scheduleSave();
+  }
+
+  private alignNodes(nodes: BoardNode[], mode: string): void {
+    const items = nodes.map((node) => ({ node, height: this.nodeHeight(node) }));
+    if (items.length < 2) return;
+
+    const minX = Math.min(...items.map((item) => item.node.x));
+    const maxX = Math.max(...items.map((item) => item.node.x + item.node.width));
+    const minY = Math.min(...items.map((item) => item.node.y));
+    const maxY = Math.max(...items.map((item) => item.node.y + item.height));
+
+    for (const { node, height } of items) {
+      switch (mode) {
+        case "left":
+          node.x = Math.round(minX);
+          break;
+        case "right":
+          node.x = Math.round(maxX - node.width);
+          break;
+        case "hcenter":
+          node.x = Math.round((minX + maxX) / 2 - node.width / 2);
+          break;
+        case "top":
+          node.y = Math.round(minY);
+          break;
+        case "bottom":
+          node.y = Math.round(maxY - height);
+          break;
+        case "vcenter":
+          node.y = Math.round((minY + maxY) / 2 - height / 2);
+          break;
+        default:
+          break;
+      }
+      this.applyNodeGeometry(node);
+    }
+
+    this.afterLayout();
+  }
+
+  private distributeNodes(nodes: BoardNode[], axis: "h" | "v"): void {
+    if (nodes.length < 3) return;
+
+    const items = nodes.map((node) => ({ node, height: this.nodeHeight(node) }));
+
+    if (axis === "h") {
+      items.sort((a, b) => a.node.x - b.node.x);
+
+      const first = items[0];
+      const last = items[items.length - 1];
+      const start = first.node.x + first.node.width;
+      const end = last.node.x;
+      const middle = items.slice(1, -1);
+      const used = middle.reduce((sum, item) => sum + item.node.width, 0);
+      const gap = (end - start - used) / (items.length - 1);
+
+      let cursor = start;
+      for (const item of middle) {
+        cursor += gap;
+        item.node.x = Math.round(cursor);
+        this.applyNodeGeometry(item.node);
+        cursor += item.node.width;
+      }
+    } else {
+      items.sort((a, b) => a.node.y - b.node.y);
+
+      const first = items[0];
+      const last = items[items.length - 1];
+      const start = first.node.y + first.height;
+      const end = last.node.y;
+      const middle = items.slice(1, -1);
+      const used = middle.reduce((sum, item) => sum + item.height, 0);
+      const gap = (end - start - used) / (items.length - 1);
+
+      let cursor = start;
+      for (const item of middle) {
+        cursor += gap;
+        item.node.y = Math.round(cursor);
+        this.applyNodeGeometry(item.node);
+        cursor += item.height;
+      }
+    }
+
+    this.afterLayout();
   }
 
   private closeColorPop(): void {
@@ -895,6 +1069,13 @@ export class BoardView extends TextFileView {
         run: () => void this.createGroupFromSelection(),
       },
       {
+        id: "align",
+        icon: "align-start-vertical",
+        label: "对齐",
+        visible: (nodes) => nodes.length >= 2,
+        run: (nodes, evt) => this.showAlignPop(nodes, evt),
+      },
+      {
         id: "color",
         icon: "palette",
         label: "颜色",
@@ -969,6 +1150,142 @@ export class BoardView extends TextFileView {
     }
     return false;
   }
+
+  private minimapWorld(): { x: number; y: number; w: number; h: number } | null {
+    if (this.nodes.length === 0) return null;
+
+    const rect = this.root.getBoundingClientRect();
+    const viewLeft = -this.tx / this.scale;
+    const viewTop = -this.ty / this.scale;
+    const viewRight = viewLeft + rect.width / this.scale;
+    const viewBottom = viewTop + rect.height / this.scale;
+
+    let minX = viewLeft;
+    let minY = viewTop;
+    let maxX = viewRight;
+    let maxY = viewBottom;
+
+    for (const node of this.nodes) {
+      const height = this.nodeHeight(node);
+      minX = Math.min(minX, node.x);
+      minY = Math.min(minY, node.y);
+      maxX = Math.max(maxX, node.x + node.width);
+      maxY = Math.max(maxY, node.y + height);
+    }
+
+    const pad = 60;
+    let x = minX - pad;
+    let y = minY - pad;
+    let w = Math.max(1, maxX - minX + pad * 2);
+    let h = Math.max(1, maxY - minY + pad * 2);
+
+    // Match the container's aspect ratio so the viewBox fills it exactly.
+    const aspect = 180 / 120;
+    if (w / h < aspect) {
+      const nextW = h * aspect;
+      x -= (nextW - w) / 2;
+      w = nextW;
+    } else {
+      const nextH = w / aspect;
+      y -= (nextH - h) / 2;
+      h = nextH;
+    }
+
+    return { x, y, w, h };
+  }
+
+  private updateMinimap(): void {
+    const el = this.minimapEl;
+    const svg = this.minimapSvg;
+    if (!el || !svg) return;
+
+    if (this.nodes.length === 0) {
+      el.addClass("is-hidden");
+      return;
+    }
+
+    const world = this.minimapWorld();
+    if (!world) {
+      el.addClass("is-hidden");
+      return;
+    }
+
+    el.removeClass("is-hidden");
+
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    svg.setAttribute("viewBox", `${world.x} ${world.y} ${world.w} ${world.h}`);
+
+    for (const node of this.nodes) {
+      const rect = this.svgNode("rect");
+      rect.setAttribute("x", String(node.x));
+      rect.setAttribute("y", String(node.y));
+      rect.setAttribute("width", String(node.width));
+      rect.setAttribute("height", String(this.nodeHeight(node)));
+      rect.setAttribute("rx", node.type === "group" ? "8" : "4");
+      rect.setAttribute("class", `volis-mini-node is-${node.type}`);
+      svg.appendChild(rect);
+    }
+
+    const view = this.svgNode("rect");
+    const rootRect = this.root.getBoundingClientRect();
+    const viewLeft = -this.tx / this.scale;
+    const viewTop = -this.ty / this.scale;
+
+    view.setAttribute("x", String(viewLeft));
+    view.setAttribute("y", String(viewTop));
+    view.setAttribute("width", String(rootRect.width / this.scale));
+    view.setAttribute("height", String(rootRect.height / this.scale));
+    view.setAttribute("rx", "6");
+    view.setAttribute("class", "volis-mini-view");
+    svg.appendChild(view);
+  }
+
+  private jumpToMinimapPoint(clientX: number, clientY: number): void {
+    const svg = this.minimapSvg;
+    const el = this.minimapEl;
+    if (!svg || !el) return;
+
+    const box = svg.viewBox.baseVal;
+    if (box.width === 0 || box.height === 0) return;
+
+    const rect = el.getBoundingClientRect();
+    const padding = 4;
+
+    const relX = (clientX - rect.left - padding) / Math.max(1, rect.width - padding * 2);
+    const relY = (clientY - rect.top - padding) / Math.max(1, rect.height - padding * 2);
+
+    const worldX = box.x + Math.min(1, Math.max(0, relX)) * box.width;
+    const worldY = box.y + Math.min(1, Math.max(0, relY)) * box.height;
+
+    const rootRect = this.root.getBoundingClientRect();
+    this.tx = rootRect.width / 2 - worldX * this.scale;
+    this.ty = rootRect.height / 2 - worldY * this.scale;
+
+    this.applyTransform();
+    this.scheduleSave();
+  }
+
+  private onMinimapDown = (evt: PointerEvent): void => {
+    evt.preventDefault();
+    evt.stopPropagation();
+
+    this.minimapDragging = true;
+    this.jumpToMinimapPoint(evt.clientX, evt.clientY);
+
+    const move = (event: PointerEvent) => {
+      if (!this.minimapDragging) return;
+      this.jumpToMinimapPoint(event.clientX, event.clientY);
+    };
+
+    const up = () => {
+      this.minimapDragging = false;
+      document.removeEventListener("pointermove", move);
+      document.removeEventListener("pointerup", up);
+    };
+
+    document.addEventListener("pointermove", move);
+    document.addEventListener("pointerup", up);
+  };
 
   private updateToolbar(): void {
     if (!this.toolbarEl) return;
@@ -1549,6 +1866,7 @@ export class BoardView extends TextFileView {
 
   private renderGroupBody(el: HTMLElement, node: GroupNode): void {
     el.addClass("is-group");
+    this.nodeText.set(node.id, node.label ?? "");
 
     // The label is a real input: one click edits it, no double-click race with
     // the canvas drag handling.
@@ -1692,6 +2010,7 @@ export class BoardView extends TextFileView {
 
   private async renderTextBody(el: HTMLElement, node: TextNode): Promise<void> {
     const body = el.createDiv({ cls: "volis-bnode-body" });
+    this.nodeText.set(node.id, node.text);
     if (!node.text.trim()) return;
     await MarkdownRenderer.render(this.app, node.text, body, "", this);
     this.decorateNumericTags(body);
@@ -1712,6 +2031,7 @@ export class BoardView extends TextFileView {
       return;
     }
 
+    this.nodeText.set(node.id, meta.editable);
     await MarkdownRenderer.render(this.app, normalizeTags(meta.body), body, node.file, this);
     this.decorateNumericTags(body);
 
@@ -1726,6 +2046,8 @@ export class BoardView extends TextFileView {
   private async renderFileBody(el: HTMLElement, node: { id: string; file: string }): Promise<void> {
     el.addClass("is-file");
     const file = this.app.vault.getAbstractFileByPath(node.file);
+    if (file instanceof TFile) this.nodeText.set(node.id, file.basename);
+
     if (!(file instanceof TFile)) {
       this.staleIds.add(node.id);
       el.createDiv({ cls: "volis-bnode-placeholder", text: "文件缺失" });
@@ -1875,6 +2197,7 @@ export class BoardView extends TextFileView {
     this.zoomEl.setText(`${Math.round(this.scale * 100)}%`);
     this.updateToolbar();
     this.updateEdgeBar();
+    this.updateMinimap();
   }
 
   private toWorld(clientX: number, clientY: number): { x: number; y: number } {
@@ -1908,13 +2231,35 @@ export class BoardView extends TextFileView {
 
     menu.addItem((item) =>
       item
+        .setTitle("查找节点")
+        .setIcon("search")
+        .onClick(() => this.openNodeSearch())
+    );
+
+    menu.addSeparator();
+
+    menu.addItem((item) =>
+      item
         .setTitle(stale > 0 ? `清理失效节点（${stale}）` : "没有失效节点")
         .setIcon("eraser")
         .setDisabled(stale === 0)
         .onClick(() => this.cleanupStaleNodes())
     );
 
-    menu.showAtMouseEvent(evt);
+    const rect = this.moreBtn?.getBoundingClientRect();
+    if (!rect) {
+      menu.showAtMouseEvent(evt);
+      return;
+    }
+
+    menu.showAtPosition({ x: Math.max(8, rect.right - 200), y: rect.bottom + 6 });
+
+    // Realign horizontally once the menu knows its own width.
+    const dom = (menu as unknown as { dom?: HTMLElement }).dom;
+    if (dom) {
+      dom.style.left = `${Math.max(8, Math.round(rect.right - dom.offsetWidth + 16))}px`;
+      dom.style.top = `${Math.round(rect.bottom + 6)}px`;
+    }
   }
 
   private cleanupStaleNodes(): void {
@@ -2170,6 +2515,191 @@ export class BoardView extends TextFileView {
     return null;
   }
 
+  private closeSearchPanel(): void {
+    if (this.searchOutside) {
+      document.removeEventListener("mousedown", this.searchOutside, true);
+      this.searchOutside = null;
+    }
+    this.searchPanel?.remove();
+    this.searchPanel = null;
+  }
+
+  private centerOnNode(node: BoardNode): void {
+    const rect = this.root.getBoundingClientRect();
+    const height = this.nodeHeight(node);
+
+    // Zoom so the node takes roughly a third of the viewport width.
+    const fit = (rect.width * 0.33) / Math.max(1, node.width);
+    this.scale = Math.max(0.6, Math.min(1.1, fit));
+
+    this.tx = rect.width / 2 - (node.x + node.width / 2) * this.scale;
+    this.ty = rect.height / 2 - (node.y + height / 2) * this.scale;
+
+    this.applyTransform();
+    this.scheduleSave();
+
+    this.selection.clear();
+    this.selection.add(node.id);
+    this.paintSelection();
+
+    const el = this.nodeEls.get(node.id);
+    if (!el) return;
+
+    // Dim everything else: contrast reads better than a highlight alone.
+    for (const [id, other] of this.nodeEls) {
+      other.toggleClass("is-dimmed", id !== node.id);
+    }
+    this.root.addClass("is-focusing");
+
+    el.addClass("is-flash");
+
+    window.setTimeout(() => {
+      el.removeClass("is-flash");
+      this.root.removeClass("is-focusing");
+      for (const other of this.nodeEls.values()) other.removeClass("is-dimmed");
+    }, 1600);
+  }
+
+  public openNodeSearch(): void {
+    this.closeSearchPanel();
+
+    const rect = this.root.getBoundingClientRect();
+    const panel = this.root.createDiv({ cls: "volis-insert-panel" });
+    const width = 328;
+    const left = Math.max(8, (rect.width - width) / 2);
+    const top = Math.max(48, rect.height * 0.22);
+
+    panel.style.left = `${Math.round(left)}px`;
+    panel.style.top = `${Math.round(top)}px`;
+
+    panel.addEventListener("pointerdown", (evt) => evt.stopPropagation());
+    panel.addEventListener("dblclick", (evt) => evt.stopPropagation());
+
+    const head = panel.createDiv({ cls: "volis-insert-head" });
+    const headIcon = head.createDiv({ cls: "volis-insert-head-icon" });
+    setIcon(headIcon, "search");
+
+    const input = head.createEl("input", {
+      cls: "volis-insert-input",
+      attr: { type: "text", placeholder: "在白板中查找节点…" },
+    });
+
+    const list = panel.createDiv({ cls: "volis-insert-list" });
+    panel.createDiv({
+      cls: "volis-insert-foot",
+      text: "↑↓ 选择 · Enter 定位 · Esc 取消",
+    });
+
+    this.searchPanel = panel;
+
+    const all = this.nodes;
+    let results: BoardNode[] = [];
+    let active = 0;
+
+    const render = () => {
+      list.empty();
+
+      if (results.length === 0) {
+        list.createDiv({ cls: "volis-insert-empty", text: "没有匹配的节点" });
+        return;
+      }
+
+      results.forEach((node, index) => {
+        const row = list.createDiv({ cls: "volis-insert-item" });
+        if (index === active) {
+          row.addClass("is-active");
+          window.requestAnimationFrame(() => row.scrollIntoView({ block: "nearest" }));
+        }
+
+        const iconEl = row.createDiv({ cls: "volis-insert-item-icon" });
+        setIcon(
+          iconEl,
+          node.type === "card"
+            ? "list"
+            : node.type === "group"
+              ? "group"
+              : node.type === "text"
+                ? "type"
+                : "file-text"
+        );
+
+        const body = row.createDiv({ cls: "volis-insert-item-body" });
+        const text = (this.nodeText.get(node.id) ?? "").replace(/\s+/g, " ").trim();
+        body.createDiv({
+          cls: "volis-insert-title",
+          text: text.slice(0, 48) || "（空节点）",
+        });
+        body.createDiv({
+          cls: "volis-insert-sub",
+          text:
+            node.type === "card"
+              ? "卡片"
+              : node.type === "group"
+                ? "分组"
+                : node.type === "text"
+                  ? "文本节点"
+                  : node.file,
+        });
+
+        row.addEventListener("click", () => {
+          this.closeSearchPanel();
+          this.centerOnNode(node);
+        });
+      });
+    };
+
+    const search = (query: string) => {
+      const q = query.trim().toLowerCase();
+      results = q
+        ? all.filter((node) => {
+            const text = (this.nodeText.get(node.id) ?? "").toLowerCase();
+            return text.includes(q);
+          })
+        : all.slice(0, 30);
+
+      active = 0;
+      render();
+    };
+
+    input.addEventListener("input", () => search(input.value));
+    input.addEventListener("keydown", (evt) => {
+      if (evt.key === "Escape") {
+        evt.preventDefault();
+        this.closeSearchPanel();
+        return;
+      }
+      if (evt.key === "ArrowDown") {
+        evt.preventDefault();
+        active = Math.min(results.length - 1, active + 1);
+        render();
+        return;
+      }
+      if (evt.key === "ArrowUp") {
+        evt.preventDefault();
+        active = Math.max(0, active - 1);
+        render();
+        return;
+      }
+      if (evt.key === "Enter") {
+        evt.preventDefault();
+        const node = results[active];
+        if (!node) return;
+        this.closeSearchPanel();
+        this.centerOnNode(node);
+      }
+    });
+
+    this.searchOutside = (evt: MouseEvent) => {
+      const target = evt.target as Node | null;
+      if (target && panel.contains(target)) return;
+      this.closeSearchPanel();
+    };
+    document.addEventListener("mousedown", this.searchOutside, true);
+
+    search("");
+    window.setTimeout(() => input.focus(), 20);
+  }
+
   public openInsertPanelAtCenter(): void {
     const rect = this.root.getBoundingClientRect();
     const world = this.toWorld(
@@ -2376,6 +2906,115 @@ export class BoardView extends TextFileView {
         (edge.fromSide ?? null) === (fromSide ?? null) &&
         (edge.toSide ?? null) === (toSide ?? null)
     );
+  }
+
+  /**
+   * Alignment snapping during a drag: compares the moving selection's six
+   * anchor lines with every other node and pulls to the closest one within a
+   * small screen-space threshold.
+   */
+  private computeSnap(
+    initial: Map<string, { x: number; y: number }>,
+    dx: number,
+    dy: number
+  ): { dx: number; dy: number; lines: GuideLine[] } {
+    const moving = new Set(initial.keys());
+    const threshold = 6 / this.scale;
+
+    let minX = Number.POSITIVE_INFINITY;
+    let minY = Number.POSITIVE_INFINITY;
+    let maxX = Number.NEGATIVE_INFINITY;
+    let maxY = Number.NEGATIVE_INFINITY;
+
+    for (const [id, start] of initial) {
+      const node = this.nodeMap.get(id);
+      if (!node) continue;
+      const height = this.nodeHeight(node);
+      minX = Math.min(minX, start.x + dx);
+      minY = Math.min(minY, start.y + dy);
+      maxX = Math.max(maxX, start.x + dx + node.width);
+      maxY = Math.max(maxY, start.y + dy + height);
+    }
+
+    if (!Number.isFinite(minX)) return { dx: 0, dy: 0, lines: [] };
+
+    const anchorX = [minX, (minX + maxX) / 2, maxX];
+    const anchorY = [minY, (minY + maxY) / 2, maxY];
+
+    let bestDx = 0;
+    let bestDy = 0;
+    let distX = threshold;
+    let distY = threshold;
+    let lineX: GuideLine | null = null;
+    let lineY: GuideLine | null = null;
+
+    for (const other of this.nodes) {
+      if (moving.has(other.id)) continue;
+
+      const height = this.nodeHeight(other);
+      const otherX = [other.x, other.x + other.width / 2, other.x + other.width];
+      const otherY = [other.y, other.y + height / 2, other.y + height];
+
+      for (const a of anchorX) {
+        for (const b of otherX) {
+          const delta = b - a;
+          const distance = Math.abs(delta);
+          if (distance < distX) {
+            distX = distance;
+            bestDx = delta;
+            lineX = { axis: "x", pos: b };
+          }
+        }
+      }
+
+      for (const a of anchorY) {
+        for (const b of otherY) {
+          const delta = b - a;
+          const distance = Math.abs(delta);
+          if (distance < distY) {
+            distY = distance;
+            bestDy = delta;
+            lineY = { axis: "y", pos: b };
+          }
+        }
+      }
+    }
+
+    const lines: GuideLine[] = [];
+    if (lineX) lines.push(lineX);
+    if (lineY) lines.push(lineY);
+
+    return { dx: bestDx, dy: bestDy, lines };
+  }
+
+  private drawGuides(lines: GuideLine[]): void {
+    const svg = this.edgesEl;
+    if (!svg || lines.length === 0) return;
+
+    const box = svg.viewBox.baseVal;
+    const left = box.x;
+    const top = box.y;
+    const right = box.x + box.width;
+    const bottom = box.y + box.height;
+
+    for (const guide of lines) {
+      const line = this.svgNode("line");
+
+      if (guide.axis === "x") {
+        line.setAttribute("x1", String(guide.pos));
+        line.setAttribute("y1", String(top));
+        line.setAttribute("x2", String(guide.pos));
+        line.setAttribute("y2", String(bottom));
+      } else {
+        line.setAttribute("x1", String(left));
+        line.setAttribute("y1", String(guide.pos));
+        line.setAttribute("x2", String(right));
+        line.setAttribute("y2", String(guide.pos));
+      }
+
+      line.setAttribute("class", "volis-guide");
+      svg.appendChild(line);
+    }
   }
 
   private setLinkTarget(nodeId: string | null): void {
@@ -2848,19 +3487,28 @@ export class BoardView extends TextFileView {
     }
 
     const point = this.toWorld(evt.clientX, evt.clientY);
-    const dx = point.x - drag.startWorld.x;
-    const dy = point.y - drag.startWorld.y;
+    let dx = point.x - drag.startWorld.x;
+    let dy = point.y - drag.startWorld.y;
     if (Math.abs(dx) > 2 || Math.abs(dy) > 2) this.dragMoved = true;
+
+    let guides: GuideLine[] = [];
+    if (!evt.altKey) {
+      const snap = this.computeSnap(drag.initial, dx, dy);
+      dx += snap.dx;
+      dy += snap.dy;
+      guides = snap.lines;
+    }
 
     for (const [id, initial] of drag.initial) {
       const node = this.nodeMap.get(id);
       const el = this.nodeEls.get(id);
       if (!node || !el) continue;
-      node.x = initial.x + dx;
-      node.y = initial.y + dy;
+      node.x = Math.round(initial.x + dx);
+      node.y = Math.round(initial.y + dy);
       el.style.transform = `translate3d(${node.x}px, ${node.y}px, 0)`;
     }
     this.renderEdges();
+    this.drawGuides(guides);
     this.updateFrame();
   };
 
@@ -2899,6 +3547,7 @@ export class BoardView extends TextFileView {
 
     if (wasBox) return;
     if (wasResize || didMove) this.pushHistory();
+    if (didMove) this.renderEdges();
     this.scheduleSave();
 
     if (!pendingClick || !pendingClick.wasSelected) return;

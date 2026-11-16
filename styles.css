@@ -1217,3 +1217,122 @@
   color: var(--text-normal);
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
 }
+
+.volis-bnode.is-dimmed {
+  opacity: 0.25;
+  transition: opacity 220ms ease;
+}
+
+.volis-board.is-focusing .volis-edges {
+  opacity: 0.2;
+  transition: opacity 220ms ease;
+}
+
+.volis-bnode.is-flash {
+  z-index: 4;
+  animation: volis-flash 700ms ease-in-out 2;
+}
+
+@keyframes volis-flash {
+  0%,
+  100% {
+    box-shadow: 0 0 0 3px var(--interactive-accent);
+  }
+  50% {
+    box-shadow:
+      0 0 0 6px var(--interactive-accent),
+      0 0 22px var(--interactive-accent);
+  }
+}
+
+.volis-insert-empty {
+  padding: 18px 12px;
+  color: var(--text-faint);
+  font-size: 12px;
+  text-align: center;
+}
+
+/* ── Align palette ───────────────────────────────────── */
+
+.volis-align-pop {
+  position: absolute;
+  z-index: 15;
+  display: grid;
+  grid-template-columns: repeat(4, 30px);
+  gap: 3px;
+  padding: 5px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 9px;
+  background: var(--background-primary);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.14);
+}
+
+.volis-guide {
+  stroke: var(--interactive-accent);
+  stroke-width: 1.5px;
+  stroke-dasharray: 5 4;
+  opacity: 1;
+  pointer-events: none;
+  /* Keep the line one and a half screen pixels at every zoom level. */
+  vector-effect: non-scaling-stroke;
+}
+
+/* ── Minimap ─────────────────────────────────────────── */
+
+.volis-minimap {
+  position: absolute;
+  left: 10px;
+  bottom: 10px;
+  z-index: 6;
+  box-sizing: border-box;
+  width: 152px;
+  height: 102px;
+  padding: 4px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 9px;
+  background: var(--background-primary);
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+  cursor: pointer;
+}
+
+.volis-minimap.is-hidden {
+  display: none;
+}
+
+.volis-minimap-svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: 6px;
+}
+
+.volis-mini-node {
+  fill: var(--background-modifier-border);
+  stroke: none;
+}
+
+.volis-mini-node.is-card {
+  fill: #b9b4a8;
+}
+
+.volis-mini-node.is-text {
+  fill: #c9c4b8;
+}
+
+.volis-mini-node.is-file {
+  fill: #a8a49a;
+}
+
+.volis-mini-node.is-group {
+  fill: transparent;
+  stroke: var(--background-modifier-border-hover);
+  stroke-width: 2;
+  stroke-dasharray: 6 4;
+}
+
+.volis-mini-view {
+  fill: var(--interactive-accent);
+  fill-opacity: 0.12;
+  stroke: var(--interactive-accent);
+  stroke-width: 2;
+}
