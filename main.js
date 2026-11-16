@@ -27,7 +27,7 @@ __export(main_exports, {
   default: () => VolisPlugin
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian11 = require("obsidian");
+var import_obsidian14 = require("obsidian");
 
 // src/settings.ts
 var DEFAULT_SETTINGS = {
@@ -37,12 +37,53 @@ var DEFAULT_SETTINGS = {
   cardFolder: "",
   ai: {
     enabled: false,
-    protocol: "anthropic",
-    baseUrl: "",
-    model: "",
-    apiKey: ""
-  }
+    activeId: "",
+    profiles: [],
+    contextLimit: 8e4,
+    compactThreshold: 2e4
+  },
+  conversations: []
 };
+function activeProfile(ai) {
+  var _a, _b;
+  return (_b = (_a = ai.profiles.find((profile) => profile.id === ai.activeId)) != null ? _a : ai.profiles[0]) != null ? _b : null;
+}
+function normalizeAISettings(raw) {
+  var _a, _b, _c, _d, _e;
+  const value = raw != null ? raw : {};
+  if (Array.isArray(value.profiles)) {
+    const profiles = value.profiles;
+    const activeId = typeof value.activeId === "string" ? value.activeId : "";
+    const exists = profiles.some((profile2) => profile2.id === activeId);
+    return {
+      enabled: Boolean(value.enabled),
+      activeId: exists ? activeId : (_b = (_a = profiles[0]) == null ? void 0 : _a.id) != null ? _b : "",
+      profiles,
+      contextLimit: numberOr(value.contextLimit, 8e4),
+      compactThreshold: numberOr(value.compactThreshold, 2e4)
+    };
+  }
+  const legacy = value;
+  const hasLegacy = Boolean(legacy.baseUrl || legacy.model || legacy.apiKey);
+  const profile = {
+    id: "default",
+    name: legacy.model || "\u9ED8\u8BA4\u914D\u7F6E",
+    protocol: legacy.protocol === "anthropic" ? "anthropic" : "openai",
+    baseUrl: (_c = legacy.baseUrl) != null ? _c : "",
+    model: (_d = legacy.model) != null ? _d : "",
+    apiKey: (_e = legacy.apiKey) != null ? _e : ""
+  };
+  return {
+    enabled: Boolean(legacy.enabled),
+    activeId: hasLegacy ? profile.id : "",
+    profiles: hasLegacy ? [profile] : [],
+    contextLimit: 8e4,
+    compactThreshold: 2e4
+  };
+}
+function numberOr(value, fallback) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
+}
 
 // src/parse/cardRef.ts
 var BLOCK_LINK_RE = /\[\[([^\[\]|#]+?)#\^([^\[\]|\n]+)(?:\|([^\]\n]+))?\]\]/g;
@@ -558,7 +599,7 @@ function paint(badge, text, stale) {
 }
 
 // src/board/BoardView.ts
-var import_obsidian7 = require("obsidian");
+var import_obsidian9 = require("obsidian");
 
 // src/ui/inlineEditor.ts
 var InlineEditor = class {
@@ -868,8 +909,35 @@ var RenameModal = class extends import_obsidian5.Modal {
   }
 };
 
-// src/board/cardWriter.ts
+// src/ui/confirmModal.ts
 var import_obsidian6 = require("obsidian");
+var ConfirmModal = class extends import_obsidian6.Modal {
+  constructor(app, heading, message, confirmText, onConfirm) {
+    super(app);
+    this.heading = heading;
+    this.message = message;
+    this.confirmText = confirmText;
+    this.onConfirm = onConfirm;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h3", { text: this.heading });
+    contentEl.createEl("p", { text: this.message, cls: "volis-confirm-text" });
+    new import_obsidian6.Setting(contentEl).addButton((button) => button.setButtonText("\u53D6\u6D88").onClick(() => this.close())).addButton(
+      (button) => button.setButtonText(this.confirmText).setWarning().onClick(() => {
+        this.close();
+        this.onConfirm();
+      })
+    );
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+
+// src/board/cardWriter.ts
+var import_obsidian7 = require("obsidian");
 var DATE_HEADING = /^##[ \t]+(\d{4}-\d{2}-\d{2})[ \t]*$/;
 var CARD_BODY_LINE = /^(\d{1,2}:\d{2})[ \t]+/;
 async function resolveCardFolder(app, fallback) {
@@ -1013,7 +1081,7 @@ async function createNoteFromText(app, folder, content, title = "\u672A\u547D\u5
     }
     const firstPath = dir ? `${dir}/${base}.md` : `${base}.md`;
     const existing = app.vault.getAbstractFileByPath(firstPath);
-    if (existing instanceof import_obsidian6.TFile) {
+    if (existing instanceof import_obsidian7.TFile) {
       const head = (await app.vault.read(existing)).slice(0, 32);
       if (head.startsWith("\u6765\u6E90\uFF1A")) {
         await app.vault.modify(existing, content);
@@ -1032,6 +1100,208 @@ async function createNoteFromText(app, folder, content, title = "\u672A\u547D\u5
     console.error("[Volis] create note failed", error);
     return null;
   }
+}
+
+// src/ai/provider.ts
+var import_obsidian8 = require("obsidian");
+
+// src/ai/url.ts
+function sanitizeBaseUrl(raw) {
+  let value = (raw != null ? raw : "").trim().replace(/\s+/g, "");
+  const duplicated = /^(https?:\/\/)+(https?:\/\/.*)$/i.exec(value);
+  if (duplicated)
+    value = duplicated[2];
+  return value.replace(/\/+$/, "");
+}
+function hostOf(url) {
+  try {
+    return new URL(url).host || url;
+  } catch (e) {
+    return url;
+  }
+}
+function describeNetworkError(error, url) {
+  const message = error instanceof Error ? error.message : String(error);
+  const host = hostOf(url);
+  if (message.includes("ERR_NAME_NOT_RESOLVED")) {
+    return `\u57DF\u540D\u65E0\u6CD5\u89E3\u6790\uFF1A${host}
+\u8BF7\u68C0\u67E5\u300C\u63A5\u53E3\u5730\u5740\u300D\u662F\u5426\u5B8C\u6574\u4E14\u6CA1\u6709\u91CD\u590D\u7684 https://\uFF08\u6B63\u786E\u793A\u4F8B\uFF1Ahttps://api.deepseek.com/v1\uFF09`;
+  }
+  if (message.includes("ERR_CONNECTION_REFUSED")) {
+    return `\u8FDE\u63A5\u88AB\u62D2\u7EDD\uFF1A${host}
+\u5982\u679C\u4F7F\u7528\u672C\u5730\u6A21\u578B\uFF0C\u8BF7\u786E\u8BA4\u670D\u52A1\u5DF2\u7ECF\u542F\u52A8\u3002`;
+  }
+  if (message.includes("ERR_INTERNET_DISCONNECTED")) {
+    return "\u5F53\u524D\u6CA1\u6709\u7F51\u7EDC\u8FDE\u63A5\u3002";
+  }
+  if (message.includes("ERR_CERT") || message.includes("SSL")) {
+    return `HTTPS \u8BC1\u4E66\u6821\u9A8C\u5931\u8D25\uFF1A${host}`;
+  }
+  if (message.toLowerCase().includes("timeout")) {
+    return `\u8BF7\u6C42\u8D85\u65F6\uFF1A${host}`;
+  }
+  return `${message}
+\u8BF7\u6C42\u5730\u5740\uFF1A${url}`;
+}
+
+// src/ai/provider.ts
+var NotConfiguredProvider = class {
+  constructor() {
+    this.id = "none";
+    this.configured = false;
+  }
+  async complete() {
+    throw new Error("AI \u5C1A\u672A\u914D\u7F6E\uFF0C\u8BF7\u5148\u5728\u8BBE\u7F6E\u91CC\u586B\u5199\u63A5\u53E3\u5730\u5740\u548C\u6A21\u578B");
+  }
+};
+function extractReply(data) {
+  var _a, _b, _c;
+  const choice = (_a = data == null ? void 0 : data.choices) == null ? void 0 : _a[0];
+  if (!choice)
+    return "";
+  const content = (_b = choice.message) == null ? void 0 : _b.content;
+  if (typeof content === "string" && content.trim())
+    return content.trim();
+  if (Array.isArray(content)) {
+    const joined = content.map((part) => {
+      var _a2;
+      return typeof part === "string" ? part : (_a2 = part == null ? void 0 : part.text) != null ? _a2 : "";
+    }).join("").trim();
+    if (joined)
+      return joined;
+  }
+  const reasoning = (_c = choice.message) == null ? void 0 : _c.reasoning_content;
+  if (typeof reasoning === "string" && reasoning.trim())
+    return reasoning.trim();
+  if (typeof choice.text === "string" && choice.text.trim())
+    return choice.text.trim();
+  return "";
+}
+function describeHttpError(status, body) {
+  var _a, _b;
+  let detail = "";
+  try {
+    const parsed = JSON.parse(body);
+    detail = (_b = (_a = parsed == null ? void 0 : parsed.error) == null ? void 0 : _a.message) != null ? _b : "";
+  } catch (e) {
+    detail = body.slice(0, 160);
+  }
+  if (status === 401 || status === 403)
+    return "API Key \u65E0\u6548\u6216\u6CA1\u6709\u6743\u9650";
+  if (status === 404)
+    return "\u63A5\u53E3\u5730\u5740\u6216\u6A21\u578B\u540D\u4E0D\u6B63\u786E";
+  if (status === 429)
+    return "\u8BF7\u6C42\u8FC7\u4E8E\u9891\u7E41\u6216\u989D\u5EA6\u4E0D\u8DB3";
+  return detail || `\u8BF7\u6C42\u5931\u8D25\uFF08HTTP ${status}\uFF09`;
+}
+var OpenAICompatibleProvider = class {
+  constructor(settings) {
+    this.settings = settings;
+    this.id = "openai";
+    this.configured = true;
+  }
+  async complete(history, options = {}) {
+    var _a, _b, _c, _d, _e;
+    const messages = [];
+    if (options.system)
+      messages.push({ role: "system", content: options.system });
+    messages.push(...history);
+    const url = `${sanitizeBaseUrl(this.settings.baseUrl)}/chat/completions`;
+    let response;
+    try {
+      response = await (0, import_obsidian8.requestUrl)({
+        url,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.settings.apiKey}`
+        },
+        body: JSON.stringify({
+          model: this.settings.model,
+          messages,
+          max_tokens: (_a = options.maxTokens) != null ? _a : 2048,
+          temperature: 0.6
+        }),
+        throw: false
+      });
+    } catch (error) {
+      throw new Error(describeNetworkError(error, url));
+    }
+    if (response.status >= 400) {
+      throw new Error(describeHttpError(response.status, response.text));
+    }
+    let data = null;
+    try {
+      data = JSON.parse(response.text);
+    } catch (e) {
+      data = null;
+    }
+    if ((_b = data == null ? void 0 : data.error) == null ? void 0 : _b.message) {
+      throw new Error(data.error.message);
+    }
+    const text = extractReply(data);
+    if (text)
+      return text;
+    const reason = (_d = (_c = data == null ? void 0 : data.choices) == null ? void 0 : _c[0]) == null ? void 0 : _d.finish_reason;
+    const summary = ((_e = response.text) != null ? _e : "").replace(/\s+/g, " ").slice(0, 300);
+    throw new Error(
+      `\u6A21\u578B\u6CA1\u6709\u8FD4\u56DE\u5185\u5BB9${reason ? `\uFF08finish_reason: ${reason}\uFF09` : ""}\u3002
+\u54CD\u5E94\uFF1A${summary || "\uFF08\u7A7A\uFF09"}`
+    );
+  }
+};
+var AnthropicProvider = class {
+  constructor(settings) {
+    this.settings = settings;
+    this.id = "anthropic";
+    this.configured = true;
+  }
+  async complete(history, options = {}) {
+    var _a, _b;
+    const base = sanitizeBaseUrl(this.settings.baseUrl);
+    const url = base.endsWith("/v1") ? `${base}/messages` : `${base}/v1/messages`;
+    let response;
+    try {
+      response = await (0, import_obsidian8.requestUrl)({
+        url,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": this.settings.apiKey,
+          "anthropic-version": "2023-06-01"
+        },
+        body: JSON.stringify({
+          model: this.settings.model,
+          max_tokens: (_a = options.maxTokens) != null ? _a : 2048,
+          system: options.system,
+          messages: history
+        }),
+        throw: false
+      });
+    } catch (error) {
+      throw new Error(describeNetworkError(error, url));
+    }
+    if (response.status >= 400) {
+      throw new Error(describeHttpError(response.status, response.text));
+    }
+    const data = response.json;
+    const text = ((_b = data == null ? void 0 : data.content) != null ? _b : []).filter((part) => part.type === "text").map((part) => {
+      var _a2;
+      return (_a2 = part.text) != null ? _a2 : "";
+    }).join("").trim();
+    if (!text)
+      throw new Error("\u6A21\u578B\u6CA1\u6709\u8FD4\u56DE\u5185\u5BB9");
+    return text;
+  }
+};
+function createProvider(profile) {
+  if (!profile || !profile.baseUrl.trim() || !profile.model.trim()) {
+    return new NotConfiguredProvider();
+  }
+  if (profile.protocol === "anthropic") {
+    return new AnthropicProvider(profile);
+  }
+  return new OpenAICompatibleProvider(profile);
 }
 
 // src/board/insertSearch.ts
@@ -1104,7 +1374,7 @@ var NODE_COLORS = [
   { name: "blue", label: "\u84DD", line: "#378add", bg: "#dfeafa" },
   { name: "purple", label: "\u7D2B", line: "#7f77dd", bg: "#e7e5f9" }
 ];
-var _BoardView = class _BoardView extends import_obsidian7.TextFileView {
+var _BoardView = class _BoardView extends import_obsidian9.TextFileView {
   constructor(leaf, plugin) {
     super(leaf);
     this.plugin = plugin;
@@ -1130,6 +1400,23 @@ var _BoardView = class _BoardView extends import_obsidian7.TextFileView {
     this.minimapDragging = false;
     this.selectedEdgeId = null;
     this.nodeText = /* @__PURE__ */ new Map();
+    this.nodeMeta = /* @__PURE__ */ new Map();
+    this.aiPanel = null;
+    this.aiOutside = null;
+    this.aiProvider = null;
+    this.aiTargets = [];
+    this.aiHistory = [];
+    this.aiContextSent = false;
+    this.aiAnswers = [];
+    this.aiPicked = /* @__PURE__ */ new Set();
+    this.aiExpanded = false;
+    this.aiBusy = false;
+    this.aiCancelled = false;
+    this.aiPending = null;
+    this.aiConversationId = null;
+    this.aiRestore = null;
+    this.historyPop = null;
+    this.historyOutside = null;
     this.searchPanel = null;
     this.searchOutside = null;
     this.clipboard = [];
@@ -1255,6 +1542,8 @@ var _BoardView = class _BoardView extends import_obsidian7.TextFileView {
       if (target == null ? void 0 : target.closest(".volis-inline"))
         return;
       if (target == null ? void 0 : target.closest(".volis-insert-panel"))
+        return;
+      if (target == null ? void 0 : target.closest(".volis-ai-panel"))
         return;
       evt.preventDefault();
       if (evt.shiftKey) {
@@ -1472,7 +1761,7 @@ var _BoardView = class _BoardView extends import_obsidian7.TextFileView {
           return;
         if (node.type === "file") {
           const file = this.app.vault.getAbstractFileByPath(node.file);
-          if (file instanceof import_obsidian7.TFile && file.extension.toLowerCase() === "md") {
+          if (file instanceof import_obsidian9.TFile && file.extension.toLowerCase() === "md") {
             void this.openEditor(node);
             return;
           }
@@ -1524,7 +1813,7 @@ var _BoardView = class _BoardView extends import_obsidian7.TextFileView {
       const candidate = plain.trim();
       if (candidate) {
         const direct = this.app.vault.getAbstractFileByPath(candidate);
-        if (direct instanceof import_obsidian7.TFile) {
+        if (direct instanceof import_obsidian9.TFile) {
           await this.addFileNode(direct.path, point);
           return;
         }
@@ -1540,7 +1829,7 @@ var _BoardView = class _BoardView extends import_obsidian7.TextFileView {
             const rel = basePath && full.startsWith(basePath) ? full.slice(basePath.length).replace(/^\//, "") : "";
             if (rel) {
               const inside = this.app.vault.getAbstractFileByPath(rel);
-              if (inside instanceof import_obsidian7.TFile) {
+              if (inside instanceof import_obsidian9.TFile) {
                 await this.addFileNode(inside.path, point);
                 handled = true;
                 continue;
@@ -1601,16 +1890,17 @@ var _BoardView = class _BoardView extends import_obsidian7.TextFileView {
     });
     this.registerEvent(
       this.app.vault.on("modify", (file) => {
-        if (file instanceof import_obsidian7.TFile)
+        if (file instanceof import_obsidian9.TFile)
           void this.refreshNodesForFile(file.path, 80);
       })
     );
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
-        if (file instanceof import_obsidian7.TFile)
+        if (file instanceof import_obsidian9.TFile)
           this.handleFileRename(file.path, oldPath);
       })
     );
+    this.registerEvent(this.app.workspace.on("css-change", () => this.repaintColors()));
     this.loaded = true;
   }
   /**
@@ -1688,7 +1978,7 @@ var _BoardView = class _BoardView extends import_obsidian7.TextFileView {
         cls: "volis-board-btn",
         attr: { "aria-label": label }
       });
-      (0, import_obsidian7.setIcon)(button, icon);
+      (0, import_obsidian9.setIcon)(button, icon);
       button.addEventListener("click", (evt) => {
         evt.preventDefault();
         evt.stopPropagation();
@@ -1777,7 +2067,7 @@ var _BoardView = class _BoardView extends import_obsidian7.TextFileView {
         this.world.empty();
       this.updateHint();
       this.updateToolbar();
-      new import_obsidian7.Notice("\u767D\u677F\u6587\u4EF6\u65E0\u6CD5\u89E3\u6790\uFF0C\u5DF2\u4FDD\u62A4\u539F\u6587\u4EF6\u4E0D\u88AB\u8986\u76D6");
+      new import_obsidian9.Notice("\u767D\u677F\u6587\u4EF6\u65E0\u6CD5\u89E3\u6790\uFF0C\u5DF2\u4FDD\u62A4\u539F\u6587\u4EF6\u4E0D\u88AB\u8986\u76D6");
       return;
     }
     this.rawFallback = null;
@@ -1838,7 +2128,7 @@ var _BoardView = class _BoardView extends import_obsidian7.TextFileView {
     if (node.type === "group")
       return;
     const file = this.app.vault.getAbstractFileByPath(node.file);
-    if (!(file instanceof import_obsidian7.TFile))
+    if (!(file instanceof import_obsidian9.TFile))
       return;
     const leaf = this.app.workspace.getLeaf(mode === "window" ? "window" : "tab");
     void leaf.openFile(file);
@@ -1851,8 +2141,8 @@ var _BoardView = class _BoardView extends import_obsidian7.TextFileView {
    */
   async openCardView(node, mode) {
     const source = this.app.vault.getAbstractFileByPath(node.file);
-    if (!(source instanceof import_obsidian7.TFile)) {
-      new import_obsidian7.Notice("\u6E90\u7B14\u8BB0\u4E0D\u5B58\u5728");
+    if (!(source instanceof import_obsidian9.TFile)) {
+      new import_obsidian9.Notice("\u6E90\u7B14\u8BB0\u4E0D\u5B58\u5728");
       return;
     }
     const baseName = source.basename;
@@ -1873,7 +2163,7 @@ var _BoardView = class _BoardView extends import_obsidian7.TextFileView {
       await leaf.openFile(file, { state: { mode: "preview" } });
     } catch (error) {
       console.error("[Volis] open card view failed", error);
-      new import_obsidian7.Notice("\u6253\u5F00\u5361\u7247\u5931\u8D25");
+      new import_obsidian9.Notice("\u6253\u5F00\u5361\u7247\u5931\u8D25");
     }
   }
   /**
@@ -1889,32 +2179,31 @@ var _BoardView = class _BoardView extends import_obsidian7.TextFileView {
   paintColor(el, color) {
     el.style.removeProperty("background");
     el.style.removeProperty("border-color");
+    el.style.removeProperty("color");
     if (!color)
       return;
+    const dark = document.body.classList.contains("theme-dark");
+    const isGroup = el.classList.contains("is-group");
+    const ink = dark ? "#eceff1" : "#1f2225";
+    const applyFill = (line, lightFill, groupFill) => {
+      el.style.borderColor = line;
+      el.style.background = dark ? this.tintOf(line, isGroup ? 0.45 : 0.66) : lightFill;
+      el.style.color = ink;
+      if (isGroup)
+        el.style.setProperty("--group-tint", line);
+      else
+        el.style.removeProperty("--group-tint");
+    };
     if (color.startsWith("#")) {
-      if (el.classList.contains("is-group")) {
-        el.style.borderColor = color;
-        el.style.setProperty("--group-tint", color);
-        el.style.background = `${color}14`;
-        return;
-      }
-      el.style.background = this.tintOf(color);
-      el.style.borderColor = color;
+      applyFill(color, this.tintOf(color), `${color}14`);
       return;
     }
     const preset = NODE_COLORS.find((item) => item.name === color);
     if (!preset)
       return;
-    if (el.classList.contains("is-group")) {
-      el.style.borderColor = preset.line;
-      el.style.setProperty("--group-tint", preset.line);
-      el.style.background = `${preset.line}14`;
-      return;
-    }
-    el.style.background = preset.bg;
-    el.style.borderColor = preset.line;
+    applyFill(preset.line, preset.bg, `${preset.line}14`);
   }
-  /** Blend a colour towards the page background, light or dark. */
+  /** Blends a colour towards white (light theme) or the board surface (dark). */
   tintOf(hex, amount = 0.84) {
     const raw = hex.replace("#", "");
     if (raw.length !== 6)
@@ -1924,9 +2213,71 @@ var _BoardView = class _BoardView extends import_obsidian7.TextFileView {
     const g = num >> 8 & 255;
     const b = num & 255;
     const dark = document.body.classList.contains("theme-dark");
-    const base = dark ? 26 : 255;
+    const base = dark ? 38 : 255;
     const blend = (channel) => Math.round(channel + (base - channel) * amount);
     return `#${[blend(r), blend(g), blend(b)].map((value) => value.toString(16).padStart(2, "0")).join("")}`;
+  }
+  closeColorPop() {
+    var _a;
+    (_a = this.colorPop) == null ? void 0 : _a.remove();
+    this.colorPop = null;
+    if (this.colorOutside) {
+      document.removeEventListener("mousedown", this.colorOutside, true);
+      this.colorOutside = null;
+    }
+  }
+  showColorPop(nodes, evt) {
+    var _a;
+    this.closeColorPop();
+    if (nodes.length === 0)
+      return;
+    const pop = this.root.createDiv({ cls: "volis-color-pop" });
+    this.colorPop = pop;
+    pop.addEventListener("pointerdown", (event) => event.stopPropagation());
+    for (const color of NODE_COLORS) {
+      const swatch = pop.createEl("button", {
+        cls: "volis-swatch",
+        attr: { "aria-label": color.label }
+      });
+      swatch.dataset.color = color.name;
+      swatch.addEventListener("click", () => {
+        this.applyNodeColor(nodes, color.name);
+        this.closeColorPop();
+      });
+    }
+    const custom = pop.createEl("label", {
+      cls: "volis-swatch is-custom",
+      attr: { "aria-label": "\u81EA\u5B9A\u4E49\u989C\u8272" }
+    });
+    const picker = custom.createEl("input", { attr: { type: "color" } });
+    picker.value = (_a = this.currentColorOf(nodes)) != null ? _a : "#7f77dd";
+    picker.addEventListener("input", () => this.applyNodeColor(nodes, picker.value));
+    picker.addEventListener("change", () => {
+      this.applyNodeColor(nodes, picker.value);
+      this.closeColorPop();
+    });
+    const clear = pop.createEl("button", {
+      cls: "volis-swatch is-clear",
+      attr: { "aria-label": "\u65E0\u989C\u8272" }
+    });
+    (0, import_obsidian9.setIcon)(clear, "ban");
+    clear.addEventListener("click", () => {
+      this.applyNodeColor(nodes, "");
+      this.closeColorPop();
+    });
+    const rect = this.root.getBoundingClientRect();
+    const popWidth = 260;
+    pop.style.left = `${Math.round(
+      Math.max(8, Math.min(evt.clientX - rect.left - 20, rect.width - popWidth - 8))
+    )}px`;
+    pop.style.top = `${Math.round(Math.max(8, evt.clientY - rect.top + 12))}px`;
+    this.colorOutside = (event) => {
+      const target = event.target;
+      if (target && pop.contains(target))
+        return;
+      this.closeColorPop();
+    };
+    document.addEventListener("mousedown", this.colorOutside, true);
   }
   closeAlignPop() {
     var _a;
@@ -1959,12 +2310,14 @@ var _BoardView = class _BoardView extends import_obsidian7.TextFileView {
         cls: "volis-tool-btn",
         attr: { "aria-label": action.label }
       });
-      (0, import_obsidian7.setIcon)(button, action.icon);
+      (0, import_obsidian9.setIcon)(button, action.icon);
       button.addEventListener("click", () => action.run());
     }
     const rect = this.root.getBoundingClientRect();
     const width = 168;
-    pop.style.left = `${Math.round(Math.max(8, Math.min(evt.clientX - rect.left - 40, rect.width - width - 8)))}px`;
+    pop.style.left = `${Math.round(
+      Math.max(8, Math.min(evt.clientX - rect.left - 40, rect.width - width - 8))
+    )}px`;
     pop.style.top = `${Math.round(Math.max(8, evt.clientY - rect.top + 12))}px`;
     this.alignOutside = (event) => {
       const target = event.target;
@@ -2063,68 +2416,6 @@ var _BoardView = class _BoardView extends import_obsidian7.TextFileView {
     }
     this.afterLayout();
   }
-  closeColorPop() {
-    var _a;
-    (_a = this.colorPop) == null ? void 0 : _a.remove();
-    this.colorPop = null;
-    if (this.colorOutside) {
-      document.removeEventListener("mousedown", this.colorOutside, true);
-      this.colorOutside = null;
-    }
-  }
-  showColorPop(nodes, evt) {
-    var _a;
-    this.closeColorPop();
-    if (nodes.length === 0)
-      return;
-    const pop = this.root.createDiv({ cls: "volis-color-pop" });
-    this.colorPop = pop;
-    pop.addEventListener("pointerdown", (event) => event.stopPropagation());
-    for (const color of NODE_COLORS) {
-      const swatch = pop.createEl("button", {
-        cls: "volis-swatch",
-        attr: { "aria-label": color.label }
-      });
-      swatch.dataset.color = color.name;
-      swatch.addEventListener("click", () => {
-        this.applyNodeColor(nodes, color.name);
-        this.closeColorPop();
-      });
-    }
-    const custom = pop.createEl("label", {
-      cls: "volis-swatch is-custom",
-      attr: { "aria-label": "\u81EA\u5B9A\u4E49\u989C\u8272" }
-    });
-    const picker = custom.createEl("input", { attr: { type: "color" } });
-    picker.value = (_a = this.currentColorOf(nodes)) != null ? _a : "#7f77dd";
-    picker.addEventListener("input", () => {
-      this.applyNodeColor(nodes, picker.value);
-    });
-    picker.addEventListener("change", () => {
-      this.applyNodeColor(nodes, picker.value);
-      this.closeColorPop();
-    });
-    const clear = pop.createEl("button", {
-      cls: "volis-swatch is-clear",
-      attr: { "aria-label": "\u65E0\u989C\u8272" }
-    });
-    (0, import_obsidian7.setIcon)(clear, "ban");
-    clear.addEventListener("click", () => {
-      this.applyNodeColor(nodes, "");
-      this.closeColorPop();
-    });
-    const rect = this.root.getBoundingClientRect();
-    const popWidth = 240;
-    pop.style.left = `${Math.round(Math.max(8, Math.min(evt.clientX - rect.left - 20, rect.width - popWidth - 8)))}px`;
-    pop.style.top = `${Math.round(Math.max(8, evt.clientY - rect.top + 12))}px`;
-    this.colorOutside = (event) => {
-      const target = event.target;
-      if (target && pop.contains(target))
-        return;
-      this.closeColorPop();
-    };
-    document.addEventListener("mousedown", this.colorOutside, true);
-  }
   currentColorOf(nodes) {
     var _a, _b;
     return (_b = (_a = nodes[0]) == null ? void 0 : _a.color) != null ? _b : null;
@@ -2147,7 +2438,7 @@ var _BoardView = class _BoardView extends import_obsidian7.TextFileView {
     this.scheduleSave();
   }
   showMoreMenu(node, evt) {
-    const menu = new import_obsidian7.Menu();
+    const menu = new import_obsidian9.Menu();
     if (node.type === "text") {
       menu.addItem(
         (item) => item.setTitle("\u8F6C\u4E3A\u5361\u7247\u7B14\u8BB0").setIcon("list").onClick(() => {
@@ -2186,12 +2477,12 @@ var _BoardView = class _BoardView extends import_obsidian7.TextFileView {
       linkpath: ""
     });
     if (meta.stale) {
-      new import_obsidian7.Notice("\u5361\u7247\u5DF2\u4E0D\u5B58\u5728");
+      new import_obsidian9.Notice("\u5361\u7247\u5DF2\u4E0D\u5B58\u5728");
       return;
     }
     const text = meta.editable.trim();
     if (!text) {
-      new import_obsidian7.Notice("\u5361\u7247\u5185\u5BB9\u4E3A\u7A7A");
+      new import_obsidian9.Notice("\u5361\u7247\u5185\u5BB9\u4E3A\u7A7A");
       return;
     }
     const title = this.deriveTitle(text);
@@ -2205,7 +2496,7 @@ ${text}
     const folder = (_a = this.plugin.settings.boardFolder) != null ? _a : "";
     const file = await createNoteFromText(this.app, folder, content, title);
     if (!file) {
-      new import_obsidian7.Notice("\u8F6C\u6362\u5931\u8D25\uFF1A\u65E0\u6CD5\u521B\u5EFA\u7B14\u8BB0");
+      new import_obsidian9.Notice("\u8F6C\u6362\u5931\u8D25\uFF1A\u65E0\u6CD5\u521B\u5EFA\u7B14\u8BB0");
       return;
     }
     const next = {
@@ -2227,7 +2518,7 @@ ${text}
     this.pushHistory();
     this.scheduleSave();
     this.updateToolbar();
-    new import_obsidian7.Notice("\u5DF2\u8F6C\u4E3A\u72EC\u7ACB\u7B14\u8BB0\uFF0C\u6E90\u5361\u7247\u4FDD\u7559");
+    new import_obsidian9.Notice("\u5DF2\u8F6C\u4E3A\u72EC\u7ACB\u7B14\u8BB0\uFF0C\u6E90\u5361\u7247\u4FDD\u7559");
   }
   async convertToCard(node) {
     const current = this.nodeMap.get(node.id);
@@ -2235,13 +2526,13 @@ ${text}
       return;
     const text = current.text.trim();
     if (!text) {
-      new import_obsidian7.Notice("\u5185\u5BB9\u4E3A\u7A7A\uFF0C\u65E0\u6CD5\u8F6C\u6362");
+      new import_obsidian9.Notice("\u5185\u5BB9\u4E3A\u7A7A\uFF0C\u65E0\u6CD5\u8F6C\u6362");
       return;
     }
     const folder = await resolveCardFolder(this.app, this.plugin.settings.cardFolder);
     const result = await appendCard(this.app, folder, text);
     if (!result) {
-      new import_obsidian7.Notice("\u8F6C\u6362\u5931\u8D25\uFF1A\u5199\u5165\u5361\u7247\u6587\u4EF6\u540E\u6821\u9A8C\u672A\u901A\u8FC7");
+      new import_obsidian9.Notice("\u8F6C\u6362\u5931\u8D25\uFF1A\u5199\u5165\u5361\u7247\u6587\u4EF6\u540E\u6821\u9A8C\u672A\u901A\u8FC7");
       return;
     }
     const { x, y, width, height } = current;
@@ -2251,7 +2542,7 @@ ${text}
     this.detachNodeElement(current.id);
     const added = await this.addCardNodeAt(result.file, result.blockId, x, y, width, height);
     if (!added) {
-      new import_obsidian7.Notice("\u5361\u7247\u5DF2\u5199\u5165\u7B14\u8BB0\uFF0C\u4F46\u672A\u80FD\u6DFB\u52A0\u5230\u767D\u677F");
+      new import_obsidian9.Notice("\u5361\u7247\u5DF2\u5199\u5165\u7B14\u8BB0\uFF0C\u4F46\u672A\u80FD\u6DFB\u52A0\u5230\u767D\u677F");
       this.scheduleSave();
       return;
     }
@@ -2261,7 +2552,7 @@ ${text}
     this.updateHint();
     this.pushHistory();
     this.updateToolbar();
-    new import_obsidian7.Notice("\u5DF2\u8F6C\u4E3A\u5361\u7247\u7B14\u8BB0");
+    new import_obsidian9.Notice("\u5DF2\u8F6C\u4E3A\u5361\u7247\u7B14\u8BB0");
   }
   async addCardNodeAt(file, blockId, x, y, width, height) {
     const node = {
@@ -2287,12 +2578,12 @@ ${text}
       return;
     const text = current.text.trim();
     if (!text) {
-      new import_obsidian7.Notice("\u5185\u5BB9\u4E3A\u7A7A\uFF0C\u65E0\u6CD5\u8F6C\u6362");
+      new import_obsidian9.Notice("\u5185\u5BB9\u4E3A\u7A7A\uFF0C\u65E0\u6CD5\u8F6C\u6362");
       return;
     }
     const file = await createNoteFromText(this.app, (_a = this.plugin.settings.boardFolder) != null ? _a : "", text);
     if (!file) {
-      new import_obsidian7.Notice("\u8F6C\u6362\u5931\u8D25\uFF1A\u65E0\u6CD5\u521B\u5EFA\u7B14\u8BB0\u6587\u4EF6");
+      new import_obsidian9.Notice("\u8F6C\u6362\u5931\u8D25\uFF1A\u65E0\u6CD5\u521B\u5EFA\u7B14\u8BB0\u6587\u4EF6");
       return;
     }
     const next = {
@@ -2314,7 +2605,7 @@ ${text}
     this.pushHistory();
     this.scheduleSave();
     this.updateToolbar();
-    new import_obsidian7.Notice("\u5DF2\u8F6C\u4E3A\u72EC\u7ACB\u7B14\u8BB0");
+    new import_obsidian9.Notice("\u5DF2\u8F6C\u4E3A\u72EC\u7ACB\u7B14\u8BB0");
   }
   buildToolbarActions() {
     const single = (nodes) => nodes.length === 1;
@@ -2357,6 +2648,12 @@ ${text}
         run: (nodes, evt) => this.showColorPop(nodes, evt)
       },
       {
+        id: "ai",
+        icon: "sparkles",
+        label: "AI \u5206\u6790",
+        run: () => this.openAIPanel()
+      },
+      {
         id: "more",
         icon: "more-horizontal",
         label: "\u66F4\u591A",
@@ -2389,7 +2686,14 @@ ${text}
     try {
       await this.app.fileManager.renameFile(file, `${prefix}${name}.volis`);
     } catch (error) {
-      new import_obsidian7.Notice("\u91CD\u547D\u540D\u5931\u8D25\uFF1A\u540D\u79F0\u53EF\u80FD\u91CD\u590D\u6216\u5305\u542B\u975E\u6CD5\u5B57\u7B26");
+      new import_obsidian9.Notice("\u91CD\u547D\u540D\u5931\u8D25\uFF1A\u540D\u79F0\u53EF\u80FD\u91CD\u590D\u6216\u5305\u542B\u975E\u6CD5\u5B57\u7B26");
+    }
+  }
+  repaintColors() {
+    for (const node of this.nodes) {
+      const el = this.nodeEls.get(node.id);
+      if (el)
+        this.paintColor(el, node.color);
     }
   }
   hasEditingNode() {
@@ -2520,7 +2824,7 @@ ${text}
           attr: { "aria-label": action.label }
         });
         button.disabled = action.enabled ? !action.enabled(nodes) : false;
-        (0, import_obsidian7.setIcon)(button, action.icon);
+        (0, import_obsidian9.setIcon)(button, action.icon);
         button.addEventListener("click", (evt) => {
           evt.preventDefault();
           evt.stopPropagation();
@@ -2662,7 +2966,7 @@ ${text}
   }
   async undo() {
     if (this.hasEditingNode()) {
-      new import_obsidian7.Notice("\u8BF7\u5148\u7ED3\u675F\u7F16\u8F91\u518D\u64A4\u9500");
+      new import_obsidian9.Notice("\u8BF7\u5148\u7ED3\u675F\u7F16\u8F91\u518D\u64A4\u9500");
       return;
     }
     if (this.historyIndex <= 0)
@@ -2673,7 +2977,7 @@ ${text}
   }
   async redo() {
     if (this.hasEditingNode()) {
-      new import_obsidian7.Notice("\u8BF7\u5148\u7ED3\u675F\u7F16\u8F91\u518D\u91CD\u505A");
+      new import_obsidian9.Notice("\u8BF7\u5148\u7ED3\u675F\u7F16\u8F91\u518D\u91CD\u505A");
       return;
     }
     if (this.historyIndex >= this.history.length - 1)
@@ -2770,8 +3074,7 @@ ${text}
       this.nodeMap.delete(id);
       this.staleIds.delete(id);
     }
-    this.edges = this.edges.filter((edge) => !ids.has(edge.from) && !ids.has(edge.to));
-    this.selectedEdgeId = null;
+    this.pruneEdges();
     this.renderEdges();
     this.selection.clear();
     this.updateFrame();
@@ -3108,7 +3411,7 @@ ${text}
     this.nodeText.set(node.id, node.text);
     if (!node.text.trim())
       return;
-    await import_obsidian7.MarkdownRenderer.render(this.app, node.text, body, "", this);
+    await import_obsidian9.MarkdownRenderer.render(this.app, node.text, body, "", this);
     this.decorateNumericTags(body);
   }
   async renderCardBody(el, node) {
@@ -3125,7 +3428,8 @@ ${text}
       return;
     }
     this.nodeText.set(node.id, meta.editable);
-    await import_obsidian7.MarkdownRenderer.render(this.app, normalizeTags(meta.body), body, node.file, this);
+    this.nodeMeta.set(node.id, { date: meta.date, time: meta.time, tags: meta.tags });
+    await import_obsidian9.MarkdownRenderer.render(this.app, normalizeTags(meta.body), body, node.file, this);
     this.decorateNumericTags(body);
     const parts = [];
     if (meta.date)
@@ -3137,9 +3441,9 @@ ${text}
   async renderFileBody(el, node) {
     el.addClass("is-file");
     const file = this.app.vault.getAbstractFileByPath(node.file);
-    if (file instanceof import_obsidian7.TFile)
+    if (file instanceof import_obsidian9.TFile)
       this.nodeText.set(node.id, file.basename);
-    if (!(file instanceof import_obsidian7.TFile)) {
+    if (!(file instanceof import_obsidian9.TFile)) {
       this.staleIds.add(node.id);
       el.createDiv({ cls: "volis-bnode-placeholder", text: "\u6587\u4EF6\u7F3A\u5931" });
       return;
@@ -3157,7 +3461,7 @@ ${text}
         content = "";
       }
       if (content.trim()) {
-        await import_obsidian7.MarkdownRenderer.render(this.app, content, body, file.path, this);
+        await import_obsidian9.MarkdownRenderer.render(this.app, content, body, file.path, this);
         this.decorateNumericTags(body);
       } else {
         body.createDiv({ cls: "volis-bnode-placeholder", text: "\u7A7A\u7B14\u8BB0" });
@@ -3296,7 +3600,7 @@ ${text}
   }
   showBoardMenu(evt) {
     var _a;
-    const menu = new import_obsidian7.Menu();
+    const menu = new import_obsidian9.Menu();
     const stale = this.staleIds.size;
     menu.addItem(
       (item) => item.setTitle("\u67E5\u627E\u8282\u70B9").setIcon("search").onClick(() => this.openNodeSearch())
@@ -3317,9 +3621,25 @@ ${text}
       dom.style.top = `${Math.round(rect.bottom + 6)}px`;
     }
   }
+  /**
+   * Drops connections whose endpoints no longer exist. Both delete paths call
+   * this, so a removed node never leaves a dangling line behind.
+   */
+  pruneEdges() {
+    const before = this.edges.length;
+    this.edges = this.edges.filter(
+      (edge) => this.nodeMap.has(edge.from) && this.nodeMap.has(edge.to)
+    );
+    if (this.edges.length === before)
+      return;
+    if (this.selectedEdgeId && !this.edges.some((edge) => edge.id === this.selectedEdgeId)) {
+      this.selectedEdgeId = null;
+      this.updateEdgeBar();
+    }
+  }
   cleanupStaleNodes() {
     if (this.hasEditingNode()) {
-      new import_obsidian7.Notice("\u8BF7\u5148\u7ED3\u675F\u7F16\u8F91\u518D\u6E05\u7406");
+      new import_obsidian9.Notice("\u8BF7\u5148\u7ED3\u675F\u7F16\u8F91\u518D\u6E05\u7406");
       return;
     }
     if (this.staleIds.size === 0)
@@ -3335,11 +3655,13 @@ ${text}
       this.selection.delete(id);
     }
     this.staleIds.clear();
+    this.pruneEdges();
+    this.renderEdges();
     this.updateFrame();
     this.updateHint();
     this.pushHistory();
     this.scheduleSave();
-    new import_obsidian7.Notice(`\u5DF2\u6E05\u7406 ${ids.size} \u4E2A\u5931\u6548\u8282\u70B9\uFF0C\u53EF\u6309 Ctrl+Z \u64A4\u9500`);
+    new import_obsidian9.Notice(`\u5DF2\u6E05\u7406 ${ids.size} \u4E2A\u5931\u6548\u8282\u70B9\uFF0C\u53EF\u6309 Ctrl+Z \u64A4\u9500`);
   }
   updateHistoryButtons() {
     if (this.undoBtn)
@@ -3445,6 +3767,796 @@ ${text}
         other.removeClass("is-dimmed");
     }, 1600);
   }
+  closeAiPanel() {
+    var _a;
+    this.closeHistoryPop();
+    if (this.aiOutside) {
+      document.removeEventListener("mousedown", this.aiOutside, true);
+      this.aiOutside = null;
+    }
+    (_a = this.aiPanel) == null ? void 0 : _a.remove();
+    this.aiPanel = null;
+  }
+  /**
+   * Turns the selected nodes into a compact structured description. Positions,
+   * groups and colours are included because they carry meaning the model cannot
+   * infer from the text alone.
+   */
+  describeNodes(nodes, perNodeLimit) {
+    var _a, _b;
+    const index = /* @__PURE__ */ new Map();
+    nodes.forEach((node, i) => index.set(node.id, `N${i + 1}`));
+    const blocks = [];
+    for (const node of nodes) {
+      const tag = index.get(node.id);
+      if (!tag)
+        continue;
+      if (node.type === "group") {
+        const members = this.groupMembers(node).map((member) => index.get(member.id)).filter((id) => Boolean(id));
+        blocks.push(
+          `\u3010${tag}\u3011\u5206\u7EC4\u300C${(_a = node.label) != null ? _a : "\u672A\u547D\u540D"}\u300D${members.length ? `\u5305\u542B ${members.join("\u3001")}` : "\uFF08\u7A7A\uFF09"}`
+        );
+        continue;
+      }
+      const kind = node.type === "card" ? "\u5361\u7247" : node.type === "file" ? "\u7B14\u8BB0" : "\u6587\u672C\u8282\u70B9";
+      const full = ((_b = this.nodeText.get(node.id)) != null ? _b : "").replace(/\s+/g, " ").trim();
+      const text = full.length > perNodeLimit ? `${full.slice(0, perNodeLimit)}\u2026\uFF08\u540E\u7565\uFF09` : full;
+      const meta = this.nodeMeta.get(node.id);
+      const bits = [kind];
+      if (meta == null ? void 0 : meta.date)
+        bits.push(meta.date + (meta.time ? ` ${meta.time}` : ""));
+      if (meta == null ? void 0 : meta.tags.length)
+        bits.push(meta.tags.map((tagText) => `#${tagText}`).join(" "));
+      if (node.color)
+        bits.push(`\u989C\u8272:${node.color}`);
+      blocks.push(`\u3010${tag}\u3011${bits.join(" \xB7 ")}
+${text || "\uFF08\u7A7A\uFF09"}`);
+    }
+    const relations = this.edges.filter((edge) => index.has(edge.from) && index.has(edge.to)).map((edge) => {
+      const label = edge.label ? `\uFF08${edge.label}\uFF09` : "";
+      return `${index.get(edge.from)} \u2192 ${index.get(edge.to)}${label}`;
+    });
+    if (relations.length > 0)
+      blocks.push(`\u3010\u5173\u7CFB\u3011
+${relations.join("\n")}`);
+    return blocks.join("\n\n");
+  }
+  /**
+   * Builds the board description within a character budget. Falls back in two
+   * steps so a large board degrades gracefully instead of failing the request.
+   */
+  buildBoardContext(nodes, limit) {
+    const full = this.describeNodes(nodes, Number.POSITIVE_INFINITY);
+    if (full.length <= limit)
+      return { text: full, note: "" };
+    const trimmed = this.describeNodes(nodes, 400);
+    if (trimmed.length <= limit) {
+      return { text: trimmed, note: "\u5185\u5BB9\u8F83\u957F\uFF0C\u6BCF\u4E2A\u8282\u70B9\u5DF2\u7CBE\u7B80\u4E3A\u524D 400 \u5B57" };
+    }
+    const half = Math.max(1, Math.floor(nodes.length / 2));
+    const partial = this.describeNodes(nodes.slice(0, half), 300);
+    return {
+      text: partial,
+      note: `\u8282\u70B9\u8F83\u591A\uFF0C\u672C\u6B21\u53EA\u53D1\u9001\u4E86\u524D ${half} \u4E2A\uFF08\u5171 ${nodes.length} \u4E2A\uFF09`
+    };
+  }
+  historyChars() {
+    return this.aiHistory.reduce((sum, message) => sum + message.content.length, 0);
+  }
+  /** Collapses early turns into one summary, keeping the last two exchanges raw. */
+  async compactHistory(provider, threshold) {
+    if (this.aiHistory.length <= 4 || this.historyChars() <= threshold)
+      return;
+    const recent = this.aiHistory.slice(-4);
+    const older = this.aiHistory.slice(0, -4);
+    const transcript = older.map((message) => `${message.role === "user" ? "\u7528\u6237" : "\u52A9\u624B"}\uFF1A${message.content}`).join("\n\n");
+    let summary = "";
+    try {
+      summary = await provider.complete(
+        [
+          {
+            role: "user",
+            content: `\u8BF7\u628A\u4E0B\u9762\u8FD9\u6BB5\u5BF9\u8BDD\u538B\u7F29\u6210\u8981\u70B9\uFF0C\u4FDD\u7559\u7ED3\u8BBA\u3001\u5224\u65AD\u3001\u7528\u6237\u610F\u56FE\u548C\u672A\u89E3\u51B3\u7684\u95EE\u9898\uFF0C\u53BB\u6389\u8FC7\u7A0B\u63CF\u8FF0\u4E0E\u91CD\u590D\u5185\u5BB9\uFF1A
+
+${transcript}`
+          }
+        ],
+        { system: "\u4F60\u662F\u5BF9\u8BDD\u6458\u8981\u52A9\u624B\u3002\u53EA\u8F93\u51FA\u6458\u8981\u6B63\u6587\uFF0C\u4E0D\u8981\u5BD2\u6684\uFF0C\u4E0D\u8981\u6807\u9898\u3002", maxTokens: 600 }
+      );
+    } catch (error) {
+      return;
+    }
+    if (!summary.trim())
+      return;
+    const block = `\u3010\u6B64\u524D\u5BF9\u8BDD\u6458\u8981\u3011
+${summary.trim()}`;
+    const head = recent[0];
+    this.aiHistory = head.role === "user" ? [{ role: "user", content: `${block}
+
+${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...recent];
+    new import_obsidian9.Notice("\u5BF9\u8BDD\u8F83\u957F\uFF0C\u65E9\u671F\u7684\u5F80\u6765\u5DF2\u538B\u7F29\u4E3A\u6458\u8981");
+  }
+  openAIPanel() {
+    var _a;
+    this.closeAiPanel();
+    const profile = activeProfile(this.plugin.settings.ai);
+    const provider = createProvider(profile);
+    if (!this.plugin.settings.ai.enabled || !provider.configured) {
+      new import_obsidian9.Notice("\u8BF7\u5148\u5728\u8BBE\u7F6E\u4E2D\u542F\u7528 AI \u5E76\u6DFB\u52A0\u4E00\u4E2A\u6A21\u578B\u914D\u7F6E");
+      return;
+    }
+    const selected = this.selectedNodes();
+    const targets = selected.length > 0 ? selected : this.nodes.slice(0, 200);
+    if (targets.length === 0) {
+      new import_obsidian9.Notice("\u767D\u677F\u4E0A\u8FD8\u6CA1\u6709\u8282\u70B9");
+      return;
+    }
+    this.aiProvider = provider;
+    this.aiTargets = targets;
+    this.aiHistory = [];
+    this.aiContextSent = false;
+    this.aiAnswers = [];
+    this.aiPicked = /* @__PURE__ */ new Set();
+    this.aiBusy = false;
+    this.aiConversationId = null;
+    this.aiExpanded = false;
+    const rect = this.root.getBoundingClientRect();
+    const box = this.selectionBox(targets);
+    const panel = this.root.createDiv({ cls: "volis-ai-panel" });
+    this.aiPanel = panel;
+    panel.addEventListener("pointerdown", (evt) => evt.stopPropagation());
+    panel.addEventListener("dblclick", (evt) => evt.stopPropagation());
+    const head = panel.createDiv({ cls: "volis-ai-head" });
+    const headIcon = head.createDiv({ cls: "volis-ai-head-icon" });
+    (0, import_obsidian9.setIcon)(headIcon, "sparkles");
+    head.createDiv({
+      cls: "volis-ai-head-title",
+      text: `${selected.length > 0 ? "\u5206\u6790\u9009\u4E2D\u7684" : "\u5206\u6790\u5168\u90E8"} ${targets.length} \u4E2A\u8282\u70B9`
+    });
+    head.createDiv({ cls: "volis-ai-head-model", text: (_a = profile == null ? void 0 : profile.name) != null ? _a : "" });
+    head.createDiv({ cls: "volis-ai-head-spacer" });
+    const newBtn = head.createEl("button", {
+      cls: "volis-ai-head-btn",
+      attr: { "aria-label": "\u65B0\u5BF9\u8BDD" }
+    });
+    (0, import_obsidian9.setIcon)(newBtn, "square-pen");
+    const historyBtn = head.createEl("button", {
+      cls: "volis-ai-head-btn",
+      attr: { "aria-label": "\u5386\u53F2\u5BF9\u8BDD" }
+    });
+    (0, import_obsidian9.setIcon)(historyBtn, "history");
+    const expandBtn = head.createEl("button", {
+      cls: "volis-ai-head-btn",
+      attr: { "aria-label": "\u5C55\u5F00" }
+    });
+    (0, import_obsidian9.setIcon)(expandBtn, "maximize-2");
+    const closeBtn = head.createEl("button", {
+      cls: "volis-ai-head-btn",
+      attr: { "aria-label": "\u5173\u95ED" }
+    });
+    (0, import_obsidian9.setIcon)(closeBtn, "x");
+    const stream = panel.createDiv({ cls: "volis-ai-stream" });
+    const compose = panel.createDiv({ cls: "volis-ai-compose" });
+    const input = compose.createEl("input", {
+      cls: "volis-ai-input",
+      attr: { type: "text", placeholder: "\u95EE\u70B9\u4EC0\u4E48\uFF0C\u6216\u7EE7\u7EED\u8FFD\u95EE\u2026" }
+    });
+    const sendBtn = compose.createEl("button", {
+      cls: "volis-ai-send",
+      attr: { "aria-label": "\u53D1\u9001" }
+    });
+    (0, import_obsidian9.setIcon)(sendBtn, "arrow-up");
+    const actions = panel.createDiv({ cls: "volis-ai-actions" });
+    const insertBtn = actions.createEl("button", {
+      cls: "volis-ai-btn is-primary",
+      text: "\u63D2\u5165\u4E3A\u65B0\u8282\u70B9"
+    });
+    const overwriteBtn = actions.createEl("button", { cls: "volis-ai-btn", text: "\u8986\u76D6\u539F\u8282\u70B9" });
+    const noteBtn = actions.createEl("button", { cls: "volis-ai-btn", text: "\u5B58\u4E3A\u7B14\u8BB0" });
+    actions.createDiv({ cls: "volis-ai-esc", text: "Esc \u9000\u51FA" });
+    insertBtn.disabled = true;
+    noteBtn.disabled = true;
+    const single = targets.length === 1 ? targets[0] : null;
+    const overwriteTarget = single && (single.type === "text" || single.type === "card" || single.type === "file" && single.file.toLowerCase().endsWith(".md")) ? single : null;
+    if (!overwriteTarget) {
+      overwriteBtn.addClass("is-hidden");
+    } else {
+      overwriteBtn.disabled = true;
+    }
+    const syncActions = () => {
+      const has = this.aiPicked.size > 0 && !this.aiBusy;
+      insertBtn.disabled = !has;
+      noteBtn.disabled = !has;
+      if (overwriteTarget)
+        overwriteBtn.disabled = !has;
+      const count = this.aiPicked.size;
+      insertBtn.setText(count > 1 ? `\u63D2\u5165\u4E3A\u65B0\u8282\u70B9\uFF08${count} \u6761\uFF09` : "\u63D2\u5165\u4E3A\u65B0\u8282\u70B9");
+      noteBtn.setText(count > 1 ? `\u5B58\u4E3A\u7B14\u8BB0\uFF08${count} \u6761\uFF09` : "\u5B58\u4E3A\u7B14\u8BB0");
+      if (overwriteTarget) {
+        overwriteBtn.setText(count > 1 ? `\u8986\u76D6\u539F\u8282\u70B9\uFF08${count} \u6761\uFF09` : "\u8986\u76D6\u539F\u8282\u70B9");
+      }
+    };
+    syncActions();
+    let dragStart = null;
+    head.addEventListener("pointerdown", (evt) => {
+      if (evt.target.closest("button"))
+        return;
+      if (this.aiExpanded)
+        return;
+      dragStart = {
+        x: evt.clientX,
+        y: evt.clientY,
+        left: panel.offsetLeft,
+        top: panel.offsetTop
+      };
+      head.setPointerCapture(evt.pointerId);
+      panel.addClass("is-dragging");
+    });
+    head.addEventListener("pointermove", (evt) => {
+      if (!dragStart)
+        return;
+      panel.style.left = `${Math.round(dragStart.left + evt.clientX - dragStart.x)}px`;
+      panel.style.top = `${Math.round(dragStart.top + evt.clientY - dragStart.y)}px`;
+    });
+    const endDrag = (evt) => {
+      if (!dragStart)
+        return;
+      dragStart = null;
+      panel.removeClass("is-dragging");
+      try {
+        head.releasePointerCapture(evt.pointerId);
+      } catch (error) {
+      }
+    };
+    head.addEventListener("pointerup", endDrag);
+    head.addEventListener("pointercancel", endDrag);
+    const place = () => {
+      if (this.aiExpanded) {
+        panel.style.left = `${Math.round(rect.width * 0.1)}px`;
+        panel.style.top = `${Math.round(rect.height * 0.06)}px`;
+        return;
+      }
+      const panelWidth = 580;
+      const screenLeft = box ? box.minX * this.scale + this.tx : rect.width / 2;
+      const screenTop = box ? box.minY * this.scale + this.ty : rect.height / 2;
+      const boxWidth = box ? (box.maxX - box.minX) * this.scale : 0;
+      let left = screenLeft + (boxWidth - panelWidth) / 2;
+      left = Math.max(8, Math.min(left, rect.width - panelWidth - 8));
+      let top = screenTop - 6;
+      top = Math.max(8, Math.min(top, rect.height - 560));
+      panel.style.left = `${Math.round(left)}px`;
+      panel.style.top = `${Math.round(top)}px`;
+    };
+    place();
+    const scrollDown = () => {
+      stream.scrollTop = stream.scrollHeight;
+    };
+    const addUserBubble = (text) => {
+      const row = stream.createDiv({ cls: "volis-ai-msg is-user" });
+      row.createDiv({ cls: "volis-ai-bubble", text });
+      scrollDown();
+    };
+    const refreshPicks = () => {
+      stream.querySelectorAll(".volis-ai-msg.is-ai").forEach((row) => {
+        var _a2;
+        const index = Number((_a2 = row.dataset.answerIndex) != null ? _a2 : "-1");
+        row.toggleClass("is-picked", this.aiPicked.has(index));
+      });
+      syncActions();
+    };
+    const togglePick = (index) => {
+      if (this.aiPicked.has(index))
+        this.aiPicked.delete(index);
+      else
+        this.aiPicked.add(index);
+      refreshPicks();
+    };
+    const addAiBubble = async (text) => {
+      const index = this.aiAnswers.length;
+      this.aiAnswers.push(text);
+      const row = stream.createDiv({ cls: "volis-ai-msg is-ai" });
+      row.dataset.answerIndex = String(index);
+      const bubble = row.createDiv({ cls: "volis-ai-bubble is-md" });
+      row.addEventListener("click", (evt) => {
+        var _a2;
+        if (!((_a2 = window.getSelection()) == null ? void 0 : _a2.isCollapsed))
+          return;
+        evt.preventDefault();
+        togglePick(index);
+      });
+      await import_obsidian9.MarkdownRenderer.render(this.app, this.decorateAnswer(text), bubble, "", this);
+      if (this.aiPicked.size === 0)
+        this.aiPicked.add(index);
+      refreshPicks();
+      scrollDown();
+      return bubble;
+    };
+    const currentAnswer = () => {
+      const indexes = Array.from(this.aiPicked).sort((a, b) => a - b);
+      return indexes.map((index) => this.aiAnswers[index]).filter((value) => Boolean(value)).join("\n\n");
+    };
+    const thinkingLines = [
+      "\u6B63\u5728\u8BFB\u4F60\u7684\u5361\u7247\u2026",
+      "CPU \u75AF\u72C2\u71C3\u70E7\u{1F525}\u2026",
+      "\u8111\u7EC6\u80DE\u96C6\u5408\u4E2D\u2026",
+      "\u7EC4\u7EC7\u8BED\u8A00\u4E2D\u2026"
+    ];
+    const addPending = () => {
+      const row = stream.createDiv({ cls: "volis-ai-msg is-status" });
+      const bubble = row.createDiv({ cls: "volis-ai-bubble is-pending" });
+      const label = bubble.createSpan({ cls: "volis-ai-thinking", text: thinkingLines[0] });
+      let step = 0;
+      const timer = window.setInterval(() => {
+        step = (step + 1) % thinkingLines.length;
+        label.setText(thinkingLines[step]);
+      }, 1500);
+      scrollDown();
+      return { row, stop: () => window.clearInterval(timer) };
+    };
+    const addError = (text) => {
+      const row = stream.createDiv({ cls: "volis-ai-msg is-status" });
+      row.createDiv({ cls: "volis-ai-bubble is-error", text });
+      scrollDown();
+    };
+    const setBusy = (value) => {
+      this.aiBusy = value;
+      input.disabled = value;
+      sendBtn.empty();
+      (0, import_obsidian9.setIcon)(sendBtn, value ? "square" : "arrow-up");
+      sendBtn.toggleClass("is-stop", value);
+      sendBtn.setAttribute("aria-label", value ? "\u505C\u6B62\u751F\u6210" : "\u53D1\u9001");
+      if (value) {
+        insertBtn.disabled = true;
+        noteBtn.disabled = true;
+        overwriteBtn.disabled = true;
+      } else {
+        syncActions();
+      }
+    };
+    const ask = async () => {
+      const question = input.value.trim();
+      if (!question || this.aiBusy || !this.aiProvider)
+        return;
+      input.value = "";
+      addUserBubble(question);
+      this.aiCancelled = false;
+      setBusy(true);
+      const pending = addPending();
+      this.aiPending = pending;
+      const aiSettings = this.plugin.settings.ai;
+      await this.compactHistory(this.aiProvider, aiSettings.compactThreshold);
+      let content = question;
+      if (!this.aiContextSent) {
+        const context = this.buildBoardContext(this.aiTargets, aiSettings.contextLimit);
+        if (context.note)
+          new import_obsidian9.Notice(context.note);
+        content = `\u3010\u767D\u677F\u5185\u5BB9\u3011
+${context.text}
+
+\u3010\u95EE\u9898\u3011
+${question}`;
+      }
+      this.aiHistory.push({ role: "user", content });
+      try {
+        const reply = await this.aiProvider.complete(this.aiHistory, {
+          system: "\u4F60\u662F\u767D\u677F\u6574\u7406\u52A9\u624B\u3002\u7528\u6237\u7ED9\u4F60\u767D\u677F\u4E0A\u7684\u8282\u70B9\u5185\u5BB9\u548C\u5B83\u4EEC\u4E4B\u95F4\u7684\u5173\u7CFB\uFF0C\u8BF7\u7528\u7B80\u6D01\u7684\u4E2D\u6587\u56DE\u7B54\uFF0C\u4E0D\u8981\u590D\u8FF0\u539F\u6587\uFF0C\u76F4\u63A5\u7ED9\u5224\u65AD\u548C\u5EFA\u8BAE\u3002\u5FC5\u8981\u65F6\u7528\u5217\u8868\u3002"
+        });
+        this.aiHistory.push({ role: "assistant", content: reply });
+        this.aiContextSent = true;
+        pending.stop();
+        pending.row.remove();
+        this.aiPending = null;
+        if (this.aiCancelled) {
+          this.aiHistory.pop();
+          this.aiHistory.pop();
+          return;
+        }
+        await addAiBubble(reply);
+        this.persistConversation(question);
+        insertBtn.disabled = false;
+        noteBtn.disabled = false;
+        if (overwriteTarget)
+          overwriteBtn.disabled = false;
+      } catch (error) {
+        this.aiHistory.pop();
+        pending.stop();
+        pending.row.remove();
+        this.aiPending = null;
+        if (!this.aiCancelled) {
+          addError(error instanceof Error ? error.message : String(error));
+        }
+      } finally {
+        setBusy(false);
+        input.focus();
+      }
+    };
+    input.addEventListener("keydown", (evt) => {
+      if (evt.key === "Escape") {
+        evt.preventDefault();
+        this.closeAiPanel();
+        return;
+      }
+      if (evt.key === "Enter") {
+        evt.preventDefault();
+        void ask();
+      }
+    });
+    sendBtn.addEventListener("click", () => {
+      var _a2, _b;
+      if (this.aiBusy) {
+        this.aiCancelled = true;
+        (_a2 = this.aiPending) == null ? void 0 : _a2.stop();
+        (_b = this.aiPending) == null ? void 0 : _b.row.remove();
+        this.aiPending = null;
+        setBusy(false);
+        new import_obsidian9.Notice("\u5DF2\u505C\u6B62\u751F\u6210");
+        return;
+      }
+      void ask();
+    });
+    newBtn.addEventListener("click", () => {
+      this.aiConversationId = null;
+      this.aiHistory = [];
+      this.aiContextSent = false;
+      this.aiAnswers = [];
+      this.aiPicked = /* @__PURE__ */ new Set();
+      stream.empty();
+      stream.createDiv({ cls: "volis-ai-empty-hint", text: "\u65B0\u5BF9\u8BDD\u5DF2\u5F00\u59CB\uFF0C\u9009\u4E2D\u7684\u8282\u70B9\u4FDD\u6301\u4E0D\u53D8\u3002" });
+      insertBtn.disabled = true;
+      noteBtn.disabled = true;
+      if (overwriteTarget)
+        overwriteBtn.disabled = true;
+      input.focus();
+    });
+    this.aiRestore = (conv) => {
+      stream.empty();
+      const answers = conv.messages.filter((message) => message.role === "assistant").map((message) => message.content);
+      this.aiAnswers = answers;
+      this.aiPicked = new Set(answers.length > 0 ? [answers.length - 1] : []);
+      let answerIndex = 0;
+      for (const message of conv.messages) {
+        if (message.role === "user") {
+          addUserBubble(message.content);
+          continue;
+        }
+        const index = answerIndex++;
+        const row = stream.createDiv({ cls: "volis-ai-msg is-ai" });
+        row.dataset.answerIndex = String(index);
+        const bubble = row.createDiv({ cls: "volis-ai-bubble is-md" });
+        row.addEventListener("click", (evt) => {
+          var _a2;
+          if (!((_a2 = window.getSelection()) == null ? void 0 : _a2.isCollapsed))
+            return;
+          evt.preventDefault();
+          togglePick(index);
+        });
+        void import_obsidian9.MarkdownRenderer.render(
+          this.app,
+          this.decorateAnswer(message.content),
+          bubble,
+          "",
+          this
+        );
+      }
+      refreshPicks();
+      scrollDown();
+    };
+    historyBtn.addEventListener("click", () => this.openHistoryPop(historyBtn));
+    expandBtn.addEventListener("click", () => {
+      this.aiExpanded = !this.aiExpanded;
+      panel.toggleClass("is-expanded", this.aiExpanded);
+      (0, import_obsidian9.setIcon)(expandBtn, this.aiExpanded ? "minimize-2" : "maximize-2");
+      place();
+    });
+    closeBtn.addEventListener("click", () => this.closeAiPanel());
+    insertBtn.addEventListener("click", () => {
+      const text = currentAnswer();
+      if (!text)
+        return;
+      void this.insertAIText(text, this.aiTargets);
+      this.closeAiPanel();
+    });
+    noteBtn.addEventListener("click", () => {
+      var _a2;
+      const text = currentAnswer();
+      if (!text)
+        return;
+      void createNoteFromText(
+        this.app,
+        (_a2 = this.plugin.settings.boardFolder) != null ? _a2 : "",
+        text,
+        "AI \u6574\u7406"
+      ).then((file) => {
+        if (file)
+          new import_obsidian9.Notice(`\u5DF2\u4FDD\u5B58\u4E3A ${file.basename}`);
+      });
+      this.closeAiPanel();
+    });
+    overwriteBtn.addEventListener("click", () => {
+      if (!overwriteTarget)
+        return;
+      const text = this.replyTextForOverwrite();
+      if (!text)
+        return;
+      const indexes = Array.from(this.aiPicked).sort((a, b) => a - b);
+      const scope = indexes.length === 1 ? `\u7B2C ${indexes[0] + 1} \u6761\u56DE\u7B54` : `\u9009\u4E2D\u7684 ${indexes.length} \u6761\u56DE\u7B54\uFF08\u6309\u987A\u5E8F\u5408\u5E76\uFF09`;
+      const targetName = overwriteTarget.type === "card" ? "\u5361\u7247\uFF08\u4F1A\u540C\u65F6\u6539\u5199\u901F\u8BB0\u91CC\u7684\u539F\u6587\uFF09" : overwriteTarget.type === "file" ? "\u8FD9\u7BC7\u7B14\u8BB0\u7684\u5168\u6587" : "\u8FD9\u4E2A\u6587\u672C\u8282\u70B9";
+      new ConfirmModal(
+        this.app,
+        "\u8986\u76D6\u539F\u8282\u70B9\u5185\u5BB9\uFF1F",
+        `\u5C06\u7528${scope}\u8986\u76D6${targetName}\u3002\u539F\u6709\u5185\u5BB9\u4F1A\u88AB\u66FF\u6362\uFF0C\u53EF\u6309 Ctrl+Z \u64A4\u9500\u3002`,
+        "\u786E\u8BA4\u8986\u76D6",
+        () => {
+          void this.overwriteNode(overwriteTarget, text).then((ok) => {
+            if (ok) {
+              new import_obsidian9.Notice("\u5DF2\u8986\u76D6\u539F\u8282\u70B9\u5185\u5BB9\uFF0C\u53EF\u6309 Ctrl+Z \u64A4\u9500");
+              this.closeAiPanel();
+            } else {
+              new import_obsidian9.Notice("\u8986\u76D6\u5931\u8D25");
+            }
+          });
+        }
+      ).open();
+    });
+    window.setTimeout(() => input.focus(), 30);
+  }
+  stripContext(content) {
+    const marker = "\u3010\u95EE\u9898\u3011\n";
+    const index = content.indexOf(marker);
+    return index >= 0 ? content.slice(index + marker.length) : content;
+  }
+  persistConversation(question) {
+    var _a, _b;
+    const boardPath = (_b = (_a = this.file) == null ? void 0 : _a.path) != null ? _b : "";
+    if (!boardPath)
+      return;
+    const store = this.plugin.settings.conversations;
+    let conversation = store.find((item) => item.id === this.aiConversationId);
+    if (!conversation) {
+      conversation = {
+        id: `c${Date.now()}`,
+        title: question.replace(/\s+/g, " ").trim().slice(0, 24) || "\u672A\u547D\u540D\u5BF9\u8BDD",
+        boardPath,
+        updatedAt: Date.now(),
+        messages: [],
+        nodeIds: []
+      };
+      store.push(conversation);
+      this.aiConversationId = conversation.id;
+    }
+    conversation.messages = this.aiHistory.map((message) => ({
+      role: message.role,
+      content: message.role === "user" ? this.stripContext(message.content) : message.content
+    }));
+    conversation.updatedAt = Date.now();
+    conversation.nodeIds = this.aiTargets.map((node) => node.id);
+    this.plugin.settings.conversations = store.sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 30);
+    void this.plugin.saveSettings();
+  }
+  async loadConversation(conversation) {
+    var _a;
+    this.aiConversationId = conversation.id;
+    this.aiHistory = conversation.messages.map((message) => ({
+      role: message.role,
+      content: message.content
+    }));
+    this.aiContextSent = false;
+    const alive = conversation.nodeIds.map((id) => this.nodeMap.get(id)).filter((node) => Boolean(node));
+    if (alive.length > 0)
+      this.aiTargets = alive;
+    (_a = this.aiRestore) == null ? void 0 : _a.call(this, conversation);
+    if (alive.length < conversation.nodeIds.length) {
+      new import_obsidian9.Notice("\u90E8\u5206\u8282\u70B9\u5DF2\u4E0D\u5B58\u5728\uFF0C\u8FD9\u6B21\u5BF9\u8BDD\u53EA\u80FD\u67E5\u770B\uFF0C\u8FFD\u95EE\u65F6 AI \u770B\u4E0D\u5230\u5B83\u4EEC");
+    }
+  }
+  deleteConversation(id) {
+    const store = this.plugin.settings.conversations.filter((item) => item.id !== id);
+    this.plugin.settings.conversations = store;
+    if (this.aiConversationId === id)
+      this.aiConversationId = null;
+    void this.plugin.saveSettings();
+  }
+  closeHistoryPop() {
+    var _a;
+    if (this.historyOutside) {
+      document.removeEventListener("mousedown", this.historyOutside, true);
+      this.historyOutside = null;
+    }
+    (_a = this.historyPop) == null ? void 0 : _a.remove();
+    this.historyPop = null;
+  }
+  formatStamp(timestamp) {
+    const date = new Date(timestamp);
+    const pad2 = (value) => String(value).padStart(2, "0");
+    return `${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+  }
+  openHistoryPop(anchor) {
+    var _a, _b, _c;
+    const wasOpen = Boolean(this.historyPop);
+    this.closeHistoryPop();
+    if (wasOpen)
+      return;
+    const boardPath = (_b = (_a = this.file) == null ? void 0 : _a.path) != null ? _b : "";
+    const items = this.plugin.settings.conversations.filter((conversation) => conversation.boardPath === boardPath).sort((a, b) => b.updatedAt - a.updatedAt);
+    const pop = this.root.createDiv({ cls: "volis-ai-history" });
+    this.historyPop = pop;
+    pop.addEventListener("pointerdown", (evt) => evt.stopPropagation());
+    pop.addEventListener("dblclick", (evt) => evt.stopPropagation());
+    const head = pop.createDiv({ cls: "volis-ai-history-head" });
+    head.createDiv({ cls: "volis-ai-history-heading", text: "\u5BF9\u8BDD\u8BB0\u5F55" });
+    if (items.length > 0) {
+      const clear = head.createEl("button", { cls: "volis-ai-history-clear", text: "\u5168\u90E8\u5220\u9664" });
+      clear.addEventListener("click", () => {
+        new ConfirmModal(
+          this.app,
+          "\u5220\u9664\u5168\u90E8\u5BF9\u8BDD\u8BB0\u5F55\uFF1F",
+          `\u5C06\u5220\u9664\u8FD9\u5757\u767D\u677F\u7684 ${items.length} \u6761\u8BB0\u5F55\uFF0C\u65E0\u6CD5\u6062\u590D\u3002`,
+          "\u5168\u90E8\u5220\u9664",
+          () => {
+            this.plugin.settings.conversations = this.plugin.settings.conversations.filter(
+              (conversation) => conversation.boardPath !== boardPath
+            );
+            this.aiConversationId = null;
+            void this.plugin.saveSettings();
+            this.closeHistoryPop();
+          }
+        ).open();
+      });
+    }
+    if (items.length === 0) {
+      pop.createDiv({ cls: "volis-ai-history-empty", text: "\u8FD9\u5757\u767D\u677F\u8FD8\u6CA1\u6709\u5BF9\u8BDD\u8BB0\u5F55" });
+    }
+    for (const conversation of items) {
+      const row = pop.createDiv({ cls: "volis-ai-history-item" });
+      if (conversation.id === this.aiConversationId)
+        row.addClass("is-current");
+      const iconEl = row.createDiv({ cls: "volis-ai-history-icon" });
+      (0, import_obsidian9.setIcon)(iconEl, "message-square");
+      const body = row.createDiv({ cls: "volis-ai-history-body" });
+      body.createDiv({ cls: "volis-ai-history-name", text: conversation.title });
+      body.createDiv({
+        cls: "volis-ai-history-time",
+        text: this.formatStamp(conversation.updatedAt)
+      });
+      const del = row.createEl("button", {
+        cls: "volis-ai-history-del",
+        attr: { "aria-label": "\u5220\u9664\u8FD9\u6761\u8BB0\u5F55" }
+      });
+      (0, import_obsidian9.setIcon)(del, "trash-2");
+      del.addEventListener("click", (evt) => {
+        evt.stopPropagation();
+        this.deleteConversation(conversation.id);
+        this.closeHistoryPop();
+        this.openHistoryPop(anchor);
+      });
+      row.addEventListener("click", () => {
+        this.closeHistoryPop();
+        void this.loadConversation(conversation);
+      });
+    }
+    const anchorRect = anchor.getBoundingClientRect();
+    const panelEl = anchor.closest(".volis-ai-panel");
+    const panelRect = (_c = panelEl == null ? void 0 : panelEl.getBoundingClientRect()) != null ? _c : anchorRect;
+    const rootRect = this.root.getBoundingClientRect();
+    const width = 300;
+    const gap = 8;
+    pop.style.left = `${Math.round(
+      Math.max(gap, Math.min(panelRect.right - rootRect.left - width - gap, rootRect.width - width - gap))
+    )}px`;
+    pop.style.top = `${Math.round(anchorRect.bottom - rootRect.top + 6)}px`;
+    this.historyOutside = (evt) => {
+      const target = evt.target;
+      if (target && (pop.contains(target) || anchor.contains(target)))
+        return;
+      this.closeHistoryPop();
+    };
+    document.addEventListener("mousedown", this.historyOutside, true);
+  }
+  /** Turns bare references like N3 into N3「content preview」 so the reader can
+   *  tell which card is meant without looking at the board. */
+  decorateAnswer(text) {
+    return text.replace(/\bN(\d+)\b/g, (match, digits) => {
+      var _a;
+      const node = this.aiTargets[Number(digits) - 1];
+      if (!node)
+        return match;
+      const preview = ((_a = this.nodeText.get(node.id)) != null ? _a : "").replace(/\s+/g, " ").trim();
+      if (!preview)
+        return match;
+      const short = preview.length > 12 ? `${preview.slice(0, 12)}\u2026` : preview;
+      return `${match}\u300C${short}\u300D`;
+    });
+  }
+  /** Selected text inside the panel, otherwise the latest full answer. */
+  replyTextForOverwrite() {
+    var _a, _b;
+    const selection = window.getSelection();
+    const text = (_a = selection == null ? void 0 : selection.toString().trim()) != null ? _a : "";
+    if (text && (selection == null ? void 0 : selection.anchorNode) && ((_b = this.aiPanel) == null ? void 0 : _b.contains(selection.anchorNode))) {
+      return text;
+    }
+    return Array.from(this.aiPicked).sort((a, b) => a - b).map((index) => this.aiAnswers[index]).filter((value) => Boolean(value)).join("\n\n");
+  }
+  /**
+   * A card lives inside a single list item, so blank lines and nested Markdown
+   * would break the block apart. This keeps the meaning but makes the result
+   * storable as one contiguous block.
+   */
+  flattenForCard(text) {
+    const out = [];
+    for (const raw of text.replace(/\r\n/g, "\n").split("\n")) {
+      const line = raw.trim();
+      if (!line)
+        continue;
+      const heading = /^#{1,6}\s+(.*)$/.exec(line);
+      if (heading) {
+        out.push(`**${heading[1].replace(/\*\*/g, "")}**`);
+        continue;
+      }
+      const bullet = /^[-*+]\s+(.*)$/.exec(line);
+      if (bullet) {
+        out.push(`\u2022 ${bullet[1]}`);
+        continue;
+      }
+      const rule = /^([-*_])\1{2,}$/.test(line);
+      if (rule)
+        continue;
+      out.push(line);
+    }
+    return out.join("\n");
+  }
+  async overwriteNode(node, text) {
+    const content = text.trim();
+    if (!content)
+      return false;
+    if (node.type === "text") {
+      node.text = content;
+      await this.renderNode(node);
+    } else if (node.type === "card") {
+      const ref = { file: node.file, blockId: node.blockId, linkpath: "" };
+      const meta = await readCard(this.app, ref);
+      const ok = await writeCard(
+        this.app,
+        ref,
+        `${meta.timePrefix}${this.flattenForCard(content)}`
+      );
+      if (!ok)
+        return false;
+      await this.renderNode(node);
+    } else if (node.type === "file") {
+      const file = this.app.vault.getAbstractFileByPath(node.file);
+      if (!(file instanceof import_obsidian9.TFile) || file.extension.toLowerCase() !== "md")
+        return false;
+      await this.app.vault.modify(file, content);
+      await this.renderNode(node);
+    } else {
+      return false;
+    }
+    this.pushHistory();
+    this.scheduleSave();
+    return true;
+  }
+  async insertAIText(text, targets) {
+    const box = this.selectionBox(targets);
+    const anchor = box != null ? box : { minX: 0, minY: 0, maxX: 0, maxY: 0 };
+    const node = {
+      id: createId(),
+      type: "text",
+      text,
+      x: Math.round(anchor.maxX + 40),
+      y: Math.round(anchor.minY),
+      width: 360
+    };
+    this.nodes.push(node);
+    this.nodeMap.set(node.id, node);
+    await this.renderNode(node);
+    this.selection.clear();
+    this.selection.add(node.id);
+    this.paintSelection();
+    this.updateHint();
+    this.pushHistory();
+    this.scheduleSave();
+  }
   openNodeSearch() {
     this.closeSearchPanel();
     const rect = this.root.getBoundingClientRect();
@@ -3458,7 +4570,7 @@ ${text}
     panel.addEventListener("dblclick", (evt) => evt.stopPropagation());
     const head = panel.createDiv({ cls: "volis-insert-head" });
     const headIcon = head.createDiv({ cls: "volis-insert-head-icon" });
-    (0, import_obsidian7.setIcon)(headIcon, "search");
+    (0, import_obsidian9.setIcon)(headIcon, "search");
     const input = head.createEl("input", {
       cls: "volis-insert-input",
       attr: { type: "text", placeholder: "\u5728\u767D\u677F\u4E2D\u67E5\u627E\u8282\u70B9\u2026" }
@@ -3486,7 +4598,7 @@ ${text}
           window.requestAnimationFrame(() => row.scrollIntoView({ block: "nearest" }));
         }
         const iconEl = row.createDiv({ cls: "volis-insert-item-icon" });
-        (0, import_obsidian7.setIcon)(
+        (0, import_obsidian9.setIcon)(
           iconEl,
           node.type === "card" ? "list" : node.type === "group" ? "group" : node.type === "text" ? "type" : "file-text"
         );
@@ -3585,7 +4697,7 @@ ${text}
     panel.addEventListener("dblclick", (evt) => evt.stopPropagation());
     const head = panel.createDiv({ cls: "volis-insert-head" });
     const headIcon = head.createDiv({ cls: "volis-insert-head-icon" });
-    (0, import_obsidian7.setIcon)(headIcon, "search");
+    (0, import_obsidian9.setIcon)(headIcon, "search");
     const input = head.createEl("input", {
       cls: "volis-insert-input",
       attr: { type: "text", placeholder: "\u641C\u7D22\u5361\u7247\u3001\u7B14\u8BB0\uFF0C\u6216\u65B0\u5EFA\u2026" }
@@ -3607,7 +4719,7 @@ ${text}
           });
         }
         const iconEl = row.createDiv({ cls: "volis-insert-item-icon" });
-        (0, import_obsidian7.setIcon)(
+        (0, import_obsidian9.setIcon)(
           iconEl,
           item.kind === "card" ? "list" : item.kind === "note" ? "file-text" : "type"
         );
@@ -3950,7 +5062,7 @@ ${text}
         cls: "volis-tool-btn",
         attr: { "aria-label": label }
       });
-      (0, import_obsidian7.setIcon)(button, icon);
+      (0, import_obsidian9.setIcon)(button, icon);
       button.addEventListener("click", () => this.styleSelectedEdge({ arrow }));
     };
     arrowBtn("target", "arrow-right", "\u5355\u5411\u7BAD\u5934");
@@ -3961,7 +5073,7 @@ ${text}
       cls: "volis-tool-btn is-danger",
       attr: { "aria-label": "\u5220\u9664\u8FDE\u7EBF" }
     });
-    (0, import_obsidian7.setIcon)(remove, "trash-2");
+    (0, import_obsidian9.setIcon)(remove, "trash-2");
     remove.addEventListener("click", () => this.deleteSelectedEdge());
   }
   styleSelectedEdge(patch) {
@@ -4167,7 +5279,7 @@ ${text}
       return;
     if (node.type === "file") {
       const file = this.app.vault.getAbstractFileByPath(node.file);
-      if (file instanceof import_obsidian7.TFile && file.extension.toLowerCase() === "md") {
+      if (file instanceof import_obsidian9.TFile && file.extension.toLowerCase() === "md") {
         void this.openEditor(node);
       }
       return;
@@ -4227,7 +5339,7 @@ ${text}
   }
   openMedia(path) {
     const file = this.app.vault.getAbstractFileByPath(path);
-    if (file instanceof import_obsidian7.TFile)
+    if (file instanceof import_obsidian9.TFile)
       new MediaModal(this.app, file).open();
   }
   async createTextNode(point) {
@@ -4306,7 +5418,7 @@ ${text}
     }
     if (node.type === "file") {
       const file = this.app.vault.getAbstractFileByPath(node.file);
-      if (!(file instanceof import_obsidian7.TFile) || file.extension.toLowerCase() !== "md")
+      if (!(file instanceof import_obsidian9.TFile) || file.extension.toLowerCase() !== "md")
         return;
       const content = await this.app.vault.read(file);
       new MarkdownNodeEditor(
@@ -4397,7 +5509,7 @@ ${text}
   async addFileNode(file, point) {
     const target = this.app.vault.getAbstractFileByPath(file);
     const width = DEFAULT_FILE_WIDTH;
-    const ext = target instanceof import_obsidian7.TFile ? target.extension.toLowerCase() : "";
+    const ext = target instanceof import_obsidian9.TFile ? target.extension.toLowerCase() : "";
     const isImage = IMAGE_EXT2.includes(ext);
     const isNote = ext === "md";
     const node = {
@@ -4495,8 +5607,8 @@ function listBoards(app) {
 }
 
 // src/board/boardPicker.ts
-var import_obsidian8 = require("obsidian");
-var BoardPickerModal = class extends import_obsidian8.FuzzySuggestModal {
+var import_obsidian10 = require("obsidian");
+var BoardPickerModal = class extends import_obsidian10.FuzzySuggestModal {
   constructor(app, onPick) {
     super(app);
     this.onPick = onPick;
@@ -4556,8 +5668,8 @@ var ContextMenuInjector = class {
 };
 
 // src/ui/cardEditor.ts
-var import_obsidian9 = require("obsidian");
-var CardEditorModal = class extends import_obsidian9.Modal {
+var import_obsidian11 = require("obsidian");
+var CardEditorModal = class extends import_obsidian11.Modal {
   constructor(app, meta, onSave) {
     super(app);
     this.meta = meta;
@@ -4612,7 +5724,7 @@ var CardEditorModal = class extends import_obsidian9.Modal {
     }
     const ok = await this.onSave(this.value);
     if (!ok) {
-      new import_obsidian9.Notice("\u4FDD\u5B58\u5931\u8D25\uFF1A\u5361\u7247\u53EF\u80FD\u5DF2\u79FB\u52A8\u6216\u5220\u9664");
+      new import_obsidian11.Notice("\u4FDD\u5B58\u5931\u8D25\uFF1A\u5361\u7247\u53EF\u80FD\u5DF2\u79FB\u52A8\u6216\u5220\u9664");
       return;
     }
     this.close();
@@ -4623,8 +5735,140 @@ var CardEditorModal = class extends import_obsidian9.Modal {
 };
 
 // src/settingsTab.ts
-var import_obsidian10 = require("obsidian");
-var VolisSettingTab = class extends import_obsidian10.PluginSettingTab {
+var import_obsidian13 = require("obsidian");
+
+// src/ui/aiProfileModal.ts
+var import_obsidian12 = require("obsidian");
+var PRESETS = {
+  deepseek: { name: "DeepSeek", protocol: "openai", baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat" },
+  kimi: { name: "Kimi", protocol: "openai", baseUrl: "https://api.moonshot.cn/v1", model: "moonshot-v1-8k" },
+  zhipu: { name: "\u667A\u8C31 GLM", protocol: "openai", baseUrl: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4-flash" },
+  openai: { name: "OpenAI", protocol: "openai", baseUrl: "https://api.openai.com/v1", model: "gpt-4o-mini" },
+  anthropic: { name: "Anthropic", protocol: "anthropic", baseUrl: "https://api.anthropic.com", model: "claude-sonnet-4-20250514" },
+  ollama: { name: "\u672C\u5730 Ollama", protocol: "openai", baseUrl: "http://localhost:11434/v1", model: "qwen2.5" }
+};
+var AIProfileModal = class extends import_obsidian12.Modal {
+  constructor(app, profile, onSubmit) {
+    super(app);
+    this.onSubmit = onSubmit;
+    this.fieldsEl = null;
+    this.nameInput = null;
+    this.urlInput = null;
+    this.modelInput = null;
+    this.keyInput = null;
+    this.protocolValue = "openai";
+    this.draft = profile ? { ...profile } : {
+      id: `p${Date.now()}`,
+      name: "",
+      protocol: "openai",
+      baseUrl: "",
+      model: "",
+      apiKey: ""
+    };
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("volis-ai-modal");
+    contentEl.createEl("h3", { text: this.draft.name ? "\u7F16\u8F91\u6A21\u578B\u914D\u7F6E" : "\u6DFB\u52A0\u6A21\u578B\u914D\u7F6E" });
+    new import_obsidian12.Setting(contentEl).setName("\u5FEB\u901F\u586B\u5165").setDesc("\u9009\u4E00\u4E2A\u670D\u52A1\u81EA\u52A8\u586B\u597D\u5730\u5740\u548C\u6A21\u578B\uFF0CKey \u4ECD\u9700\u81EA\u5DF1\u586B\u3002").addDropdown((dropdown) => {
+      dropdown.addOption("", "\u9009\u62E9\u670D\u52A1\u2026");
+      for (const [key, preset] of Object.entries(PRESETS)) {
+        dropdown.addOption(key, preset.name);
+      }
+      dropdown.onChange((value) => {
+        const preset = PRESETS[value];
+        if (!preset)
+          return;
+        this.draft.name = preset.name;
+        this.draft.protocol = preset.protocol;
+        this.draft.baseUrl = preset.baseUrl;
+        this.draft.model = preset.model;
+        this.refreshFields();
+        dropdown.setValue("");
+      });
+    });
+    this.fieldsEl = contentEl.createDiv();
+    new import_obsidian12.Setting(contentEl).addButton(
+      (button) => button.setButtonText("\u53D6\u6D88").onClick(() => this.close())
+    ).addButton(
+      (button) => button.setButtonText("\u4FDD\u5B58").setCta().onClick(() => this.submit())
+    );
+    this.renderFields();
+  }
+  renderFields() {
+    const host = this.fieldsEl;
+    if (!host)
+      return;
+    host.empty();
+    this.protocolValue = this.draft.protocol;
+    new import_obsidian12.Setting(host).setName("\u540D\u79F0").addText((text) => {
+      this.nameInput = text.inputEl;
+      text.setPlaceholder("\u4F8B\u5982 DeepSeek").setValue(this.draft.name).onChange((value) => {
+        this.draft.name = value.trim();
+      });
+    });
+    new import_obsidian12.Setting(host).setName("\u63A5\u53E3\u534F\u8BAE").addDropdown(
+      (dropdown) => dropdown.addOption("openai", "OpenAI \u517C\u5BB9").addOption("anthropic", "Anthropic Messages").setValue(this.draft.protocol).onChange((value) => {
+        this.protocolValue = value === "anthropic" ? "anthropic" : "openai";
+        this.draft.protocol = this.protocolValue;
+      })
+    );
+    new import_obsidian12.Setting(host).setName("\u63A5\u53E3\u5730\u5740").setDesc("\u4F8B\u5982 https://api.deepseek.com/v1").addText((text) => {
+      this.urlInput = text.inputEl;
+      text.setPlaceholder("https://").setValue(this.draft.baseUrl).onChange((value) => {
+        this.draft.baseUrl = value.trim();
+      });
+    });
+    new import_obsidian12.Setting(host).setName("\u6A21\u578B").addText((text) => {
+      this.modelInput = text.inputEl;
+      text.setPlaceholder("deepseek-chat").setValue(this.draft.model).onChange((value) => {
+        this.draft.model = value.trim();
+      });
+    });
+    new import_obsidian12.Setting(host).setName("API Key").setDesc("\u4EC5\u4FDD\u5B58\u5728\u672C\u673A\u63D2\u4EF6\u914D\u7F6E\u4E2D\u3002").addText((text) => {
+      this.keyInput = text.inputEl;
+      text.inputEl.type = "password";
+      text.setPlaceholder("sk-\u2026").setValue(this.draft.apiKey).onChange((value) => {
+        this.draft.apiKey = value.trim();
+      });
+    });
+  }
+  /** Keeps the visible inputs in sync when a preset fills the draft. */
+  refreshFields() {
+    this.draft.baseUrl = sanitizeBaseUrl(this.draft.baseUrl);
+    this.renderFields();
+  }
+  submit() {
+    const baseUrl = sanitizeBaseUrl(this.draft.baseUrl);
+    if (!this.draft.name.trim()) {
+      new import_obsidian12.Notice("\u8BF7\u586B\u5199\u540D\u79F0");
+      return;
+    }
+    if (!baseUrl) {
+      new import_obsidian12.Notice("\u8BF7\u586B\u5199\u63A5\u53E3\u5730\u5740");
+      return;
+    }
+    if (!this.draft.model.trim()) {
+      new import_obsidian12.Notice("\u8BF7\u586B\u5199\u6A21\u578B\u540D");
+      return;
+    }
+    this.onSubmit({
+      ...this.draft,
+      name: this.draft.name.trim(),
+      baseUrl,
+      model: this.draft.model.trim(),
+      apiKey: this.draft.apiKey.trim()
+    });
+    this.close();
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+
+// src/settingsTab.ts
+var VolisSettingTab = class extends import_obsidian13.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
@@ -4634,26 +5878,26 @@ var VolisSettingTab = class extends import_obsidian10.PluginSettingTab {
     containerEl.empty();
     containerEl.createEl("h2", { text: "Volis" });
     containerEl.createEl("h3", { text: "\u89D2\u6807" });
-    new import_obsidian10.Setting(containerEl).setName("\u663E\u793A\u89D2\u6807").setDesc("\u5728\u5361\u7247\u8282\u70B9\u53F3\u4E0B\u89D2\u663E\u793A\u65E5\u671F\u3002\u4EC5\u5728\u753B\u5E03\u89C6\u56FE\u4E2D\u751F\u6548\uFF0C\u4E0D\u5F71\u54CD\u5361\u7247\u6B63\u6587\u3002").addToggle(
+    new import_obsidian13.Setting(containerEl).setName("\u663E\u793A\u89D2\u6807").setDesc("\u5728\u5361\u7247\u8282\u70B9\u53F3\u4E0B\u89D2\u663E\u793A\u65E5\u671F\u3002\u4EC5\u5728\u753B\u5E03\u89C6\u56FE\u4E2D\u751F\u6548\uFF0C\u4E0D\u5F71\u54CD\u5361\u7247\u6B63\u6587\u3002").addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.showBadge).onChange(async (value) => {
         this.plugin.settings.showBadge = value;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian10.Setting(containerEl).setName("\u89D2\u6807\u5185\u5BB9").setDesc("\u7CBE\u7B80\u53EA\u663E\u793A\u65E5\u671F\uFF1B\u5B8C\u6574\u663E\u793A\u6807\u7B7E\u3001\u65E5\u671F\u548C\u65F6\u95F4\u3002").addDropdown(
+    new import_obsidian13.Setting(containerEl).setName("\u89D2\u6807\u5185\u5BB9").setDesc("\u7CBE\u7B80\u53EA\u663E\u793A\u65E5\u671F\uFF1B\u5B8C\u6574\u663E\u793A\u6807\u7B7E\u3001\u65E5\u671F\u548C\u65F6\u95F4\u3002").addDropdown(
       (dropdown) => dropdown.addOption("date", "\u7CBE\u7B80\uFF0811-11\uFF09").addOption("full", "\u5B8C\u6574\uFF08#\u6807\u7B7E 11-11 11:08\uFF09").setValue(this.plugin.settings.badgeFormat).onChange(async (value) => {
         this.plugin.settings.badgeFormat = value === "full" ? "full" : "date";
         await this.plugin.saveSettings();
       })
     );
     containerEl.createEl("h3", { text: "\u767D\u677F" });
-    new import_obsidian10.Setting(containerEl).setName("\u767D\u677F\u4FDD\u5B58\u4F4D\u7F6E").setDesc("\u65B0\u5EFA\u767D\u677F\u65F6\u628A\u6587\u4EF6\u5B58\u5230\u8FD9\u4E2A\u6587\u4EF6\u5939\uFF1B\u7559\u7A7A\u8868\u793A\u5E93\u6839\u76EE\u5F55\u3002\u6BCF\u6B21\u65B0\u5EFA\u90FD\u4F1A\u751F\u6210\u4E00\u4E2A\u72EC\u7ACB\u6587\u4EF6\u3002").addText(
+    new import_obsidian13.Setting(containerEl).setName("\u767D\u677F\u4FDD\u5B58\u4F4D\u7F6E").setDesc("\u65B0\u5EFA\u767D\u677F\u65F6\u628A\u6587\u4EF6\u5B58\u5230\u8FD9\u4E2A\u6587\u4EF6\u5939\uFF1B\u7559\u7A7A\u8868\u793A\u5E93\u6839\u76EE\u5F55\u3002\u6BCF\u6B21\u65B0\u5EFA\u90FD\u4F1A\u751F\u6210\u4E00\u4E2A\u72EC\u7ACB\u6587\u4EF6\u3002").addText(
       (text) => text.setPlaceholder("\u7559\u7A7A = \u5E93\u6839\u76EE\u5F55").setValue(this.plugin.settings.boardFolder).onChange(async (value) => {
         this.plugin.settings.boardFolder = value.trim();
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian10.Setting(containerEl).setName("\u5361\u7247\u7B14\u8BB0\u76EE\u5F55").setDesc("\u4ECE\u767D\u677F\u8F6C\u6210\u5361\u7247\u65F6\u5199\u5230\u8FD9\u91CC\u3002\u7559\u7A7A\u5219\u81EA\u52A8\u8BFB Collis \u7684\u8BBE\u7F6E\uFF0C\u8BFB\u4E0D\u5230\u7528 00-Inbox/\u901F\u8BB0\u3002").addText(
+    new import_obsidian13.Setting(containerEl).setName("\u5361\u7247\u7B14\u8BB0\u76EE\u5F55").setDesc("\u4ECE\u767D\u677F\u8F6C\u6210\u5361\u7247\u65F6\u5199\u5230\u8FD9\u91CC\u3002\u7559\u7A7A\u5219\u81EA\u52A8\u8BFB Collis \u7684\u8BBE\u7F6E\uFF0C\u8BFB\u4E0D\u5230\u7528 00-Inbox/\u901F\u8BB0\u3002").addText(
       (text) => text.setPlaceholder("\u7559\u7A7A = \u8DDF\u968F Collis").setValue(this.plugin.settings.cardFolder).onChange(async (value) => {
         this.plugin.settings.cardFolder = value.trim();
         await this.plugin.saveSettings();
@@ -4661,42 +5905,109 @@ var VolisSettingTab = class extends import_obsidian10.PluginSettingTab {
     );
     containerEl.createEl("h3", { text: "AI" });
     const ai = this.plugin.settings.ai;
-    new import_obsidian10.Setting(containerEl).setName("\u542F\u7528 AI").setDesc("\u5F53\u524D\u7248\u672C\u4EC5\u4FDD\u7559\u63A5\u53E3\uFF0C\u5C1A\u672A\u5B9E\u73B0\u8C03\u7528\u3002\u5F00\u542F\u540E\u8BBE\u7F6E\u9879\u624D\u4F1A\u751F\u6548\u3002").addToggle(
+    const save = () => this.plugin.saveSettings();
+    new import_obsidian13.Setting(containerEl).setName("\u542F\u7528 AI").setDesc("\u5F00\u542F\u540E\uFF0C\u767D\u677F\u5185\u53EF\u4EE5\u9009\u4E2D\u8282\u70B9\u8BA9 AI \u5206\u6790\u3002\u5185\u5BB9\u4F1A\u53D1\u9001\u5230\u5F53\u524D\u4F7F\u7528\u7684\u914D\u7F6E\u3002").addToggle(
       (toggle) => toggle.setValue(ai.enabled).onChange(async (value) => {
         ai.enabled = value;
-        await this.plugin.saveSettings();
+        await save();
       })
     );
-    new import_obsidian10.Setting(containerEl).setName("\u63A5\u53E3\u534F\u8BAE").addDropdown(
-      (dropdown) => dropdown.addOption("anthropic", "Anthropic Messages").addOption("openai", "OpenAI \u517C\u5BB9").setValue(ai.protocol).onChange(async (value) => {
-        ai.protocol = value === "openai" ? "openai" : "anthropic";
-        await this.plugin.saveSettings();
-      })
-    );
-    new import_obsidian10.Setting(containerEl).setName("Base URL").setDesc("\u4F8B\u5982 https://api.example.com\uFF0C\u4E0D\u8981\u5E26\u8DEF\u5F84\u540E\u7F00\u3002").addText(
-      (text) => text.setPlaceholder("https://api.example.com").setValue(ai.baseUrl).onChange(async (value) => {
-        ai.baseUrl = value.trim();
-        await this.plugin.saveSettings();
-      })
-    );
-    new import_obsidian10.Setting(containerEl).setName("\u6A21\u578B").addText(
-      (text) => text.setPlaceholder("model-name").setValue(ai.model).onChange(async (value) => {
-        ai.model = value.trim();
-        await this.plugin.saveSettings();
-      })
-    );
-    new import_obsidian10.Setting(containerEl).setName("API Key").setDesc("\u4EC5\u4FDD\u5B58\u5728\u672C\u673A\u63D2\u4EF6\u914D\u7F6E\u4E2D\u3002").addText((text) => {
-      text.inputEl.type = "password";
-      text.setPlaceholder("sk-...").setValue(ai.apiKey).onChange(async (value) => {
-        ai.apiKey = value.trim();
-        await this.plugin.saveSettings();
+    new import_obsidian13.Setting(containerEl).setName("\u5355\u6B21\u53D1\u9001\u4E0A\u9650\uFF08\u5B57\u7B26\uFF09").setDesc(
+      "\u9ED8\u8BA4 80000\uFF0C\u7EA6 5 \u4E07 token\u3002\u8D85\u51FA\u4F1A\u6309\u7EA7\u7CBE\u7B80\uFF1A\u5148\u622A\u77ED\u6BCF\u4E2A\u8282\u70B9\uFF0C\u518D\u51CF\u5C11\u8282\u70B9\u6570\u3002\u56FA\u5B9A\u4F7F\u7528 1M \u7A97\u53E3\u6A21\u578B\uFF08DeepSeek V4\u3001GLM-5.3\u3001Kimi K3 \u7B49\uFF09\u53EF\u8C03\u5230 300000\uFF1B200K \u7A97\u53E3\u7684\u6A21\u578B\u5EFA\u8BAE\u4FDD\u6301 80000 \u4EE5\u5185\u3002"
+    ).addText((text) => {
+      text.inputEl.type = "number";
+      text.setPlaceholder("80000").setValue(String(ai.contextLimit)).onChange(async (value) => {
+        const parsed = Number(value);
+        if (!Number.isFinite(parsed) || parsed < 2e4 || parsed > 5e5)
+          return;
+        ai.contextLimit = Math.round(parsed);
+        ai.compactThreshold = Math.round(ai.contextLimit / 4);
+        await save();
       });
     });
+    const listEl = containerEl.createDiv({ cls: "volis-ai-cards" });
+    const renderCards = () => {
+      listEl.empty();
+      if (ai.profiles.length === 0) {
+        listEl.createDiv({
+          cls: "volis-ai-empty",
+          text: "\u8FD8\u6CA1\u6709\u6A21\u578B\u914D\u7F6E\u3002\u70B9\u4E0B\u9762\u7684\u300C\u6DFB\u52A0\u914D\u7F6E\u300D\u65B0\u5EFA\u4E00\u4E2A\u3002"
+        });
+        return;
+      }
+      for (const profile of ai.profiles) {
+        const active = profile.id === ai.activeId;
+        const card = listEl.createDiv({ cls: "volis-ai-card" });
+        if (active)
+          card.addClass("is-active");
+        card.createDiv({
+          cls: "volis-ai-avatar",
+          text: (profile.name || "?").trim().charAt(0).toUpperCase()
+        });
+        const main = card.createDiv({ cls: "volis-ai-card-main" });
+        main.createDiv({ cls: "volis-ai-card-name", text: profile.name || "\u672A\u547D\u540D\u914D\u7F6E" });
+        main.createDiv({
+          cls: "volis-ai-card-url",
+          text: profile.baseUrl || "\uFF08\u672A\u586B\u5199\u5730\u5740\uFF09"
+        });
+        const actions = card.createDiv({ cls: "volis-ai-card-actions" });
+        if (!active) {
+          const useBtn = actions.createEl("button", { cls: "volis-ai-use", text: "\u542F\u7528" });
+          useBtn.addEventListener("click", async () => {
+            ai.activeId = profile.id;
+            ai.enabled = true;
+            await save();
+            renderCards();
+          });
+        }
+        const editBtn = actions.createEl("button", {
+          cls: "volis-ai-icon",
+          attr: { "aria-label": "\u7F16\u8F91" }
+        });
+        (0, import_obsidian13.setIcon)(editBtn, "pencil");
+        editBtn.addEventListener("click", () => {
+          new AIProfileModal(this.app, profile, async (next) => {
+            const index = ai.profiles.findIndex((item) => item.id === profile.id);
+            if (index === -1)
+              return;
+            ai.profiles[index] = next;
+            await save();
+            renderCards();
+          }).open();
+        });
+        const delBtn = actions.createEl("button", {
+          cls: "volis-ai-icon is-danger",
+          attr: { "aria-label": "\u5220\u9664" }
+        });
+        (0, import_obsidian13.setIcon)(delBtn, "trash-2");
+        delBtn.addEventListener("click", async () => {
+          var _a, _b;
+          ai.profiles = ai.profiles.filter((item) => item.id !== profile.id);
+          if (ai.activeId === profile.id) {
+            ai.activeId = (_b = (_a = ai.profiles[0]) == null ? void 0 : _a.id) != null ? _b : "";
+          }
+          await save();
+          renderCards();
+        });
+      }
+    };
+    renderCards();
+    new import_obsidian13.Setting(containerEl).setName("\u6DFB\u52A0\u914D\u7F6E").setDesc("\u5728\u5F39\u7A97\u91CC\u586B\u5199\u540D\u79F0\u3001\u5730\u5740\u548C\u6A21\u578B\uFF0C\u4FDD\u5B58\u540E\u4F1A\u51FA\u73B0\u5728\u4E0A\u9762\u3002").addButton(
+      (button) => button.setButtonText("\u6DFB\u52A0\u914D\u7F6E").setCta().onClick(() => {
+        new AIProfileModal(this.app, null, async (profile) => {
+          ai.profiles.push(profile);
+          if (!ai.activeId)
+            ai.activeId = profile.id;
+          await save();
+          renderCards();
+        }).open();
+      })
+    );
     containerEl.createEl("h3", { text: "\u8BCA\u65AD" });
     const stat = containerEl.createEl("p", {
       text: "\u5728\u753B\u5E03\u89C6\u56FE\u4E2D\u6253\u5F00\u672C\u9875\uFF0C\u53EF\u770B\u5230\u5F53\u524D\u8BC6\u522B\u5230\u7684\u5361\u7247\u6570\u91CF\u3002"
     });
-    new import_obsidian10.Setting(containerEl).setName("\u5F53\u524D\u753B\u5E03").addButton(
+    new import_obsidian13.Setting(containerEl).setName("\u5F53\u524D\u753B\u5E03").addButton(
       (button) => button.setButtonText("\u5237\u65B0\u8BC6\u522B").onClick(() => {
         this.plugin.scheduleRefresh(0);
         window.setTimeout(() => {
@@ -4708,7 +6019,7 @@ var VolisSettingTab = class extends import_obsidian10.PluginSettingTab {
 };
 
 // src/main.ts
-var VolisPlugin = class extends import_obsidian11.Plugin {
+var VolisPlugin = class extends import_obsidian14.Plugin {
   constructor() {
     super(...arguments);
     this.observer = null;
@@ -4774,7 +6085,7 @@ var VolisPlugin = class extends import_obsidian11.Plugin {
   async openBoardFile(path) {
     var _a;
     const file = this.app.vault.getAbstractFileByPath(path);
-    if (!(file instanceof import_obsidian11.TFile))
+    if (!(file instanceof import_obsidian14.TFile))
       return;
     for (const leaf2 of this.app.workspace.getLeavesOfType(VIEW_TYPE_VOLIS_BOARD)) {
       const view = leaf2.view;
@@ -4801,12 +6112,13 @@ var VolisPlugin = class extends import_obsidian11.Plugin {
       clearBadges(view);
   }
   async loadSettings() {
-    var _a, _b;
+    var _a;
     const data = (_a = await this.loadData()) != null ? _a : {};
     this.settings = {
       ...DEFAULT_SETTINGS,
       ...data,
-      ai: { ...DEFAULT_SETTINGS.ai, ...(_b = data.ai) != null ? _b : {} }
+      ai: normalizeAISettings(data.ai),
+      conversations: Array.isArray(data.conversations) ? data.conversations : []
     };
   }
   async saveSettings() {
@@ -4913,7 +6225,7 @@ var VolisPlugin = class extends import_obsidian11.Plugin {
       };
     }
     console.log("[Volis] self-check", info);
-    new import_obsidian11.Notice(
+    new import_obsidian14.Notice(
       `Volis \u81EA\u68C0 \xB7 \u753B\u5E03:${info.hasCanvasView ? "\u6709" : "\u65E0"} \xB7 \u8282\u70B9:${info.nodeCount} \xB7 \u8BC6\u522B:${info.recognized}`,
       1e4
     );
@@ -5046,7 +6358,7 @@ var VolisPlugin = class extends import_obsidian11.Plugin {
       meta.editable,
       async (value) => {
         if (!value.trim()) {
-          new import_obsidian11.Notice("\u5185\u5BB9\u4E3A\u7A7A\uFF0C\u672A\u4FDD\u5B58");
+          new import_obsidian14.Notice("\u5185\u5BB9\u4E3A\u7A7A\uFF0C\u672A\u4FDD\u5B58");
           this.scheduleRefresh(0);
           return;
         }
@@ -5055,7 +6367,7 @@ var VolisPlugin = class extends import_obsidian11.Plugin {
           return;
         const ok = await writeCard(this.app, meta.ref, next);
         if (!ok) {
-          new import_obsidian11.Notice("\u4FDD\u5B58\u5931\u8D25\uFF1A\u5361\u7247\u53EF\u80FD\u5DF2\u79FB\u52A8\u6216\u5220\u9664");
+          new import_obsidian14.Notice("\u4FDD\u5B58\u5931\u8D25\uFF1A\u5361\u7247\u53EF\u80FD\u5DF2\u79FB\u52A8\u6216\u5220\u9664");
           return;
         }
         this.index.clear();
@@ -5078,12 +6390,21 @@ var VolisPlugin = class extends import_obsidian11.Plugin {
     this.registerEvent(this.app.workspace.on("file-open", () => this.scheduleRefresh(150)));
     this.registerEvent(
       this.app.metadataCache.on("changed", (file) => {
-        if (file instanceof import_obsidian11.TFile)
+        if (file instanceof import_obsidian14.TFile)
           this.sync.handleModify(file);
       })
     );
   }
   registerCommands() {
+    this.addCommand({
+      id: "ai-analyze",
+      name: "\u7528 AI \u5206\u6790\u767D\u677F",
+      callback: () => {
+        const view = this.getCanvasView();
+        if (view)
+          view.openAIPanel();
+      }
+    });
     this.addCommand({
       id: "find-node",
       name: "\u5728\u767D\u677F\u4E2D\u67E5\u627E\u8282\u70B9",
@@ -5175,7 +6496,7 @@ var VolisPlugin = class extends import_obsidian11.Plugin {
           return false;
         if (!checking) {
           void navigator.clipboard.writeText(makeBlockLink(meta.ref)).then(() => {
-            new import_obsidian11.Notice("\u5DF2\u590D\u5236\u5757\u94FE\u63A5");
+            new import_obsidian14.Notice("\u5DF2\u590D\u5236\u5757\u94FE\u63A5");
           });
         }
         return true;
@@ -5215,7 +6536,7 @@ var VolisPlugin = class extends import_obsidian11.Plugin {
         if (!ctx.entry.meta)
           return;
         await navigator.clipboard.writeText(makeBlockLink(ctx.entry.meta.ref));
-        new import_obsidian11.Notice("\u5DF2\u590D\u5236\u5757\u94FE\u63A5");
+        new import_obsidian14.Notice("\u5DF2\u590D\u5236\u5757\u94FE\u63A5");
       }
     });
     this.registry.register({
@@ -5267,8 +6588,8 @@ var VolisPlugin = class extends import_obsidian11.Plugin {
   async locateCard(meta) {
     var _a, _b, _c, _d, _e;
     const file = this.app.vault.getAbstractFileByPath(meta.ref.file);
-    if (!(file instanceof import_obsidian11.TFile)) {
-      new import_obsidian11.Notice("\u627E\u4E0D\u5230\u6E90\u6587\u4EF6");
+    if (!(file instanceof import_obsidian14.TFile)) {
+      new import_obsidian14.Notice("\u627E\u4E0D\u5230\u6E90\u6587\u4EF6");
       return;
     }
     const cache = this.app.metadataCache.getFileCache(file);
@@ -5290,7 +6611,7 @@ var VolisPlugin = class extends import_obsidian11.Plugin {
       }
       this.scheduleRefresh(150);
     } catch (error) {
-      new import_obsidian11.Notice("\u65E0\u6CD5\u79FB\u9664\u8BE5\u8282\u70B9");
+      new import_obsidian14.Notice("\u65E0\u6CD5\u79FB\u9664\u8BE5\u8282\u70B9");
     }
   }
 };

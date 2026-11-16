@@ -5,7 +5,10 @@ import { InlineEditor } from "../ui/inlineEditor";
 import { MarkdownNodeEditor } from "../ui/markdownNodeEditor";
 import { MediaModal } from "../ui/mediaModal";
 import { RenameModal } from "../ui/renameModal";
+import { ConfirmModal } from "../ui/confirmModal";
 import { appendCard, createNoteFromText, resolveCardFolder } from "./cardWriter";
+import { AIProvider, AIMessage, createProvider } from "../ai/provider";
+import { activeProfile, StoredConversation } from "../settings";
 import { InsertItem, searchInsertItems } from "./insertSearch";
 import {
   BoardData,
@@ -118,6 +121,23 @@ export class BoardView extends TextFileView {
   private minimapDragging = false;
   private selectedEdgeId: string | null = null;
   private nodeText = new Map<string, string>();
+  private nodeMeta = new Map<string, { date?: string; time?: string; tags: string[] }>();
+  private aiPanel: HTMLElement | null = null;
+  private aiOutside: ((evt: MouseEvent) => void) | null = null;
+  private aiProvider: AIProvider | null = null;
+  private aiTargets: BoardNode[] = [];
+  private aiHistory: AIMessage[] = [];
+  private aiContextSent = false;
+  private aiAnswers: string[] = [];
+  private aiPicked = new Set<number>();
+  private aiExpanded = false;
+  private aiBusy = false;
+  private aiCancelled = false;
+  private aiPending: { row: HTMLElement; stop: () => void } | null = null;
+  private aiConversationId: string | null = null;
+  private aiRestore: ((conv: StoredConversation) => void) | null = null;
+  private historyPop: HTMLElement | null = null;
+  private historyOutside: ((evt: MouseEvent) => void) | null = null;
   private searchPanel: HTMLElement | null = null;
   private searchOutside: ((evt: MouseEvent) => void) | null = null;
   private clipboard: BoardNode[] = [];
@@ -223,6 +243,9 @@ export class BoardView extends TextFileView {
         if (file instanceof TFile) this.handleFileRename(file.path, oldPath);
       })
     );
+
+    // Colours are applied inline, so a theme switch has to repaint them.
+    this.registerEvent(this.app.workspace.on("css-change", () => this.repaintColors()));
 
     this.loaded = true;
   }
@@ -540,37 +563,37 @@ export class BoardView extends TextFileView {
   private paintColor(el: HTMLElement, color: string | undefined): void {
     el.style.removeProperty("background");
     el.style.removeProperty("border-color");
+    el.style.removeProperty("color");
 
     if (!color) return;
 
-    if (color.startsWith("#")) {
-      if (el.classList.contains("is-group")) {
-        el.style.borderColor = color;
-        el.style.setProperty("--group-tint", color);
-        el.style.background = `${color}14`;
-        return;
-      }
+    const dark = document.body.classList.contains("theme-dark");
+    const isGroup = el.classList.contains("is-group");
 
-      el.style.background = this.tintOf(color);
-      el.style.borderColor = color;
+    // Foreground is pinned together with the fill: relying on the theme's text
+    // colour alone breaks the moment one side changes without the other.
+    const ink = dark ? "#eceff1" : "#1f2225";
+
+    const applyFill = (line: string, lightFill: string, groupFill: string) => {
+      el.style.borderColor = line;
+      el.style.background = dark ? this.tintOf(line, isGroup ? 0.45 : 0.66) : lightFill;
+      el.style.color = ink;
+      if (isGroup) el.style.setProperty("--group-tint", line);
+      else el.style.removeProperty("--group-tint");
+    };
+
+    if (color.startsWith("#")) {
+      applyFill(color, this.tintOf(color), `${color}14`);
       return;
     }
 
     const preset = NODE_COLORS.find((item) => item.name === color);
     if (!preset) return;
 
-    if (el.classList.contains("is-group")) {
-      el.style.borderColor = preset.line;
-      el.style.setProperty("--group-tint", preset.line);
-      el.style.background = `${preset.line}14`;
-      return;
-    }
-
-    el.style.background = preset.bg;
-    el.style.borderColor = preset.line;
+    applyFill(preset.line, preset.bg, `${preset.line}14`);
   }
 
-  /** Blend a colour towards the page background, light or dark. */
+  /** Blends a colour towards white (light theme) or the board surface (dark). */
   private tintOf(hex: string, amount = 0.84): string {
     const raw = hex.replace("#", "");
     if (raw.length !== 6) return hex;
@@ -581,12 +604,79 @@ export class BoardView extends TextFileView {
     const b = num & 255;
 
     const dark = document.body.classList.contains("theme-dark");
-    const base = dark ? 26 : 255;
+    const base = dark ? 38 : 255;
     const blend = (channel: number) => Math.round(channel + (base - channel) * amount);
 
     return `#${[blend(r), blend(g), blend(b)]
       .map((value) => value.toString(16).padStart(2, "0"))
       .join("")}`;
+  }
+
+  private closeColorPop(): void {
+    this.colorPop?.remove();
+    this.colorPop = null;
+
+    if (this.colorOutside) {
+      document.removeEventListener("mousedown", this.colorOutside, true);
+      this.colorOutside = null;
+    }
+  }
+
+  private showColorPop(nodes: BoardNode[], evt: MouseEvent): void {
+    this.closeColorPop();
+    if (nodes.length === 0) return;
+
+    const pop = this.root.createDiv({ cls: "volis-color-pop" });
+    this.colorPop = pop;
+    pop.addEventListener("pointerdown", (event) => event.stopPropagation());
+
+    for (const color of NODE_COLORS) {
+      const swatch = pop.createEl("button", {
+        cls: "volis-swatch",
+        attr: { "aria-label": color.label },
+      });
+      swatch.dataset.color = color.name;
+      swatch.addEventListener("click", () => {
+        this.applyNodeColor(nodes, color.name);
+        this.closeColorPop();
+      });
+    }
+
+    const custom = pop.createEl("label", {
+      cls: "volis-swatch is-custom",
+      attr: { "aria-label": "自定义颜色" },
+    });
+    const picker = custom.createEl("input", { attr: { type: "color" } });
+    picker.value = this.currentColorOf(nodes) ?? "#7f77dd";
+    picker.addEventListener("input", () => this.applyNodeColor(nodes, picker.value));
+    picker.addEventListener("change", () => {
+      this.applyNodeColor(nodes, picker.value);
+      this.closeColorPop();
+    });
+
+    const clear = pop.createEl("button", {
+      cls: "volis-swatch is-clear",
+      attr: { "aria-label": "无颜色" },
+    });
+    setIcon(clear, "ban");
+    clear.addEventListener("click", () => {
+      this.applyNodeColor(nodes, "");
+      this.closeColorPop();
+    });
+
+    const rect = this.root.getBoundingClientRect();
+    const popWidth = 260;
+    pop.style.left = `${Math.round(
+      Math.max(8, Math.min(evt.clientX - rect.left - 20, rect.width - popWidth - 8))
+    )}px`;
+    pop.style.top = `${Math.round(Math.max(8, evt.clientY - rect.top + 12))}px`;
+
+    this.colorOutside = (event: MouseEvent) => {
+      const target = event.target as Node | null;
+      if (target && pop.contains(target)) return;
+      this.closeColorPop();
+    };
+    document.addEventListener("mousedown", this.colorOutside, true);
   }
 
   private closeAlignPop(): void {
@@ -628,7 +718,9 @@ export class BoardView extends TextFileView {
 
     const rect = this.root.getBoundingClientRect();
     const width = 168;
-    pop.style.left = `${Math.round(Math.max(8, Math.min(evt.clientX - rect.left - 40, rect.width - width - 8)))}px`;
+    pop.style.left = `${Math.round(
+      Math.max(8, Math.min(evt.clientX - rect.left - 40, rect.width - width - 8))
+    )}px`;
     pop.style.top = `${Math.round(Math.max(8, evt.clientY - rect.top + 12))}px`;
 
     this.alignOutside = (event: MouseEvent) => {
@@ -737,73 +829,6 @@ export class BoardView extends TextFileView {
     }
 
     this.afterLayout();
-  }
-
-  private closeColorPop(): void {
-    this.colorPop?.remove();
-    this.colorPop = null;
-    if (this.colorOutside) {
-      document.removeEventListener("mousedown", this.colorOutside, true);
-      this.colorOutside = null;
-    }
-  }
-
-  private showColorPop(nodes: BoardNode[], evt: MouseEvent): void {
-    this.closeColorPop();
-    if (nodes.length === 0) return;
-
-    const pop = this.root.createDiv({ cls: "volis-color-pop" });
-    this.colorPop = pop;
-
-    pop.addEventListener("pointerdown", (event) => event.stopPropagation());
-
-    for (const color of NODE_COLORS) {
-      const swatch = pop.createEl("button", {
-        cls: "volis-swatch",
-        attr: { "aria-label": color.label },
-      });
-      swatch.dataset.color = color.name;
-      swatch.addEventListener("click", () => {
-        this.applyNodeColor(nodes, color.name);
-        this.closeColorPop();
-      });
-    }
-
-    const custom = pop.createEl("label", {
-      cls: "volis-swatch is-custom",
-      attr: { "aria-label": "自定义颜色" },
-    });
-    const picker = custom.createEl("input", { attr: { type: "color" } });
-    picker.value = this.currentColorOf(nodes) ?? "#7f77dd";
-    picker.addEventListener("input", () => {
-      this.applyNodeColor(nodes, picker.value);
-    });
-    picker.addEventListener("change", () => {
-      this.applyNodeColor(nodes, picker.value);
-      this.closeColorPop();
-    });
-
-    const clear = pop.createEl("button", {
-      cls: "volis-swatch is-clear",
-      attr: { "aria-label": "无颜色" },
-    });
-    setIcon(clear, "ban");
-    clear.addEventListener("click", () => {
-      this.applyNodeColor(nodes, "");
-      this.closeColorPop();
-    });
-
-    const rect = this.root.getBoundingClientRect();
-    const popWidth = 240;
-    pop.style.left = `${Math.round(Math.max(8, Math.min(evt.clientX - rect.left - 20, rect.width - popWidth - 8)))}px`;
-    pop.style.top = `${Math.round(Math.max(8, evt.clientY - rect.top + 12))}px`;
-
-    this.colorOutside = (event: MouseEvent) => {
-      const target = event.target as Node | null;
-      if (target && pop.contains(target)) return;
-      this.closeColorPop();
-    };
-    document.addEventListener("mousedown", this.colorOutside, true);
   }
 
   private currentColorOf(nodes: BoardNode[]): string | null {
@@ -1082,6 +1107,12 @@ export class BoardView extends TextFileView {
         run: (nodes, evt) => this.showColorPop(nodes, evt),
       },
       {
+        id: "ai",
+        icon: "sparkles",
+        label: "AI 分析",
+        run: () => this.openAIPanel(),
+      },
+      {
         id: "more",
         icon: "more-horizontal",
         label: "更多",
@@ -1141,6 +1172,13 @@ export class BoardView extends TextFileView {
       await this.app.fileManager.renameFile(file, `${prefix}${name}.volis`);
     } catch (error) {
       new Notice("重命名失败：名称可能重复或包含非法字符");
+    }
+  }
+
+  private repaintColors(): void {
+    for (const node of this.nodes) {
+      const el = this.nodeEls.get(node.id);
+      if (el) this.paintColor(el, node.color);
     }
   }
 
@@ -1611,8 +1649,7 @@ export class BoardView extends TextFileView {
       this.staleIds.delete(id);
     }
 
-    this.edges = this.edges.filter((edge) => !ids.has(edge.from) && !ids.has(edge.to));
-    this.selectedEdgeId = null;
+    this.pruneEdges();
     this.renderEdges();
 
     this.selection.clear();
@@ -2032,6 +2069,7 @@ export class BoardView extends TextFileView {
     }
 
     this.nodeText.set(node.id, meta.editable);
+    this.nodeMeta.set(node.id, { date: meta.date, time: meta.time, tags: meta.tags });
     await MarkdownRenderer.render(this.app, normalizeTags(meta.body), body, node.file, this);
     this.decorateNumericTags(body);
 
@@ -2262,6 +2300,25 @@ export class BoardView extends TextFileView {
     }
   }
 
+  /**
+   * Drops connections whose endpoints no longer exist. Both delete paths call
+   * this, so a removed node never leaves a dangling line behind.
+   */
+  private pruneEdges(): void {
+    const before = this.edges.length;
+
+    this.edges = this.edges.filter(
+      (edge) => this.nodeMap.has(edge.from) && this.nodeMap.has(edge.to)
+    );
+
+    if (this.edges.length === before) return;
+
+    if (this.selectedEdgeId && !this.edges.some((edge) => edge.id === this.selectedEdgeId)) {
+      this.selectedEdgeId = null;
+      this.updateEdgeBar();
+    }
+  }
+
   private cleanupStaleNodes(): void {
     if (this.hasEditingNode()) {
       new Notice("请先结束编辑再清理");
@@ -2281,6 +2338,8 @@ export class BoardView extends TextFileView {
     }
 
     this.staleIds.clear();
+    this.pruneEdges();
+    this.renderEdges();
     this.updateFrame();
     this.updateHint();
     this.pushHistory();
@@ -2395,6 +2454,7 @@ export class BoardView extends TextFileView {
     const target = evt.target as HTMLElement | null;
     if (target?.closest(".volis-inline")) return;
     if (target?.closest(".volis-insert-panel")) return;
+    if (target?.closest(".volis-ai-panel")) return;
 
     evt.preventDefault();
 
@@ -2558,6 +2618,949 @@ export class BoardView extends TextFileView {
       this.root.removeClass("is-focusing");
       for (const other of this.nodeEls.values()) other.removeClass("is-dimmed");
     }, 1600);
+  }
+
+  private closeAiPanel(): void {
+    this.closeHistoryPop();
+    if (this.aiOutside) {
+      document.removeEventListener("mousedown", this.aiOutside, true);
+      this.aiOutside = null;
+    }
+    this.aiPanel?.remove();
+    this.aiPanel = null;
+  }
+
+  /**
+   * Turns the selected nodes into a compact structured description. Positions,
+   * groups and colours are included because they carry meaning the model cannot
+   * infer from the text alone.
+   */
+  private describeNodes(nodes: BoardNode[], perNodeLimit: number): string {
+    const index = new Map<string, string>();
+    nodes.forEach((node, i) => index.set(node.id, `N${i + 1}`));
+
+    const blocks: string[] = [];
+
+    for (const node of nodes) {
+      const tag = index.get(node.id);
+      if (!tag) continue;
+
+      if (node.type === "group") {
+        const members = this.groupMembers(node)
+          .map((member) => index.get(member.id))
+          .filter((id): id is string => Boolean(id));
+        blocks.push(
+          `【${tag}】分组「${node.label ?? "未命名"}」${members.length ? `包含 ${members.join("、")}` : "（空）"}`
+        );
+        continue;
+      }
+
+      const kind = node.type === "card" ? "卡片" : node.type === "file" ? "笔记" : "文本节点";
+      const full = (this.nodeText.get(node.id) ?? "").replace(/\s+/g, " ").trim();
+      const text =
+        full.length > perNodeLimit ? `${full.slice(0, perNodeLimit)}…（后略）` : full;
+
+      const meta = this.nodeMeta.get(node.id);
+      const bits: string[] = [kind];
+      if (meta?.date) bits.push(meta.date + (meta.time ? ` ${meta.time}` : ""));
+      if (meta?.tags.length) bits.push(meta.tags.map((tagText) => `#${tagText}`).join(" "));
+      if (node.color) bits.push(`颜色:${node.color}`);
+
+      blocks.push(`【${tag}】${bits.join(" · ")}\n${text || "（空）"}`);
+    }
+
+    const relations = this.edges
+      .filter((edge) => index.has(edge.from) && index.has(edge.to))
+      .map((edge) => {
+        const label = edge.label ? `（${edge.label}）` : "";
+        return `${index.get(edge.from)} → ${index.get(edge.to)}${label}`;
+      });
+
+    if (relations.length > 0) blocks.push(`【关系】\n${relations.join("\n")}`);
+
+    return blocks.join("\n\n");
+  }
+
+  /**
+   * Builds the board description within a character budget. Falls back in two
+   * steps so a large board degrades gracefully instead of failing the request.
+   */
+  private buildBoardContext(
+    nodes: BoardNode[],
+    limit: number
+  ): { text: string; note: string } {
+    const full = this.describeNodes(nodes, Number.POSITIVE_INFINITY);
+    if (full.length <= limit) return { text: full, note: "" };
+
+    const trimmed = this.describeNodes(nodes, 400);
+    if (trimmed.length <= limit) {
+      return { text: trimmed, note: "内容较长，每个节点已精简为前 400 字" };
+    }
+
+    const half = Math.max(1, Math.floor(nodes.length / 2));
+    const partial = this.describeNodes(nodes.slice(0, half), 300);
+    return {
+      text: partial,
+      note: `节点较多，本次只发送了前 ${half} 个（共 ${nodes.length} 个）`,
+    };
+  }
+
+  private historyChars(): number {
+    return this.aiHistory.reduce((sum, message) => sum + message.content.length, 0);
+  }
+
+  /** Collapses early turns into one summary, keeping the last two exchanges raw. */
+  private async compactHistory(provider: AIProvider, threshold: number): Promise<void> {
+    if (this.aiHistory.length <= 4 || this.historyChars() <= threshold) return;
+
+    const recent = this.aiHistory.slice(-4);
+    const older = this.aiHistory.slice(0, -4);
+
+    const transcript = older
+      .map((message) => `${message.role === "user" ? "用户" : "助手"}：${message.content}`)
+      .join("\n\n");
+
+    let summary = "";
+    try {
+      summary = await provider.complete(
+        [
+          {
+            role: "user",
+            content: `请把下面这段对话压缩成要点，保留结论、判断、用户意图和未解决的问题，去掉过程描述与重复内容：\n\n${transcript}`,
+          },
+        ],
+        { system: "你是对话摘要助手。只输出摘要正文，不要寒暄，不要标题。", maxTokens: 600 }
+      );
+    } catch (error) {
+      return;
+    }
+
+    if (!summary.trim()) return;
+
+    const block = `【此前对话摘要】\n${summary.trim()}`;
+    const head = recent[0];
+
+    this.aiHistory =
+      head.role === "user"
+        ? [{ role: "user", content: `${block}\n\n${head.content}` }, ...recent.slice(1)]
+        : [{ role: "user", content: block }, ...recent];
+
+    new Notice("对话较长，早期的往来已压缩为摘要");
+  }
+
+  public openAIPanel(): void {
+    this.closeAiPanel();
+
+    const profile = activeProfile(this.plugin.settings.ai);
+    const provider = createProvider(profile);
+
+    if (!this.plugin.settings.ai.enabled || !provider.configured) {
+      new Notice("请先在设置中启用 AI 并添加一个模型配置");
+      return;
+    }
+
+    const selected = this.selectedNodes();
+    // The context builder trims to budget, so the raw cap can be generous.
+    const targets = selected.length > 0 ? selected : this.nodes.slice(0, 200);
+    if (targets.length === 0) {
+      new Notice("白板上还没有节点");
+      return;
+    }
+
+    this.aiProvider = provider;
+    this.aiTargets = targets;
+    this.aiHistory = [];
+    this.aiContextSent = false;
+    this.aiAnswers = [];
+    this.aiPicked = new Set<number>();
+    this.aiBusy = false;
+    this.aiConversationId = null;
+    this.aiExpanded = false;
+
+    const rect = this.root.getBoundingClientRect();
+    const box = this.selectionBox(targets);
+
+    const panel = this.root.createDiv({ cls: "volis-ai-panel" });
+    this.aiPanel = panel;
+    panel.addEventListener("pointerdown", (evt) => evt.stopPropagation());
+    panel.addEventListener("dblclick", (evt) => evt.stopPropagation());
+
+    const head = panel.createDiv({ cls: "volis-ai-head" });
+    const headIcon = head.createDiv({ cls: "volis-ai-head-icon" });
+    setIcon(headIcon, "sparkles");
+    head.createDiv({
+      cls: "volis-ai-head-title",
+      text: `${selected.length > 0 ? "分析选中的" : "分析全部"} ${targets.length} 个节点`,
+    });
+    head.createDiv({ cls: "volis-ai-head-model", text: profile?.name ?? "" });
+    head.createDiv({ cls: "volis-ai-head-spacer" });
+
+    const newBtn = head.createEl("button", {
+      cls: "volis-ai-head-btn",
+      attr: { "aria-label": "新对话" },
+    });
+    setIcon(newBtn, "square-pen");
+
+    const historyBtn = head.createEl("button", {
+      cls: "volis-ai-head-btn",
+      attr: { "aria-label": "历史对话" },
+    });
+    setIcon(historyBtn, "history");
+
+    const expandBtn = head.createEl("button", {
+      cls: "volis-ai-head-btn",
+      attr: { "aria-label": "展开" },
+    });
+    setIcon(expandBtn, "maximize-2");
+
+    const closeBtn = head.createEl("button", {
+      cls: "volis-ai-head-btn",
+      attr: { "aria-label": "关闭" },
+    });
+    setIcon(closeBtn, "x");
+
+    const stream = panel.createDiv({ cls: "volis-ai-stream" });
+
+    const compose = panel.createDiv({ cls: "volis-ai-compose" });
+    const input = compose.createEl("input", {
+      cls: "volis-ai-input",
+      attr: { type: "text", placeholder: "问点什么，或继续追问…" },
+    });
+    const sendBtn = compose.createEl("button", {
+      cls: "volis-ai-send",
+      attr: { "aria-label": "发送" },
+    });
+    setIcon(sendBtn, "arrow-up");
+
+    const actions = panel.createDiv({ cls: "volis-ai-actions" });
+    const insertBtn = actions.createEl("button", {
+      cls: "volis-ai-btn is-primary",
+      text: "插入为新节点",
+    });
+    const overwriteBtn = actions.createEl("button", { cls: "volis-ai-btn", text: "覆盖原节点" });
+    const noteBtn = actions.createEl("button", { cls: "volis-ai-btn", text: "存为笔记" });
+    actions.createDiv({ cls: "volis-ai-esc", text: "Esc 退出" });
+
+    insertBtn.disabled = true;
+    noteBtn.disabled = true;
+
+    // Overwriting only makes sense for a single editable node.
+    const single = targets.length === 1 ? targets[0] : null;
+    const overwriteTarget =
+      single &&
+      (single.type === "text" ||
+        single.type === "card" ||
+        (single.type === "file" && single.file.toLowerCase().endsWith(".md")))
+        ? single
+        : null;
+
+    if (!overwriteTarget) {
+      overwriteBtn.addClass("is-hidden");
+    } else {
+      overwriteBtn.disabled = true;
+    }
+
+    const syncActions = () => {
+      const has = this.aiPicked.size > 0 && !this.aiBusy;
+      insertBtn.disabled = !has;
+      noteBtn.disabled = !has;
+      if (overwriteTarget) overwriteBtn.disabled = !has;
+
+      const count = this.aiPicked.size;
+      insertBtn.setText(count > 1 ? `插入为新节点（${count} 条）` : "插入为新节点");
+      noteBtn.setText(count > 1 ? `存为笔记（${count} 条）` : "存为笔记");
+      if (overwriteTarget) {
+        overwriteBtn.setText(count > 1 ? `覆盖原节点（${count} 条）` : "覆盖原节点");
+      }
+    };
+
+    syncActions();
+
+    let dragStart: { x: number; y: number; left: number; top: number } | null = null;
+
+    head.addEventListener("pointerdown", (evt) => {
+      if ((evt.target as HTMLElement).closest("button")) return;
+      if (this.aiExpanded) return;
+
+      dragStart = {
+        x: evt.clientX,
+        y: evt.clientY,
+        left: panel.offsetLeft,
+        top: panel.offsetTop,
+      };
+
+      head.setPointerCapture(evt.pointerId);
+      panel.addClass("is-dragging");
+    });
+
+    head.addEventListener("pointermove", (evt) => {
+      if (!dragStart) return;
+      panel.style.left = `${Math.round(dragStart.left + evt.clientX - dragStart.x)}px`;
+      panel.style.top = `${Math.round(dragStart.top + evt.clientY - dragStart.y)}px`;
+    });
+
+    const endDrag = (evt: PointerEvent) => {
+      if (!dragStart) return;
+      dragStart = null;
+      panel.removeClass("is-dragging");
+      try {
+        head.releasePointerCapture(evt.pointerId);
+      } catch (error) {
+        // pointer already released
+      }
+    };
+
+    head.addEventListener("pointerup", endDrag);
+    head.addEventListener("pointercancel", endDrag);
+
+    const place = () => {
+      if (this.aiExpanded) {
+        panel.style.left = `${Math.round(rect.width * 0.1)}px`;
+        panel.style.top = `${Math.round(rect.height * 0.06)}px`;
+        return;
+      }
+
+      const panelWidth = 580;
+      const screenLeft = box ? box.minX * this.scale + this.tx : rect.width / 2;
+      const screenTop = box ? box.minY * this.scale + this.ty : rect.height / 2;
+      const boxWidth = box ? (box.maxX - box.minX) * this.scale : 0;
+
+      let left = screenLeft + (boxWidth - panelWidth) / 2;
+      left = Math.max(8, Math.min(left, rect.width - panelWidth - 8));
+
+      // The node toolbar floats just above the selection; tuck the panel
+      // directly underneath it instead of leaving a gap.
+      let top = screenTop - 6;
+      top = Math.max(8, Math.min(top, rect.height - 560));
+
+      panel.style.left = `${Math.round(left)}px`;
+      panel.style.top = `${Math.round(top)}px`;
+    };
+
+    place();
+
+    const scrollDown = () => {
+      stream.scrollTop = stream.scrollHeight;
+    };
+
+    const addUserBubble = (text: string) => {
+      const row = stream.createDiv({ cls: "volis-ai-msg is-user" });
+      row.createDiv({ cls: "volis-ai-bubble", text });
+      scrollDown();
+    };
+
+    const refreshPicks = () => {
+      stream.querySelectorAll(".volis-ai-msg.is-ai").forEach((row) => {
+        const index = Number((row as HTMLElement).dataset.answerIndex ?? "-1");
+        row.toggleClass("is-picked", this.aiPicked.has(index));
+      });
+      syncActions();
+    };
+
+    const togglePick = (index: number) => {
+      if (this.aiPicked.has(index)) this.aiPicked.delete(index);
+      else this.aiPicked.add(index);
+      refreshPicks();
+    };
+
+    const addAiBubble = async (text: string): Promise<HTMLElement> => {
+      const index = this.aiAnswers.length;
+      this.aiAnswers.push(text);
+
+      const row = stream.createDiv({ cls: "volis-ai-msg is-ai" });
+      row.dataset.answerIndex = String(index);
+
+      const bubble = row.createDiv({ cls: "volis-ai-bubble is-md" });
+      row.addEventListener("click", (evt) => {
+        // Let text selection inside an answer work without toggling it.
+        if (!window.getSelection()?.isCollapsed) return;
+        evt.preventDefault();
+        togglePick(index);
+      });
+
+      await MarkdownRenderer.render(this.app, this.decorateAnswer(text), bubble, "", this);
+
+      if (this.aiPicked.size === 0) this.aiPicked.add(index);
+      refreshPicks();
+      scrollDown();
+      return bubble;
+    };
+
+    /** All picked answers, joined in dialogue order. */
+    const currentAnswer = (): string => {
+      const indexes = Array.from(this.aiPicked).sort((a, b) => a - b);
+      return indexes
+        .map((index) => this.aiAnswers[index])
+        .filter((value): value is string => Boolean(value))
+        .join("\n\n");
+    };
+
+    const thinkingLines = [
+      "正在读你的卡片…",
+      "CPU 疯狂燃烧🔥…",
+      "脑细胞集合中…",
+      "组织语言中…",
+    ];
+
+    const addPending = (): { row: HTMLElement; stop: () => void } => {
+      const row = stream.createDiv({ cls: "volis-ai-msg is-status" });
+      const bubble = row.createDiv({ cls: "volis-ai-bubble is-pending" });
+      const label = bubble.createSpan({ cls: "volis-ai-thinking", text: thinkingLines[0] });
+
+      let step = 0;
+      const timer = window.setInterval(() => {
+        step = (step + 1) % thinkingLines.length;
+        label.setText(thinkingLines[step]);
+      }, 1500);
+
+      scrollDown();
+      return { row, stop: () => window.clearInterval(timer) };
+    };
+
+    const addError = (text: string) => {
+      const row = stream.createDiv({ cls: "volis-ai-msg is-status" });
+      row.createDiv({ cls: "volis-ai-bubble is-error", text });
+      scrollDown();
+    };
+
+    const setBusy = (value: boolean) => {
+      this.aiBusy = value;
+
+      input.disabled = value;
+      sendBtn.empty();
+      setIcon(sendBtn, value ? "square" : "arrow-up");
+      sendBtn.toggleClass("is-stop", value);
+      sendBtn.setAttribute("aria-label", value ? "停止生成" : "发送");
+
+      if (value) {
+        insertBtn.disabled = true;
+        noteBtn.disabled = true;
+        overwriteBtn.disabled = true;
+      } else {
+        syncActions();
+      }
+    };
+
+    const ask = async () => {
+      const question = input.value.trim();
+      if (!question || this.aiBusy || !this.aiProvider) return;
+
+      input.value = "";
+      addUserBubble(question);
+      this.aiCancelled = false;
+      setBusy(true);
+
+      const pending = addPending();
+      this.aiPending = pending;
+
+      const aiSettings = this.plugin.settings.ai;
+      await this.compactHistory(this.aiProvider, aiSettings.compactThreshold);
+
+      let content = question;
+      if (!this.aiContextSent) {
+        const context = this.buildBoardContext(this.aiTargets, aiSettings.contextLimit);
+        if (context.note) new Notice(context.note);
+        content = `【白板内容】\n${context.text}\n\n【问题】\n${question}`;
+      }
+
+      this.aiHistory.push({ role: "user", content });
+
+      try {
+        const reply = await this.aiProvider.complete(this.aiHistory, {
+          system:
+            "你是白板整理助手。用户给你白板上的节点内容和它们之间的关系，请用简洁的中文回答，" +
+            "不要复述原文，直接给判断和建议。必要时用列表。",
+        });
+
+        this.aiHistory.push({ role: "assistant", content: reply });
+        this.aiContextSent = true;
+
+        pending.stop();
+        pending.row.remove();
+        this.aiPending = null;
+
+        if (this.aiCancelled) {
+          this.aiHistory.pop();
+          this.aiHistory.pop();
+          return;
+        }
+
+        await addAiBubble(reply);
+        this.persistConversation(question);
+
+        insertBtn.disabled = false;
+        noteBtn.disabled = false;
+        if (overwriteTarget) overwriteBtn.disabled = false;
+      } catch (error) {
+        // Drop the unanswered turn so a retry does not carry a dangling user message.
+        this.aiHistory.pop();
+        pending.stop();
+        pending.row.remove();
+        this.aiPending = null;
+        if (!this.aiCancelled) {
+          addError(error instanceof Error ? error.message : String(error));
+        }
+      } finally {
+        setBusy(false);
+        input.focus();
+      }
+    };
+
+    input.addEventListener("keydown", (evt) => {
+      if (evt.key === "Escape") {
+        evt.preventDefault();
+        this.closeAiPanel();
+        return;
+      }
+      if (evt.key === "Enter") {
+        evt.preventDefault();
+        void ask();
+      }
+    });
+
+    sendBtn.addEventListener("click", () => {
+      if (this.aiBusy) {
+        this.aiCancelled = true;
+        this.aiPending?.stop();
+        this.aiPending?.row.remove();
+        this.aiPending = null;
+        setBusy(false);
+        new Notice("已停止生成");
+        return;
+      }
+      void ask();
+    });
+
+    newBtn.addEventListener("click", () => {
+      this.aiConversationId = null;
+      this.aiHistory = [];
+      this.aiContextSent = false;
+      this.aiAnswers = [];
+      this.aiPicked = new Set<number>();
+      stream.empty();
+      stream.createDiv({ cls: "volis-ai-empty-hint", text: "新对话已开始，选中的节点保持不变。" });
+      insertBtn.disabled = true;
+      noteBtn.disabled = true;
+      if (overwriteTarget) overwriteBtn.disabled = true;
+      input.focus();
+    });
+
+    this.aiRestore = (conv: StoredConversation) => {
+      stream.empty();
+
+      const answers = conv.messages
+        .filter((message) => message.role === "assistant")
+        .map((message) => message.content);
+
+      this.aiAnswers = answers;
+      this.aiPicked = new Set(answers.length > 0 ? [answers.length - 1] : []);
+
+      let answerIndex = 0;
+
+      for (const message of conv.messages) {
+        if (message.role === "user") {
+          addUserBubble(message.content);
+          continue;
+        }
+
+        const index = answerIndex++;
+        const row = stream.createDiv({ cls: "volis-ai-msg is-ai" });
+        row.dataset.answerIndex = String(index);
+
+        const bubble = row.createDiv({ cls: "volis-ai-bubble is-md" });
+        row.addEventListener("click", (evt) => {
+          if (!window.getSelection()?.isCollapsed) return;
+          evt.preventDefault();
+          togglePick(index);
+        });
+
+        void MarkdownRenderer.render(
+          this.app,
+          this.decorateAnswer(message.content),
+          bubble,
+          "",
+          this
+        );
+      }
+
+      refreshPicks();
+      scrollDown();
+    };
+
+    historyBtn.addEventListener("click", () => this.openHistoryPop(historyBtn));
+
+    expandBtn.addEventListener("click", () => {
+      this.aiExpanded = !this.aiExpanded;
+      panel.toggleClass("is-expanded", this.aiExpanded);
+      setIcon(expandBtn, this.aiExpanded ? "minimize-2" : "maximize-2");
+      place();
+    });
+
+    closeBtn.addEventListener("click", () => this.closeAiPanel());
+
+    insertBtn.addEventListener("click", () => {
+      const text = currentAnswer();
+      if (!text) return;
+      void this.insertAIText(text, this.aiTargets);
+      this.closeAiPanel();
+    });
+
+    noteBtn.addEventListener("click", () => {
+      const text = currentAnswer();
+      if (!text) return;
+      void createNoteFromText(
+        this.app,
+        this.plugin.settings.boardFolder ?? "",
+        text,
+        "AI 整理"
+      ).then((file) => {
+        if (file) new Notice(`已保存为 ${file.basename}`);
+      });
+      this.closeAiPanel();
+    });
+
+    overwriteBtn.addEventListener("click", () => {
+      if (!overwriteTarget) return;
+
+      const text = this.replyTextForOverwrite();
+      if (!text) return;
+
+      const indexes = Array.from(this.aiPicked).sort((a, b) => a - b);
+      const scope =
+        indexes.length === 1
+          ? `第 ${indexes[0] + 1} 条回答`
+          : `选中的 ${indexes.length} 条回答（按顺序合并）`;
+      const targetName =
+        overwriteTarget.type === "card"
+          ? "卡片（会同时改写速记里的原文）"
+          : overwriteTarget.type === "file"
+            ? "这篇笔记的全文"
+            : "这个文本节点";
+
+      new ConfirmModal(
+        this.app,
+        "覆盖原节点内容？",
+        `将用${scope}覆盖${targetName}。原有内容会被替换，可按 Ctrl+Z 撤销。`,
+        "确认覆盖",
+        () => {
+          void this.overwriteNode(overwriteTarget, text).then((ok) => {
+            if (ok) {
+              new Notice("已覆盖原节点内容，可按 Ctrl+Z 撤销");
+              this.closeAiPanel();
+            } else {
+              new Notice("覆盖失败");
+            }
+          });
+        }
+      ).open();
+    });
+
+
+    window.setTimeout(() => input.focus(), 30);
+  }
+
+  private stripContext(content: string): string {
+    const marker = "【问题】\n";
+    const index = content.indexOf(marker);
+    return index >= 0 ? content.slice(index + marker.length) : content;
+  }
+
+  private persistConversation(question: string): void {
+    const boardPath = this.file?.path ?? "";
+    if (!boardPath) return;
+
+    const store = this.plugin.settings.conversations;
+    let conversation = store.find((item) => item.id === this.aiConversationId);
+
+    if (!conversation) {
+      conversation = {
+        id: `c${Date.now()}`,
+        title: question.replace(/\s+/g, " ").trim().slice(0, 24) || "未命名对话",
+        boardPath,
+        updatedAt: Date.now(),
+        messages: [],
+        nodeIds: [],
+      };
+      store.push(conversation);
+      this.aiConversationId = conversation.id;
+    }
+
+    conversation.messages = this.aiHistory.map((message) => ({
+      role: message.role,
+      content: message.role === "user" ? this.stripContext(message.content) : message.content,
+    }));
+    conversation.updatedAt = Date.now();
+    conversation.nodeIds = this.aiTargets.map((node) => node.id);
+
+    // Newest first, capped so the settings file cannot grow without bound.
+    this.plugin.settings.conversations = store
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .slice(0, 30);
+
+    void this.plugin.saveSettings();
+  }
+
+  private async loadConversation(conversation: StoredConversation): Promise<void> {
+    this.aiConversationId = conversation.id;
+    this.aiHistory = conversation.messages.map((message) => ({
+      role: message.role,
+      content: message.content,
+    }));
+    this.aiContextSent = false;
+
+    const alive = conversation.nodeIds
+      .map((id) => this.nodeMap.get(id))
+      .filter((node): node is BoardNode => Boolean(node));
+
+    if (alive.length > 0) this.aiTargets = alive;
+
+    this.aiRestore?.(conversation);
+
+    if (alive.length < conversation.nodeIds.length) {
+      new Notice("部分节点已不存在，这次对话只能查看，追问时 AI 看不到它们");
+    }
+  }
+
+  private deleteConversation(id: string): void {
+    const store = this.plugin.settings.conversations.filter((item) => item.id !== id);
+    this.plugin.settings.conversations = store;
+    if (this.aiConversationId === id) this.aiConversationId = null;
+    void this.plugin.saveSettings();
+  }
+
+  private closeHistoryPop(): void {
+    if (this.historyOutside) {
+      document.removeEventListener("mousedown", this.historyOutside, true);
+      this.historyOutside = null;
+    }
+    this.historyPop?.remove();
+    this.historyPop = null;
+  }
+
+  private formatStamp(timestamp: number): string {
+    const date = new Date(timestamp);
+    const pad = (value: number) => String(value).padStart(2, "0");
+    return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  }
+
+  private openHistoryPop(anchor: HTMLElement): void {
+    const wasOpen = Boolean(this.historyPop);
+    this.closeHistoryPop();
+    if (wasOpen) return;
+
+    const boardPath = this.file?.path ?? "";
+    const items = this.plugin.settings.conversations
+      .filter((conversation) => conversation.boardPath === boardPath)
+      .sort((a, b) => b.updatedAt - a.updatedAt);
+
+    const pop = this.root.createDiv({ cls: "volis-ai-history" });
+    this.historyPop = pop;
+    pop.addEventListener("pointerdown", (evt) => evt.stopPropagation());
+    pop.addEventListener("dblclick", (evt) => evt.stopPropagation());
+
+    const head = pop.createDiv({ cls: "volis-ai-history-head" });
+    head.createDiv({ cls: "volis-ai-history-heading", text: "对话记录" });
+
+    if (items.length > 0) {
+      const clear = head.createEl("button", { cls: "volis-ai-history-clear", text: "全部删除" });
+      clear.addEventListener("click", () => {
+        new ConfirmModal(
+          this.app,
+          "删除全部对话记录？",
+          `将删除这块白板的 ${items.length} 条记录，无法恢复。`,
+          "全部删除",
+          () => {
+            this.plugin.settings.conversations = this.plugin.settings.conversations.filter(
+              (conversation) => conversation.boardPath !== boardPath
+            );
+            this.aiConversationId = null;
+            void this.plugin.saveSettings();
+            this.closeHistoryPop();
+          }
+        ).open();
+      });
+    }
+
+    if (items.length === 0) {
+      pop.createDiv({ cls: "volis-ai-history-empty", text: "这块白板还没有对话记录" });
+    }
+
+    for (const conversation of items) {
+      const row = pop.createDiv({ cls: "volis-ai-history-item" });
+      if (conversation.id === this.aiConversationId) row.addClass("is-current");
+
+      const iconEl = row.createDiv({ cls: "volis-ai-history-icon" });
+      setIcon(iconEl, "message-square");
+
+      const body = row.createDiv({ cls: "volis-ai-history-body" });
+      body.createDiv({ cls: "volis-ai-history-name", text: conversation.title });
+      body.createDiv({
+        cls: "volis-ai-history-time",
+        text: this.formatStamp(conversation.updatedAt),
+      });
+
+      const del = row.createEl("button", {
+        cls: "volis-ai-history-del",
+        attr: { "aria-label": "删除这条记录" },
+      });
+      setIcon(del, "trash-2");
+
+      del.addEventListener("click", (evt) => {
+        evt.stopPropagation();
+        this.deleteConversation(conversation.id);
+        this.closeHistoryPop();
+        this.openHistoryPop(anchor);
+      });
+
+      row.addEventListener("click", () => {
+        this.closeHistoryPop();
+        void this.loadConversation(conversation);
+      });
+    }
+
+    const anchorRect = anchor.getBoundingClientRect();
+    const panelEl = anchor.closest(".volis-ai-panel") as HTMLElement | null;
+    const panelRect = panelEl?.getBoundingClientRect() ?? anchorRect;
+    const rootRect = this.root.getBoundingClientRect();
+    const width = 300;
+    const gap = 8;
+
+    // Align to the panel's right edge, not to the button, so it hugs the window.
+    pop.style.left = `${Math.round(
+      Math.max(gap, Math.min(panelRect.right - rootRect.left - width - gap, rootRect.width - width - gap))
+    )}px`;
+    pop.style.top = `${Math.round(anchorRect.bottom - rootRect.top + 6)}px`;
+
+    this.historyOutside = (evt: MouseEvent) => {
+      const target = evt.target as Node | null;
+      if (target && (pop.contains(target) || anchor.contains(target))) return;
+      this.closeHistoryPop();
+    };
+    document.addEventListener("mousedown", this.historyOutside, true);
+  }
+
+  /** Turns bare references like N3 into N3「content preview」 so the reader can
+   *  tell which card is meant without looking at the board. */
+  private decorateAnswer(text: string): string {
+    return text.replace(/\bN(\d+)\b/g, (match, digits: string) => {
+      const node = this.aiTargets[Number(digits) - 1];
+      if (!node) return match;
+
+      const preview = (this.nodeText.get(node.id) ?? "").replace(/\s+/g, " ").trim();
+      if (!preview) return match;
+
+      const short = preview.length > 12 ? `${preview.slice(0, 12)}…` : preview;
+      return `${match}「${short}」`;
+    });
+  }
+
+  /** Selected text inside the panel, otherwise the latest full answer. */
+  private replyTextForOverwrite(): string {
+    const selection = window.getSelection();
+    const text = selection?.toString().trim() ?? "";
+
+    if (text && selection?.anchorNode && this.aiPanel?.contains(selection.anchorNode)) {
+      return text;
+    }
+
+    return Array.from(this.aiPicked)
+      .sort((a, b) => a - b)
+      .map((index) => this.aiAnswers[index])
+      .filter((value): value is string => Boolean(value))
+      .join("\n\n");
+  }
+
+  /**
+   * A card lives inside a single list item, so blank lines and nested Markdown
+   * would break the block apart. This keeps the meaning but makes the result
+   * storable as one contiguous block.
+   */
+  private flattenForCard(text: string): string {
+    const out: string[] = [];
+
+    for (const raw of text.replace(/\r\n/g, "\n").split("\n")) {
+      const line = raw.trim();
+      if (!line) continue;
+
+      const heading = /^#{1,6}\s+(.*)$/.exec(line);
+      if (heading) {
+        out.push(`**${heading[1].replace(/\*\*/g, "")}**`);
+        continue;
+      }
+
+      const bullet = /^[-*+]\s+(.*)$/.exec(line);
+      if (bullet) {
+        out.push(`• ${bullet[1]}`);
+        continue;
+      }
+
+      const rule = /^([-*_])\1{2,}$/.test(line);
+      if (rule) continue;
+
+      out.push(line);
+    }
+
+    return out.join("\n");
+  }
+
+  private async overwriteNode(node: BoardNode, text: string): Promise<boolean> {
+    const content = text.trim();
+    if (!content) return false;
+
+    if (node.type === "text") {
+      node.text = content;
+      await this.renderNode(node);
+    } else if (node.type === "card") {
+      const ref = { file: node.file, blockId: node.blockId, linkpath: "" };
+      const meta = await readCard(this.app, ref);
+
+      // The time prefix is what marks a block as a card; dropping it makes the
+      // card disappear from the card list even though the content is intact.
+      const ok = await writeCard(
+        this.app,
+        ref,
+        `${meta.timePrefix}${this.flattenForCard(content)}`
+      );
+      if (!ok) return false;
+      await this.renderNode(node);
+    } else if (node.type === "file") {
+      const file = this.app.vault.getAbstractFileByPath(node.file);
+      if (!(file instanceof TFile) || file.extension.toLowerCase() !== "md") return false;
+      await this.app.vault.modify(file, content);
+      await this.renderNode(node);
+    } else {
+      return false;
+    }
+
+    this.pushHistory();
+    this.scheduleSave();
+    return true;
+  }
+
+  private async insertAIText(text: string, targets: BoardNode[]): Promise<void> {
+    const box = this.selectionBox(targets);
+    const anchor = box ?? { minX: 0, minY: 0, maxX: 0, maxY: 0 };
+
+    const node: TextNode = {
+      id: createId(),
+      type: "text",
+      text,
+      x: Math.round(anchor.maxX + 40),
+      y: Math.round(anchor.minY),
+      width: 360,
+    };
+
+    this.nodes.push(node);
+    this.nodeMap.set(node.id, node);
+
+    await this.renderNode(node);
+
+    this.selection.clear();
+    this.selection.add(node.id);
+    this.paintSelection();
+    this.updateHint();
+    this.pushHistory();
+    this.scheduleSave();
   }
 
   public openNodeSearch(): void {

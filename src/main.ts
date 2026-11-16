@@ -1,5 +1,5 @@
 import { Notice, Plugin, TFile } from "obsidian";
-import { DEFAULT_SETTINGS, VolisSettings } from "./settings";
+import { DEFAULT_SETTINGS, VolisSettings, normalizeAISettings } from "./settings";
 import { NodeIndex, collectNodes } from "./canvas/nodeIndex";
 import { ActionContext, ActionRegistry } from "./canvas/actions";
 import { SyncEngine } from "./canvas/syncEngine";
@@ -140,7 +140,10 @@ export default class VolisPlugin extends Plugin {
     this.settings = {
       ...DEFAULT_SETTINGS,
       ...data,
-      ai: { ...DEFAULT_SETTINGS.ai, ...(data.ai ?? {}) },
+      ai: normalizeAISettings((data as { ai?: unknown }).ai),
+      conversations: Array.isArray((data as { conversations?: unknown }).conversations)
+        ? ((data as { conversations: never[] }).conversations)
+        : [],
     };
   }
 
@@ -416,6 +419,15 @@ export default class VolisPlugin extends Plugin {
   }
 
   private registerCommands(): void {
+    this.addCommand({
+      id: "ai-analyze",
+      name: "用 AI 分析白板",
+      callback: () => {
+        const view = this.getCanvasView();
+        if (view) view.openAIPanel();
+      },
+    });
+
     this.addCommand({
       id: "find-node",
       name: "在白板中查找节点",

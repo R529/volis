@@ -1,5 +1,7 @@
-import { App, PluginSettingTab, Setting } from "obsidian";
+import { App, PluginSettingTab, Setting, setIcon } from "obsidian";
 import type VolisPlugin from "./main";
+import { AIProfile } from "./settings";
+import { AIProfileModal } from "./ui/aiProfileModal";
 
 export class VolisSettingTab extends PluginSettingTab {
   constructor(app: App, private plugin: VolisPlugin) {
@@ -69,68 +71,130 @@ export class VolisSettingTab extends PluginSettingTab {
     containerEl.createEl("h3", { text: "AI" });
 
     const ai = this.plugin.settings.ai;
+    const save = () => this.plugin.saveSettings();
 
     new Setting(containerEl)
       .setName("启用 AI")
-      .setDesc("当前版本仅保留接口，尚未实现调用。开启后设置项才会生效。")
+      .setDesc("开启后，白板内可以选中节点让 AI 分析。内容会发送到当前使用的配置。")
       .addToggle((toggle) =>
         toggle.setValue(ai.enabled).onChange(async (value) => {
           ai.enabled = value;
-          await this.plugin.saveSettings();
+          await save();
         })
       );
 
     new Setting(containerEl)
-      .setName("接口协议")
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOption("anthropic", "Anthropic Messages")
-          .addOption("openai", "OpenAI 兼容")
-          .setValue(ai.protocol)
-          .onChange(async (value) => {
-            ai.protocol = value === "openai" ? "openai" : "anthropic";
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Base URL")
-      .setDesc("例如 https://api.example.com，不要带路径后缀。")
-      .addText((text) =>
-        text
-          .setPlaceholder("https://api.example.com")
-          .setValue(ai.baseUrl)
-          .onChange(async (value) => {
-            ai.baseUrl = value.trim();
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("模型")
-      .addText((text) =>
-        text
-          .setPlaceholder("model-name")
-          .setValue(ai.model)
-          .onChange(async (value) => {
-            ai.model = value.trim();
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("API Key")
-      .setDesc("仅保存在本机插件配置中。")
+      .setName("单次发送上限（字符）")
+      .setDesc(
+        "默认 80000，约 5 万 token。超出会按级精简：先截短每个节点，再减少节点数。" +
+          "固定使用 1M 窗口模型（DeepSeek V4、GLM-5.3、Kimi K3 等）可调到 300000；200K 窗口的模型建议保持 80000 以内。"
+      )
       .addText((text) => {
-        text.inputEl.type = "password";
+        text.inputEl.type = "number";
         text
-          .setPlaceholder("sk-...")
-          .setValue(ai.apiKey)
+          .setPlaceholder("80000")
+          .setValue(String(ai.contextLimit))
           .onChange(async (value) => {
-            ai.apiKey = value.trim();
-            await this.plugin.saveSettings();
+            const parsed = Number(value);
+            if (!Number.isFinite(parsed) || parsed < 20000 || parsed > 500000) return;
+            ai.contextLimit = Math.round(parsed);
+            ai.compactThreshold = Math.round(ai.contextLimit / 4);
+            await save();
           });
       });
+
+    const listEl = containerEl.createDiv({ cls: "volis-ai-cards" });
+
+    const renderCards = () => {
+      listEl.empty();
+
+      if (ai.profiles.length === 0) {
+        listEl.createDiv({
+          cls: "volis-ai-empty",
+          text: "还没有模型配置。点下面的「添加配置」新建一个。",
+        });
+        return;
+      }
+
+      for (const profile of ai.profiles) {
+        const active = profile.id === ai.activeId;
+        const card = listEl.createDiv({ cls: "volis-ai-card" });
+        if (active) card.addClass("is-active");
+
+        card.createDiv({
+          cls: "volis-ai-avatar",
+          text: (profile.name || "?").trim().charAt(0).toUpperCase(),
+        });
+
+        const main = card.createDiv({ cls: "volis-ai-card-main" });
+        main.createDiv({ cls: "volis-ai-card-name", text: profile.name || "未命名配置" });
+        main.createDiv({
+          cls: "volis-ai-card-url",
+          text: profile.baseUrl || "（未填写地址）",
+        });
+
+        const actions = card.createDiv({ cls: "volis-ai-card-actions" });
+
+        if (!active) {
+          const useBtn = actions.createEl("button", { cls: "volis-ai-use", text: "启用" });
+          useBtn.addEventListener("click", async () => {
+            ai.activeId = profile.id;
+            ai.enabled = true;
+            await save();
+            renderCards();
+          });
+        }
+
+        const editBtn = actions.createEl("button", {
+          cls: "volis-ai-icon",
+          attr: { "aria-label": "编辑" },
+        });
+        setIcon(editBtn, "pencil");
+        editBtn.addEventListener("click", () => {
+          new AIProfileModal(this.app, profile, async (next: AIProfile) => {
+            const index = ai.profiles.findIndex((item) => item.id === profile.id);
+            if (index === -1) return;
+
+            ai.profiles[index] = next;
+            await save();
+            renderCards();
+          }).open();
+        });
+
+        const delBtn = actions.createEl("button", {
+          cls: "volis-ai-icon is-danger",
+          attr: { "aria-label": "删除" },
+        });
+        setIcon(delBtn, "trash-2");
+        delBtn.addEventListener("click", async () => {
+          ai.profiles = ai.profiles.filter((item) => item.id !== profile.id);
+          if (ai.activeId === profile.id) {
+            ai.activeId = ai.profiles[0]?.id ?? "";
+          }
+          await save();
+          renderCards();
+        });
+      }
+    };
+
+    renderCards();
+
+    new Setting(containerEl)
+      .setName("添加配置")
+      .setDesc("在弹窗里填写名称、地址和模型，保存后会出现在上面。")
+      .addButton((button) =>
+        button
+          .setButtonText("添加配置")
+          .setCta()
+          .onClick(() => {
+            new AIProfileModal(this.app, null, async (profile: AIProfile) => {
+              ai.profiles.push(profile);
+              if (!ai.activeId) ai.activeId = profile.id;
+              await save();
+              renderCards();
+            }).open();
+          })
+      );
 
     containerEl.createEl("h3", { text: "诊断" });
 
