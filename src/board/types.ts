@@ -18,6 +18,8 @@ export interface CardNode extends BaseNode {
 export interface TextNode extends BaseNode {
   type: "text";
   text: string;
+  /** A sticky is an unfinished text node: yellow until it is finalised. */
+  sticky?: boolean;
 }
 
 export interface FileNode extends BaseNode {

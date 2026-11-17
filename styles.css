@@ -114,8 +114,8 @@
 }
 
 .volis-board {
-  --volis-bg: #f7f6f2;
-  --volis-dot: #d9d5cc;
+  --volis-bg: var(--volis-board-bg, #f7f6f2);
+  --volis-dot: var(--volis-board-dot, #d9d5cc);
   position: relative;
   width: 100%;
   height: 100%;
@@ -125,13 +125,6 @@
   background-size: 24px 24px;
   cursor: default;
   touch-action: none;
-}
-
-.theme-dark .volis-board {
-  /* Follow the theme's own dark surface so the tint matches Lomes instead of
-     sitting there as a flat neutral grey. One step away from the node surface. */
-  --volis-bg: var(--background-secondary, #232628);
-  --volis-dot: var(--background-modifier-border, #3c4046);
 }
 
 .volis-board.is-panning {
@@ -186,6 +179,8 @@
 
 .volis-bnode.is-selected {
   border-color: var(--interactive-accent);
+  /* border-box keeps the node size fixed when the border thickens. */
+  border-width: 2.5px;
   box-shadow: 0 0 0 1px var(--interactive-accent), 0 2px 10px rgba(0, 0, 0, 0.1);
 }
 
@@ -203,7 +198,7 @@
 }
 
 .volis-bnode-body::-webkit-scrollbar {
-  width: 4px;
+  width: 8px;
 }
 
 .volis-bnode-body::-webkit-scrollbar-track {
@@ -211,8 +206,14 @@
 }
 
 .volis-bnode-body::-webkit-scrollbar-thumb {
-  border-radius: 2px;
-  background: var(--background-modifier-border);
+  border: 2px solid transparent;
+  border-radius: 8px;
+  background-clip: padding-box;
+  background-color: var(--background-modifier-border-hover);
+}
+
+.volis-bnode-body::-webkit-scrollbar-thumb:hover {
+  background-color: var(--text-faint);
 }
 
 .volis-bnode-body .markdown-rendered {
@@ -656,10 +657,13 @@
    without touching any of its borders or controls. */
 .volis-board-leaf {
   --volis-board-bg: #f7f6f2;
+  --volis-board-dot: #d9d5cc;
 }
 
 .theme-dark .volis-board-leaf {
-  --volis-board-bg: #1e2023;
+  /* Same source as the canvas, otherwise the header shows a seam. */
+  --volis-board-bg: var(--background-secondary, #232628);
+  --volis-board-dot: var(--background-modifier-border, #3c4046);
 }
 
 .volis-board-leaf,
@@ -782,7 +786,7 @@
 .volis-edge {
   fill: none;
   stroke: var(--text-faint);
-  stroke-width: 1.8px;
+  stroke-width: 2.6px;
   pointer-events: none;
 }
 
@@ -792,7 +796,7 @@
 
 .volis-edge-group.is-selected .volis-edge {
   stroke: var(--interactive-accent);
-  stroke-width: 2.8px;
+  stroke-width: 3.6px;
 }
 
 .volis-edge.is-preview {
@@ -1271,7 +1275,7 @@
 
 .volis-guide {
   stroke: var(--interactive-accent);
-  stroke-width: 1.5px;
+  stroke-width: 1.8px;
   stroke-dasharray: 5 4;
   opacity: 1;
   pointer-events: none;
@@ -1653,12 +1657,6 @@
   display: none;
 }
 
-.volis-ai-esc {
-  margin-left: auto;
-  color: var(--text-faint);
-  font-size: 10.5px;
-}
-
 /* ── AI config cards ─────────────────────────────────── */
 
 .volis-ai-cards {
@@ -2001,4 +1999,499 @@
   color: var(--text-faint);
   font-size: 12px;
   text-align: center;
+}
+
+/* Dark theme: solid surfaces one step above the canvas, so the grid never
+   shows through and the toolbar reads as a raised panel rather than a hole. */
+.theme-dark .volis-board-toolbar {
+  border-color: rgba(255, 255, 255, 0.12);
+  background: #2f3634;
+  box-shadow: 0 2px 14px rgba(0, 0, 0, 0.45);
+}
+
+.theme-dark .volis-board-btn {
+  border-color: transparent;
+  background: #3d4644;
+  box-shadow: none;
+  color: var(--text-muted);
+}
+
+.theme-dark .volis-board-btn:hover {
+  background: #4a5451;
+  color: var(--text-normal);
+}
+
+.theme-dark .volis-board-btn:disabled {
+  background: #343b39;
+  color: var(--text-faint);
+}
+
+/* ── Type badge on the node border ───────────────────── */
+
+.volis-type-badge {
+  position: absolute;
+  top: -9px;
+  right: 10px;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.22);
+  /* Never steal a click: the badge is decoration, not a control. */
+  pointer-events: none;
+}
+
+.volis-type-badge svg {
+  width: 13px;
+  height: 13px;
+  stroke: #ffffff;
+  stroke-width: 2.2;
+  fill: none;
+}
+
+/* These two types clip their content to keep rounded image corners, which would
+   slice a badge sitting across the border. They keep it just inside instead. */
+.volis-bnode.is-file .volis-type-badge,
+.volis-bnode.is-doc-text .volis-type-badge {
+  top: 2px;
+  right: 4px;
+}
+
+.volis-type-badge[data-kind="card"] {
+  background: #c9a227;
+}
+
+.volis-type-badge[data-kind="note"] {
+  background: #378add;
+}
+
+.volis-type-badge[data-kind="text"] {
+  background: #8a8880;
+}
+
+.volis-type-badge[data-kind="image"] {
+  background: #1d9e75;
+}
+
+.volis-type-badge[data-kind="video"] {
+  background: #d9534f;
+}
+
+.volis-type-badge[data-kind="file"] {
+  background: #8a8880;
+}
+
+.theme-dark .volis-type-badge {
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
+}
+
+.theme-dark .volis-type-badge[data-kind="card"] {
+  background: #b8912a;
+}
+
+.theme-dark .volis-type-badge[data-kind="note"] {
+  background: #2f76bf;
+}
+
+.theme-dark .volis-type-badge[data-kind="text"] {
+  background: #6f6e68;
+}
+
+.theme-dark .volis-type-badge[data-kind="image"] {
+  background: #1a8c68;
+}
+
+.theme-dark .volis-type-badge[data-kind="video"] {
+  background: #bf4a46;
+}
+
+/* ── Sticky notes ────────────────────────────────────── */
+
+.volis-bnode.is-sticky {
+  background: #fdf3cf;
+  border-color: #e3cf8d;
+}
+
+.theme-dark .volis-bnode.is-sticky {
+  background: #4a4127;
+  border-color: #796b3d;
+}
+
+.volis-bnode.is-sticky.is-selected {
+  border-color: var(--interactive-accent);
+}
+
+.volis-type-badge[data-kind="sticky"] {
+  background: #c9a227;
+}
+
+.theme-dark .volis-type-badge[data-kind="sticky"] {
+  background: #b8912a;
+}
+
+.volis-insert-head {
+  cursor: grab;
+  user-select: none;
+}
+
+.volis-insert-panel.is-dragging .volis-insert-head {
+  cursor: grabbing;
+}
+
+.volis-ai-hint {
+  margin: 6px 0 12px;
+  padding: 8px 10px;
+  border-left: 2px solid var(--interactive-accent);
+  border-radius: 4px;
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.volis-ai-advanced {
+  margin: 8px 0 16px;
+}
+
+.volis-ai-advanced > summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+/* Settings page: clear section breaks and quieter model metadata. */
+.volis-settings h3 {
+  margin-top: 4px;
+}
+
+.volis-settings-divider {
+  height: 1px;
+  margin: 22px 0 18px;
+  border-radius: 1px;
+  background: var(--background-modifier-border);
+}
+
+.volis-ai-hint {
+  margin: 4px 0 14px;
+  padding: 7px 10px;
+}
+
+.volis-ai-card-meta {
+  overflow: hidden;
+  margin-top: 3px;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.volis-ai-card-url {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+/* ── Conversation: chat-like, no boxes around the assistant ───── */
+
+.volis-ai-panel {
+  overflow: hidden;
+}
+
+.volis-ai-stream {
+  padding: 20px 28px 116px;
+}
+
+.volis-ai-msg {
+  margin-bottom: 18px;
+}
+
+.volis-ai-msg.is-user {
+  justify-content: flex-end;
+}
+
+.volis-ai-msg.is-user .volis-ai-bubble {
+  max-width: 72%;
+  padding: 9px 13px;
+  border: none;
+  border-radius: 12px 12px 4px 12px;
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.volis-ai-msg.is-ai {
+  display: block;
+  cursor: default;
+}
+
+.volis-ai-msg.is-ai:hover {
+  cursor: default;
+}
+
+.volis-ai-reply {
+  font-size: 13.5px;
+  line-height: 1.75;
+  color: var(--text-normal);
+  overflow-wrap: anywhere;
+}
+
+.volis-ai-reply p {
+  margin: 0 0 0.7em;
+}
+
+.volis-ai-reply p:last-child {
+  margin-bottom: 0;
+}
+
+.volis-ai-reply h1,
+.volis-ai-reply h2,
+.volis-ai-reply h3 {
+  margin: 0.8em 0 0.4em;
+  font-size: 1.05em;
+  font-weight: 500;
+}
+
+.volis-ai-reply ul,
+.volis-ai-reply ol {
+  margin: 0.4em 0;
+  padding-left: 1.35em;
+}
+
+/* Selected answer: a faint tint that stays inside the text column. */
+.volis-ai-msg.is-ai.is-picked .volis-ai-reply {
+  background: var(--background-modifier-hover);
+  box-shadow: inset 0 0 0 1px var(--background-modifier-border);
+  border-radius: 6px;
+  padding: 5px 0;
+  margin: -5px 0 0;
+}
+
+.volis-ai-reply-bar {
+  display: flex;
+  gap: 10px;
+  margin-top: 8px;
+  min-height: 20px;
+}
+
+.volis-ai-reply-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 4px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+
+.volis-ai-reply-icon:hover {
+  background: var(--background-secondary);
+  color: var(--text-normal);
+}
+
+.volis-ai-reply-icon.is-done {
+  color: var(--interactive-accent);
+}
+
+.volis-ai-reply-icon svg {
+  width: 14px;
+  height: 14px;
+  stroke-width: 1.8;
+}
+
+
+.volis-ai-context {
+  margin-bottom: 8px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.volis-ai-context > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  list-style: none;
+  cursor: pointer;
+  width: fit-content;
+  padding: 2px 0;
+  color: var(--text-muted);
+}
+
+.volis-ai-context > summary::-webkit-details-marker {
+  display: none;
+}
+
+.volis-ai-context > summary::before {
+  content: "▸";
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+.volis-ai-context[open] > summary::before {
+  content: "▾";
+}
+
+.volis-ai-context-count {
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.volis-ai-context-body {
+  margin: 4px 0 2px 14px;
+  line-height: 1.7;
+}
+
+.volis-ai-context-row {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.volis-ai-context-tag {
+  min-width: 26px;
+  color: var(--text-faint);
+}
+
+.volis-ai-context-name {
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+}
+
+.volis-ai-context-size {
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.volis-ai-context-flag,
+.volis-ai-context-note {
+  color: var(--text-warning);
+}
+
+.volis-ai-pending {
+  padding: 2px 0;
+}
+
+.volis-ai-msg.is-error .volis-ai-error {
+  padding: 2px 0;
+  color: var(--text-muted);
+  font-size: 12.5px;
+}
+
+.volis-ai-error-title {
+  color: var(--text-normal);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.volis-ai-error-summary {
+  margin-top: 4px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.volis-ai-error-detail {
+  margin-top: 6px;
+  font-size: 11.5px;
+}
+
+.volis-ai-error-detail > summary {
+  list-style: none;
+  cursor: pointer;
+  width: fit-content;
+  color: var(--text-faint);
+}
+
+.volis-ai-error-detail > summary::-webkit-details-marker {
+  display: none;
+}
+
+.volis-ai-error-detail > summary::before {
+  content: "▸ ";
+}
+
+.volis-ai-error-detail[open] > summary::before {
+  content: "▾ ";
+}
+
+.volis-ai-error-detail pre {
+  margin: 6px 0 0;
+  padding: 0 0 0 12px;
+  border-left: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.volis-ai-error-hint {
+  display: block;
+  margin-top: 6px;
+  color: var(--text-muted);
+}
+
+/* Floating composer, no dividing rule. */
+.volis-ai-dock {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 10px 28px 12px;
+  background: linear-gradient(to top, var(--background-primary) 72%, transparent);
+}
+
+.volis-ai-dock .volis-ai-compose {
+  padding: 0;
+  border-top: none;
+  gap: 8px;
+}
+
+.volis-ai-dock .volis-ai-input {
+  height: 46px;
+  padding: 0 16px;
+  border: none !important;
+  border-radius: 14px;
+  background: var(--background-secondary) !important;
+  font-size: 13px;
+}
+
+.volis-ai-dock .volis-ai-input:focus {
+  border: none !important;
+  box-shadow: none !important;
+}
+
+.volis-ai-dock .volis-ai-send {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+}
+
+.volis-ai-dock .volis-ai-actions {
+  padding: 10px 2px 0;
+}
+
+/* Keep the original button look; only lift it above the floating dock. */
+.volis-ai-dock .volis-ai-btn {
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  color: var(--text-normal);
+}
+
+.volis-ai-dock .volis-ai-btn.is-primary {
+  border-color: transparent;
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
 }

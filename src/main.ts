@@ -20,6 +20,17 @@ import { makeBlockLink } from "./parse/cardRef";
 import { CardMeta } from "./types";
 import { VolisSettingTab } from "./settingsTab";
 
+/** Dashed canvas, a flowing stroke and a node dot. Colour comes from the theme
+ *  so the icon stays visible in dark mode. */
+const RIBBON_ICON = `
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18"
+  fill="none" stroke="currentColor" stroke-width="1.8"
+  stroke-linecap="round" stroke-linejoin="round">
+  <rect x="2.5" y="3.5" width="19" height="17" rx="5" stroke-dasharray="3 2.6"/>
+  <path d="M6 15.5C8.2 10.5 11 10.2 11.8 12.4C12.6 14.6 15.4 14.8 17.6 10.2"/>
+  <circle cx="18.6" cy="6.6" r="1.5" fill="currentColor" stroke="none"/>
+</svg>`;
+
 export default class VolisPlugin extends Plugin {
   settings!: VolisSettings;
 
@@ -66,9 +77,13 @@ export default class VolisPlugin extends Plugin {
 
     this.registerView(VIEW_TYPE_VOLIS_BOARD, (leaf) => new BoardView(leaf, this));
     this.registerExtensions(["volis"], VIEW_TYPE_VOLIS_BOARD);
-    this.addRibbonIcon("layout-dashboard", "新建卡片白板", () => {
+    // Drawn by hand instead of a library icon, so it cannot collide with the
+    // stock shapes every canvas-style plugin reuses.
+    const ribbon = this.addRibbonIcon("dot", "Volis", () => {
       void this.createBoard();
     });
+    ribbon.empty();
+    ribbon.innerHTML = RIBBON_ICON;
 
     this.app.workspace.onLayoutReady(() => {
       this.scheduleRefresh(300);

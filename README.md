@@ -1,69 +1,93 @@
 # Volis
 
-让画布认识"卡片"的插件。
+An Obsidian plugin that turns a canvas into a working surface for cards, notes and ideas — with AI built in.
 
-Obsidian 的画布只认文件，而卡片笔记通常是笔记里的一个块（列表项 + 行末 `^id`）。拖进画布时，它只是一段带嵌入语法的文本——能显示，但节点不知道自己是谁。
+Volis starts where Obsidian Canvas stops. Canvas nodes hold a link, but they do not know what they point to. Volis identifies block-reference cards, gives every node a type and colour, connects them with labelled edges, and lets an AI read the whole board and write its answer back into it.
 
-Volis 补的就是这层身份：**解析块引用 → 定位卡片 → 就地编辑 → 保持同步**。卡片仍然住在笔记里，不产生任何新文件。
+Everything stays local except the requests you explicitly send to your own AI provider.
 
-## 当前版本（0.1.0）
+## Features
 
-- 识别画布上的卡片节点（`![[文件#^块ID]]`）
-- 右下角角标显示卡片日期，悬停变实
-- 右键面板：编辑卡片 / 在笔记中定位 / 复制块链接 / 刷新 / 移除失效节点
-- 双击卡片节点，浮层编辑，写回源笔记
-- 笔记改动后主动刷新画布节点（原生嵌入在内容变短时会留残影，这里绕过它）
-- 所有功能同时注册为命令，菜单失效时仍可用
+**Cards that stay cards**
+- Recognise `![[file#^block-id]]` nodes, show their date badge, and edit them in place without leaving the board.
+- Editing writes back to the source note; external note changes refresh the node automatically.
+- Insert real notes, cards, media, sticky notes and text from a filtered search panel, or by dragging files in.
 
-## 不做什么
+**Board manipulation**
+- Multi-select, drag, resize, align and distribute. Smart guides appear while dragging.
+- Group nodes into labelled frames with their own background colour; moving a frame moves its members.
+- Connection tool with colour, three arrow states and edge labels.
+- Per-node colours with a custom colour picker.
+- Type badges for card / note / text / media nodes.
+- In-board search that zooms to and highlights the matching node.
+- Minimap for navigating large boards.
 
-- 不创建卡片文件
-- 不修改卡片的存储格式
-- 不写自定义字段到画布，画布保持标准 JSON Canvas
-- 不接管非卡片节点（笔记、PDF、图片、视频、网页、自由文本一律交给原生）
+**AI on the board**
+- Select nodes (or a whole group) and ask questions about them in a chat-style panel.
+- Multiple model profiles: OpenAI-compatible and Anthropic protocols, switchable at any time. Each profile carries its own context window, output cap and thinking mode.
+- Only the board snapshot and your question are sent — no telemetry, no background calls.
+- Answers can be inserted as new nodes, written over the source node, or saved as a note.
+- Conversation history per board, with the exact input snapshot of each turn kept in a collapsible block.
+- Automatic handling of output caps: continuation, token-budget accounting and cache-aware prompts.
 
-## 安装
+**Safety**
+- The board file stays valid JSON Canvas. Uninstalling leaves it readable by Obsidian.
+- No block format changes, no custom fields, no new card files.
+- API keys are stored only in the local plugin settings.
 
-把 `main.js`、`manifest.json`、`styles.css` 放进库的 `.obsidian/plugins/volis/`，在设置里启用。
+## Installation
 
-## 开发
+Copy `main.js`, `manifest.json` and `styles.css` into:
+
+```
+<vault>/.obsidian/plugins/volis/
+```
+
+Then enable **Volis** under Settings → Community plugins. A full reload (`Ctrl/Cmd + R`) is recommended after updating.
+
+Requires Obsidian 1.13.0 or newer. Desktop only.
+
+## AI setup
+
+1. Settings → Volis → AI → **Add profile**.
+2. Pick a service preset or enter an OpenAI-compatible / Anthropic Messages endpoint, model name and API key.
+3. The context window and output cap are inferred from the model name. Use **Probe** to read the real values where the provider allows it, or set them manually.
+4. Select nodes on the board and press the Volis ribbon icon (or run **Volis: Open AI panel**).
+
+For large boards, a model with a 200K+ context window is recommended. The AI panel shows the exact token accounting for every turn.
+
+## Development
 
 ```
 npm install
-npm run build     # 类型检查 + 打包
-npm run dev       # 监听模式
+npm run build     # type-check + production bundle
+npm run dev       # watch mode
 ```
 
-构建产物为根目录下的 `main.js`。
-
-## 目录
+The build writes `main.js` at the repository root. Source lives in `src/`:
 
 ```
 src/
-  main.ts                 插件入口、命令、事件
-  settings.ts             设置模型与默认值
-  settingsTab.ts          设置界面
-  types.ts                共享类型
-  parse/
-    cardRef.ts            块引用解析
-    blockLocator.ts       块定位与重建
-  store/
-    cardStore.ts          卡片读取/写入（不依赖其他插件）
-  canvas/
-    nodeIndex.ts          节点 → 卡片 映射缓存
-    badge.ts              角标渲染
-    syncEngine.ts         文件变更后的画布刷新
-    actions.ts            动作注册表
-    contextMenu.ts        右键面板注入
-  ui/
-    cardEditor.ts         浮层编辑器
-  ai/
-    provider.ts           AI 接口（当前仅占位）
+  main.ts              entry point, ribbon icon, commands, events
+  settings.ts          settings model and migration
+  settingsTab.ts       settings UI
+  types.ts             shared types
+  parse/               block-reference parsing and location
+  store/               card reads and writes
+  canvas/              node index, badges, sync, actions, context menu
+  board/               board view, storage, insert search, card writer
+  ai/                  provider protocols, capability presets, token budgeting
+  ui/                  modals and inline editors
 ```
 
-## 设计约束
+## Design constraints
 
-1. 卡片不变成文件。
-2. 画布保持标准格式，卸载插件后仍可正常打开。
-3. 身份只从链接解析，不额外存储。
-4. 依赖 Canvas 内部 API 的部分全部包在 try/catch 里，失败只会降级，不会崩。
+1. A card never becomes a file.
+2. Canvas files remain standard JSON Canvas and survive uninstall.
+3. A node's identity comes only from its link — nothing extra is stored.
+4. Code touching Canvas internals is guarded so a failure degrades instead of crashing.
+5. No network calls without an explicit user action.
+
+## License
+
+GPL-3.0. See [LICENSE](LICENSE).

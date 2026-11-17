@@ -7,9 +7,33 @@ import { MediaModal } from "../ui/mediaModal";
 import { RenameModal } from "../ui/renameModal";
 import { ConfirmModal } from "../ui/confirmModal";
 import { appendCard, createNoteFromText, resolveCardFolder } from "./cardWriter";
-import { AIProvider, AIMessage, createProvider } from "../ai/provider";
-import { activeProfile, StoredConversation } from "../settings";
-import { InsertItem, searchInsertItems } from "./insertSearch";
+import {
+  AIProvider,
+  AIMessage,
+  AIResult,
+  AISystemBlock,
+  balanceTail,
+  createProvider,
+  isThinkingBudgetError,
+  mergeContinuation,
+} from "../ai/provider";
+import {
+  activeProfile,
+  AISendSnapshot,
+  AIProfile,
+  AIThinkingMode,
+  StoredConversation,
+} from "../settings";
+import {
+  buildBoardContext,
+  ContextEdgeInput,
+  ContextGroupInput,
+  ContextNodeInput,
+  estimateTokens,
+  SendManifest,
+} from "../ai/context";
+import { formatTokens } from "../ai/capability";
+import { InsertFilter, InsertItem, searchInsertItems } from "./insertSearch";
 import {
   BoardData,
   BoardEdge,
@@ -31,6 +55,26 @@ const MIN_SCALE = 0.05;
 const MAX_SCALE = 3;
 const IMAGE_EXT = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"];
 const VIDEO_EXT = ["mp4", "webm", "mov", "mkv"];
+
+/** Continues a capped answer; the round limit lives in settings. */
+const CONTINUE_PROMPT =
+  "你上一条回答因为长度上限被截断了。请从断掉的地方直接往下接着写，" +
+  "不要重复已经写过的内容，不要开场白，不要解释，只输出续写的部分。";
+
+/** The stable half of the prompt. Kept separate so it can be cached. */
+const AI_ROLE_PROMPT =
+  "你是白板整理助手。用户给你白板上的节点内容和它们之间的关系，请用简洁的中文回答，" +
+  "不要复述原文，直接给判断和建议。必要时用列表。" +
+  "如果上下文里说明某些节点没有发送或被截断，不要假装读过它们。";
+
+/** Human label for content the model cannot read at all. */
+function mediaLabel(ext: string): string {
+  if (IMAGE_EXT.includes(ext)) return "图片";
+  if (VIDEO_EXT.includes(ext)) return "视频";
+  if (ext === "pdf") return "PDF";
+  if (["mp3", "wav", "m4a", "ogg", "flac", "aac"].includes(ext)) return "音频";
+  return "文件";
+}
 
 const NODE_COLORS = [
   { name: "red", label: "红", line: "#d9534f", bg: "#f8dedd" },
@@ -122,18 +166,29 @@ export class BoardView extends TextFileView {
   private selectedEdgeId: string | null = null;
   private nodeText = new Map<string, string>();
   private nodeMeta = new Map<string, { date?: string; time?: string; tags: string[] }>();
+  /** Cached note bodies, keyed by path and validated by mtime. */
+  private noteTextCache = new Map<string, { mtime: number; text: string }>();
   private aiPanel: HTMLElement | null = null;
   private aiOutside: ((evt: MouseEvent) => void) | null = null;
   private aiProvider: AIProvider | null = null;
   private aiTargets: BoardNode[] = [];
   private aiHistory: AIMessage[] = [];
-  private aiContextSent = false;
+  /** Stable prefix: role + board snapshot. Rebuilt only when the board changes. */
+  private aiSystem: AISystemBlock[] = [];
+  private aiSystemKey = "";
+  /** What the last request actually contained, shown in the panel. */
+  private aiManifest: SendManifest | null = null;
+  /** One snapshot per answer, aligned with `aiAnswers`. */
+  private aiSnapshots: Array<AISendSnapshot | null> = [];
+  /** Guards the lazy note-loading pass so it cannot loop. */
+  private aiNotesLoading = false;
   private aiAnswers: string[] = [];
   private aiPicked = new Set<number>();
   private aiExpanded = false;
   private aiBusy = false;
   private aiCancelled = false;
-  private aiPending: { row: HTMLElement; stop: () => void } | null = null;
+  private aiPending: { row: HTMLElement; stop: () => void; say: (text: string) => void } | null =
+    null;
   private aiConversationId: string | null = null;
   private aiRestore: ((conv: StoredConversation) => void) | null = null;
   private historyPop: HTMLElement | null = null;
@@ -347,6 +402,18 @@ export class BoardView extends TextFileView {
 
     this.moreBtn = addButton("more-vertical", "更多", (evt) => this.showBoardMenu(evt));
     toolbar.createDiv({ cls: "volis-board-sep" });
+
+    // Create group: these two make a node directly, no picker.
+    addButton("sticky-note", "新建便签", () => this.createStickyAtCenter());
+    addButton("type", "新建文本", () => this.createTextAtCenter());
+    toolbar.createDiv({ cls: "volis-board-sep" });
+
+    // Insert group: each opens the picker filtered to one kind.
+    addButton("file-text", "添加 md 笔记", () => this.openInsertPanelAtCenter("note"));
+    addButton("list", "添加卡片笔记", () => this.openInsertPanelAtCenter("card"));
+    addButton("image", "添加媒体文件", () => this.openInsertPanelAtCenter("media"));
+    toolbar.createDiv({ cls: "volis-board-sep" });
+
     addButton("plus", "放大", () => this.zoomBy(1.2));
     addButton("minus", "缩小", () => this.zoomBy(1 / 1.2));
     addButton("maximize", "总览", () => {
@@ -1901,6 +1968,36 @@ export class BoardView extends TextFileView {
 
   }
 
+  /** Small icon sitting on the top border, so the node type stays readable
+   *  even when the content is scaled down to an illegible blur. */
+  private attachTypeBadge(el: HTMLElement, node: BoardNode): void {
+    const ext = node.type === "file" ? (node.file.split(".").pop() ?? "").toLowerCase() : "";
+
+    let kind = "file";
+    let icon = "file";
+
+    if (node.type === "card") {
+      kind = "card";
+      icon = "quote";
+    } else if (node.type === "text") {
+      kind = node.sticky ? "sticky" : "text";
+      icon = node.sticky ? "sticky-note" : "type";
+    } else if (ext === "md") {
+      kind = "note";
+      icon = "file-text";
+    } else if (IMAGE_EXT.includes(ext)) {
+      kind = "image";
+      icon = "image";
+    } else if (VIDEO_EXT.includes(ext)) {
+      kind = "video";
+      icon = "video";
+    }
+
+    const badge = el.createDiv({ cls: "volis-type-badge" });
+    badge.dataset.kind = kind;
+    setIcon(badge, icon);
+  }
+
   private renderGroupBody(el: HTMLElement, node: GroupNode): void {
     el.addClass("is-group");
     this.nodeText.set(node.id, node.label ?? "");
@@ -1966,6 +2063,30 @@ export class BoardView extends TextFileView {
     });
   }
 
+  /**
+   * A group only stores a rectangle, so a selected group must be paired with
+   * the nodes it holds. Without this the AI would be handed a bare frame and
+   * answer "this group is empty" while four cards sit inside it.
+   */
+  private expandGroups(nodes: BoardNode[]): BoardNode[] {
+    const out: BoardNode[] = [];
+    const seen = new Set<string>();
+
+    const push = (node: BoardNode): void => {
+      if (seen.has(node.id)) return;
+      seen.add(node.id);
+      out.push(node);
+    };
+
+    for (const node of nodes) {
+      push(node);
+      if (node.type !== "group") continue;
+      for (const member of this.groupMembers(node)) push(member);
+    }
+
+    return out;
+  }
+
   private async createGroupFromSelection(): Promise<void> {
     const nodes = this.selectedNodes().filter((node) => node.type !== "group");
     if (nodes.length === 0) return;
@@ -2009,6 +2130,7 @@ export class BoardView extends TextFileView {
     if (node.height) el.style.height = `${node.height}px`;
     el.style.transform = `translate3d(${node.x}px, ${node.y}px, 0)`;
 
+    el.toggleClass("is-sticky", node.type === "text" && Boolean(node.sticky));
     this.paintColor(el, node.color);
 
     for (const dir of ["n", "s", "e", "w", "ne", "nw", "se", "sw"] as const) {
@@ -2021,6 +2143,8 @@ export class BoardView extends TextFileView {
         const port = el.createDiv({ cls: `volis-port is-${side}` });
         port.dataset.port = side;
       }
+
+      this.attachTypeBadge(el, node);
     }
 
     if (node.type === "group") {
@@ -2081,10 +2205,37 @@ export class BoardView extends TextFileView {
     }
   }
 
+  /**
+   * Reads a note for the AI context. Capped so a 300-page note cannot blow up
+   * memory; the budget builder trims it further. Frontmatter is dropped since
+   * it is metadata, not content.
+   */
+  private async readNoteText(file: TFile): Promise<string> {
+    const cached = this.noteTextCache.get(file.path);
+    if (cached && cached.mtime === file.stat.mtime) return cached.text;
+
+    let body = "";
+    try {
+      body = await this.app.vault.cachedRead(file);
+    } catch (error) {
+      return file.basename;
+    }
+
+    const stripped = body.replace(/^---\n[\s\S]*?\n---\n/, "").trim();
+    const text = stripped.length > 100000 ? `${stripped.slice(0, 100000)}\n…（超长，已截断）` : stripped;
+    this.noteTextCache.set(file.path, { mtime: file.stat.mtime, text });
+    return text;
+  }
+
   private async renderFileBody(el: HTMLElement, node: { id: string; file: string }): Promise<void> {
     el.addClass("is-file");
     const file = this.app.vault.getAbstractFileByPath(node.file);
-    if (file instanceof TFile) this.nodeText.set(node.id, file.basename);
+    if (file instanceof TFile) {
+      // A note's body is what the AI needs. Without this the model only ever
+      // saw "文件名.md" and silently answered from nothing.
+      const isNote = file.extension.toLowerCase() === "md";
+      this.nodeText.set(node.id, isNote ? await this.readNoteText(file) : file.basename);
+    }
 
     if (!(file instanceof TFile)) {
       this.staleIds.add(node.id);
@@ -2448,6 +2599,25 @@ export class BoardView extends TextFileView {
     this.root.removeClass("is-space");
   };
 
+  /**
+   * Hit test for the native scrollbar. Everything here is in screen pixels:
+   * getBoundingClientRect() already includes the board's zoom transform, so it
+   * must NOT be compared with clientWidth/offsetWidth (unscaled CSS pixels).
+   */
+  private isOnScrollbar(body: HTMLElement, clientX: number): boolean {
+    const cssWidth = body.offsetWidth;
+    const barCss = cssWidth - body.clientWidth;
+    if (barCss <= 0) return false;
+
+    const rect = body.getBoundingClientRect();
+    if (rect.width <= 0 || cssWidth <= 0) return false;
+
+    const scale = rect.width / cssWidth;
+    const barScreen = barCss * scale;
+
+    return clientX - rect.left >= rect.width - barScreen;
+  }
+
   private onWheel = (evt: WheelEvent): void => {
     // While editing, the wheel belongs to the textarea's own scrollbar, not to
     // the board zoom.
@@ -2455,6 +2625,14 @@ export class BoardView extends TextFileView {
     if (target?.closest(".volis-inline")) return;
     if (target?.closest(".volis-insert-panel")) return;
     if (target?.closest(".volis-ai-panel")) return;
+    // Only a SELECTED node claims the wheel for its own content. Hovering an
+    // unselected node must still zoom the board.
+    const hoveredBody = target?.closest(".volis-bnode-body") as HTMLElement | null;
+    if (hoveredBody) {
+      const nodeEl = hoveredBody.closest(".volis-bnode") as HTMLElement | null;
+      const nodeId = nodeEl?.dataset?.nodeId;
+      if (nodeId && this.selection.has(nodeId)) return;
+    }
 
     evt.preventDefault();
 
@@ -2504,6 +2682,12 @@ export class BoardView extends TextFileView {
     }
 
     if (target.closest(".volis-bnode.is-playing")) return;
+
+    // A press on the native scrollbar belongs to the browser. If we start a
+    // node drag here, pointer capture steals the events and the thumb cannot
+    // be dragged at all.
+    const bodyEl = target.closest(".volis-bnode-body") as HTMLElement | null;
+    if (bodyEl && this.isOnScrollbar(bodyEl, evt.clientX)) return;
 
     if (evt.button === 1 || (evt.button === 0 && this.spaceDown)) {
       evt.preventDefault();
@@ -2631,87 +2815,152 @@ export class BoardView extends TextFileView {
   }
 
   /**
-   * Turns the selected nodes into a compact structured description. Positions,
-   * groups and colours are included because they carry meaning the model cannot
-   * infer from the text alone.
+   * Maps board nodes to the plain data the budget builder understands. Node
+   * types live here, token math lives in ai/context.ts — adding a node type
+   * only touches this function.
    */
-  private describeNodes(nodes: BoardNode[], perNodeLimit: number): string {
-    const index = new Map<string, string>();
-    nodes.forEach((node, i) => index.set(node.id, `N${i + 1}`));
-
-    const blocks: string[] = [];
+  private contextInput(nodes: BoardNode[]): {
+    nodes: ContextNodeInput[];
+    groups: ContextGroupInput[];
+    edges: ContextEdgeInput[];
+  } {
+    const present = new Set(nodes.map((node) => node.id));
+    const inputs: ContextNodeInput[] = [];
+    const groups: ContextGroupInput[] = [];
 
     for (const node of nodes) {
-      const tag = index.get(node.id);
-      if (!tag) continue;
-
       if (node.type === "group") {
-        const members = this.groupMembers(node)
-          .map((member) => index.get(member.id))
-          .filter((id): id is string => Boolean(id));
-        blocks.push(
-          `【${tag}】分组「${node.label ?? "未命名"}」${members.length ? `包含 ${members.join("、")}` : "（空）"}`
-        );
+        const members = this.groupMembers(node).filter((member) => present.has(member.id));
+        groups.push({
+          id: node.id,
+          label: node.label ?? "未命名",
+          memberIds: members.map((member) => member.id),
+        });
         continue;
       }
 
-      const kind = node.type === "card" ? "卡片" : node.type === "file" ? "笔记" : "文本节点";
-      const full = (this.nodeText.get(node.id) ?? "").replace(/\s+/g, " ").trim();
-      const text =
-        full.length > perNodeLimit ? `${full.slice(0, perNodeLimit)}…（后略）` : full;
-
       const meta = this.nodeMeta.get(node.id);
-      const bits: string[] = [kind];
-      if (meta?.date) bits.push(meta.date + (meta.time ? ` ${meta.time}` : ""));
-      if (meta?.tags.length) bits.push(meta.tags.map((tagText) => `#${tagText}`).join(" "));
-      if (node.color) bits.push(`颜色:${node.color}`);
+      const text = this.nodeText.get(node.id) ?? "";
 
-      blocks.push(`【${tag}】${bits.join(" · ")}\n${text || "（空）"}`);
+      if (node.type === "file") {
+        const ext = node.file.split(".").pop()?.toLowerCase() ?? "";
+        const isNote = ext === "md" || ext === "markdown";
+        const name = node.file.split("/").pop() ?? node.file;
+        inputs.push({
+          id: node.id,
+          kind: isNote ? "note" : "file",
+          label: name.replace(/\.md$/i, ""),
+          text: isNote ? text : "",
+          readable: isNote,
+          mediaKind: isNote ? undefined : mediaLabel(ext),
+          path: node.file,
+        });
+        continue;
+      }
+
+      const kind = node.type === "card" ? "card" : "text";
+      const firstLine = text.split("\n").find((line) => line.trim()) ?? "";
+      inputs.push({
+        id: node.id,
+        kind,
+        label: firstLine.trim().slice(0, 24) || (kind === "card" ? "卡片" : "文本"),
+        text,
+        readable: true,
+        meta: meta ? { date: meta.date, time: meta.time, tags: meta.tags } : undefined,
+        color: "color" in node ? node.color : undefined,
+      });
     }
 
-    const relations = this.edges
-      .filter((edge) => index.has(edge.from) && index.has(edge.to))
-      .map((edge) => {
-        const label = edge.label ? `（${edge.label}）` : "";
-        return `${index.get(edge.from)} → ${index.get(edge.to)}${label}`;
-      });
+    const edges = this.edges
+      .filter((edge) => present.has(edge.from) && present.has(edge.to))
+      .map((edge) => ({ from: edge.from, to: edge.to, label: edge.label }));
 
-    if (relations.length > 0) blocks.push(`【关系】\n${relations.join("\n")}`);
+    return { nodes: inputs, groups, edges };
+  }
 
-    return blocks.join("\n\n");
+  /** Tokens available for board content: window minus answer minus safety. */
+  private inputBudget(profile: AIProfile | null): number {
+    const policy = this.plugin.settings.ai.policy;
+    const window = profile?.capability?.contextWindow ?? 128000;
+    const output = profile?.capability?.maxOutput ?? 8192;
+    return Math.max(2000, window - output - policy.safetyTokens);
   }
 
   /**
-   * Builds the board description within a character budget. Falls back in two
-   * steps so a large board degrades gracefully instead of failing the request.
+   * Rebuilds the cached board prefix. Only re-runs when the selection or the
+   * node text actually changed, so the cache marker keeps hitting between
+   * turns. `force` is used after an edit or when the model profile changes.
    */
-  private buildBoardContext(
-    nodes: BoardNode[],
-    limit: number
-  ): { text: string; note: string } {
-    const full = this.describeNodes(nodes, Number.POSITIVE_INFINITY);
-    if (full.length <= limit) return { text: full, note: "" };
+  private ensureSystem(profile: AIProfile | null, force = false): void {
+    const key = this.aiTargets
+      .map((node) => {
+        const text = this.nodeText.get(node.id) ?? "";
+        return `${node.id}:${node.type}:${text.length}:${"label" in node ? node.label : ""}`;
+      })
+      .join("|");
 
-    const trimmed = this.describeNodes(nodes, 400);
-    if (trimmed.length <= limit) {
-      return { text: trimmed, note: "内容较长，每个节点已精简为前 400 字" };
+    if (!force && key === this.aiSystemKey && this.aiSystem.length > 0) return;
+
+    const policy = this.plugin.settings.ai.policy;
+    const result = buildBoardContext(
+      this.contextInput(this.aiTargets),
+      this.inputBudget(profile),
+      policy
+    );
+
+    this.aiManifest = result.manifest;
+    this.aiSystemKey = key;
+    this.aiSystem = [
+      { text: AI_ROLE_PROMPT },
+      { text: `【白板内容】\n${result.text}`, cache: true },
+    ];
+
+    // A note may not have been rendered yet when the panel opened. Load it once
+    // and rebuild, so the user never sees "笔记内容为空" for a real note.
+    const missing = this.aiTargets.filter(
+      (node) =>
+        node.type === "file" &&
+        node.file.toLowerCase().endsWith(".md") &&
+        !(this.nodeText.get(node.id) ?? "").trim()
+    );
+
+    if (missing.length > 0 && !this.aiNotesLoading) {
+      this.aiNotesLoading = true;
+      void Promise.all(
+        missing.map(async (node) => {
+          if (node.type !== "file") return;
+          const file = this.app.vault.getAbstractFileByPath(node.file);
+          if (!(file instanceof TFile)) return;
+          this.nodeText.set(node.id, await this.readNoteText(file));
+        })
+      ).then(() => {
+        this.aiNotesLoading = false;
+        this.ensureSystem(profile, true);
+      });
     }
-
-    const half = Math.max(1, Math.floor(nodes.length / 2));
-    const partial = this.describeNodes(nodes.slice(0, half), 300);
-    return {
-      text: partial,
-      note: `节点较多，本次只发送了前 ${half} 个（共 ${nodes.length} 个）`,
-    };
   }
 
-  private historyChars(): number {
-    return this.aiHistory.reduce((sum, message) => sum + message.content.length, 0);
+  private historyTokens(): number {
+    return this.aiHistory.reduce((sum, message) => sum + estimateTokens(message.content), 0);
   }
 
-  /** Collapses early turns into one summary, keeping the last two exchanges raw. */
-  private async compactHistory(provider: AIProvider, threshold: number): Promise<void> {
-    if (this.aiHistory.length <= 4 || this.historyChars() <= threshold) return;
+  /** Profile setting wins; otherwise the global default; otherwise vendor. */
+  private resolveThinking(profile: AIProfile | null): AIThinkingMode {
+    const mode = profile?.thinking ?? this.plugin.settings.ai.thinking;
+    return mode === "on" || mode === "off" ? mode : "auto";
+  }
+
+  /**
+   * Collapses early turns into one summary, keeping the last two exchanges raw.
+   * Only history is compressed — the board prefix lives in `aiSystem` and is
+   * never summarised, so the material stays intact however long the chat runs.
+   */
+  private async compactHistory(profile: AIProfile | null): Promise<void> {
+    const budget = this.inputBudget(profile);
+    // History should not crowd out the material it is asking about.
+    const threshold = Math.max(2000, Math.floor(budget * 0.35));
+
+    if (this.aiHistory.length <= 4 || this.historyTokens() <= threshold) return;
 
     const recent = this.aiHistory.slice(-4);
     const older = this.aiHistory.slice(0, -4);
@@ -2722,16 +2971,23 @@ export class BoardView extends TextFileView {
 
     let summary = "";
     try {
-      summary = await provider.complete(
+      const result = await this.aiProvider?.complete(
         [
           {
             role: "user",
             content: `请把下面这段对话压缩成要点，保留结论、判断、用户意图和未解决的问题，去掉过程描述与重复内容：\n\n${transcript}`,
           },
         ],
-        { system: "你是对话摘要助手。只输出摘要正文，不要寒暄，不要标题。", maxTokens: 600 }
+        {
+          system: "你是对话摘要助手。只输出摘要正文，不要寒暄，不要标题。",
+          maxTokens: 800,
+          thinking: "off",
+          cache: false,
+        }
       );
+      summary = result?.text ?? "";
     } catch (error) {
+      // A failed summary must never block the question itself.
       return;
     }
 
@@ -2745,7 +3001,7 @@ export class BoardView extends TextFileView {
         ? [{ role: "user", content: `${block}\n\n${head.content}` }, ...recent.slice(1)]
         : [{ role: "user", content: block }, ...recent];
 
-    new Notice("对话较长，早期的往来已压缩为摘要");
+    new Notice("对话较长，早期的往来已压缩为摘要（白板内容不受影响）");
   }
 
   public openAIPanel(): void {
@@ -2760,22 +3016,41 @@ export class BoardView extends TextFileView {
     }
 
     const selected = this.selectedNodes();
+    // A group is only a rectangle: expand it to the nodes it holds, otherwise
+    // the model sees an "empty" frame while the cards sit right there.
+    const expanded = selected.length > 0 ? this.expandGroups(selected) : [];
+    const contentNodes = expanded.filter((node) => node.type !== "group");
+
+    if (selected.length > 0 && contentNodes.length === 0) {
+      new Notice("选中的分组里还没有内容，先把卡片放进去再分析");
+      return;
+    }
+
     // The context builder trims to budget, so the raw cap can be generous.
-    const targets = selected.length > 0 ? selected : this.nodes.slice(0, 200);
+    const targets = expanded.length > 0 ? expanded : this.nodes.slice(0, 200);
     if (targets.length === 0) {
       new Notice("白板上还没有节点");
       return;
     }
+    // Groups are frames, not content: count only the nodes holding text.
+    const targetCount =
+      targets.filter((node) => node.type !== "group").length || targets.length;
 
     this.aiProvider = provider;
     this.aiTargets = targets;
     this.aiHistory = [];
-    this.aiContextSent = false;
+    this.aiSystem = [];
+    this.aiSystemKey = "";
+    this.aiManifest = null;
     this.aiAnswers = [];
+    this.aiSnapshots = [];
     this.aiPicked = new Set<number>();
     this.aiBusy = false;
     this.aiConversationId = null;
     this.aiExpanded = false;
+
+    // Build the board snapshot once per opening; each answer carries its copy.
+    this.ensureSystem(profile, true);
 
     const rect = this.root.getBoundingClientRect();
     const box = this.selectionBox(targets);
@@ -2790,7 +3065,7 @@ export class BoardView extends TextFileView {
     setIcon(headIcon, "sparkles");
     head.createDiv({
       cls: "volis-ai-head-title",
-      text: `${selected.length > 0 ? "分析选中的" : "分析全部"} ${targets.length} 个节点`,
+      text: `${selected.length > 0 ? "分析选中的" : "分析全部"} ${targetCount} 个节点`,
     });
     head.createDiv({ cls: "volis-ai-head-model", text: profile?.name ?? "" });
     head.createDiv({ cls: "volis-ai-head-spacer" });
@@ -2821,7 +3096,9 @@ export class BoardView extends TextFileView {
 
     const stream = panel.createDiv({ cls: "volis-ai-stream" });
 
-    const compose = panel.createDiv({ cls: "volis-ai-compose" });
+    // The input dock floats over the stream instead of splitting it with a rule.
+    const dock = panel.createDiv({ cls: "volis-ai-dock" });
+    const compose = dock.createDiv({ cls: "volis-ai-compose" });
     const input = compose.createEl("input", {
       cls: "volis-ai-input",
       attr: { type: "text", placeholder: "问点什么，或继续追问…" },
@@ -2832,14 +3109,13 @@ export class BoardView extends TextFileView {
     });
     setIcon(sendBtn, "arrow-up");
 
-    const actions = panel.createDiv({ cls: "volis-ai-actions" });
+    const actions = dock.createDiv({ cls: "volis-ai-actions" });
     const insertBtn = actions.createEl("button", {
       cls: "volis-ai-btn is-primary",
       text: "插入为新节点",
     });
     const overwriteBtn = actions.createEl("button", { cls: "volis-ai-btn", text: "覆盖原节点" });
     const noteBtn = actions.createEl("button", { cls: "volis-ai-btn", text: "存为笔记" });
-    actions.createDiv({ cls: "volis-ai-esc", text: "Esc 退出" });
 
     insertBtn.disabled = true;
     noteBtn.disabled = true;
@@ -2963,27 +3239,105 @@ export class BoardView extends TextFileView {
       refreshPicks();
     };
 
-    const addAiBubble = async (text: string): Promise<HTMLElement> => {
+    const clearPickOutside = (evt: MouseEvent) => {
+      const target = evt.target as HTMLElement;
+      // Clicks on an answer row are handled by that row (toggle).
+      if (target.closest(".volis-ai-msg.is-ai")) return;
+      // The action bar and input need the current selection to stay intact.
+      if (target.closest(".volis-ai-actions, .volis-ai-compose")) return;
+      if (this.aiPicked.size === 0) return;
+      this.aiPicked.clear();
+      refreshPicks();
+    };
+
+    this.aiOutside = clearPickOutside;
+    document.addEventListener("mousedown", this.aiOutside, true);
+
+    /** The collapsed "read context" block shared by pending and final rows. */
+    const appendContext = (
+      host: HTMLElement,
+      snapshot: AISendSnapshot | null
+    ): HTMLElement | null => {
+      if (!snapshot) return null;
+
+      const details = host.createEl("details", { cls: "volis-ai-context" });
+      const summary = details.createEl("summary");
+      const label = summary.createSpan({ cls: "volis-ai-context-label", text: "已读取上下文" });
+      summary.createSpan({
+        cls: "volis-ai-context-count",
+        text: `${snapshot.nodes.length} 个节点 · ${formatTokens(snapshot.usedTokens)} token`,
+      });
+
+      const body = details.createDiv({ cls: "volis-ai-context-body" });
+      for (const node of snapshot.nodes) {
+        const line = body.createDiv({ cls: "volis-ai-context-row" });
+        line.createSpan({ cls: "volis-ai-context-tag", text: node.tag });
+        line.createSpan({ cls: "volis-ai-context-name", text: node.label });
+        line.createSpan({
+          cls: "volis-ai-context-size",
+          text: node.readable ? `${node.charsSent}/${node.charsTotal} 字` : "仅文件名",
+        });
+        if (node.note) line.createSpan({ cls: "volis-ai-context-flag", text: node.note });
+      }
+      for (const note of snapshot.notes) {
+        body.createDiv({ cls: "volis-ai-context-note", text: note });
+      }
+      return label;
+    };
+
+    /** Copy button: icon brightens on hover, turns into a check when done. */
+    const appendCopy = (host: HTMLElement, text: string): void => {
+      const button = host.createEl("button", { cls: "volis-ai-reply-icon" });
+      setIcon(button, "copy");
+      button.addEventListener("click", (evt) => {
+        evt.stopPropagation();
+        void navigator.clipboard.writeText(text).then(
+          () => {
+            setIcon(button, "check");
+            button.addClass("is-done");
+            window.setTimeout(() => {
+              setIcon(button, "copy");
+              button.removeClass("is-done");
+            }, 1200);
+          },
+          () => new Notice("复制失败，请检查剪贴板权限")
+        );
+      });
+    };
+
+    const addAiBubble = async (
+      text: string,
+      snapshot: AISendSnapshot | null = null,
+      selectable = true
+    ): Promise<HTMLElement> => {
       const index = this.aiAnswers.length;
       this.aiAnswers.push(text);
+      this.aiSnapshots.push(snapshot);
 
       const row = stream.createDiv({ cls: "volis-ai-msg is-ai" });
       row.dataset.answerIndex = String(index);
 
-      const bubble = row.createDiv({ cls: "volis-ai-bubble is-md" });
-      row.addEventListener("click", (evt) => {
-        // Let text selection inside an answer work without toggling it.
-        if (!window.getSelection()?.isCollapsed) return;
-        evt.preventDefault();
-        togglePick(index);
-      });
+      appendContext(row, snapshot);
 
-      await MarkdownRenderer.render(this.app, this.decorateAnswer(text), bubble, "", this);
+      const body = row.createDiv({ cls: "volis-ai-reply" });
+      await MarkdownRenderer.render(this.app, this.decorateAnswer(text), body, "", this);
 
-      if (this.aiPicked.size === 0) this.aiPicked.add(index);
+      const bar = row.createDiv({ cls: "volis-ai-reply-bar" });
+      appendCopy(bar, text);
+
+      if (selectable) {
+        row.addEventListener("click", (evt) => {
+          if (!window.getSelection()?.isCollapsed) return;
+          if ((evt.target as HTMLElement).closest("details, button")) return;
+          evt.preventDefault();
+          togglePick(index);
+        });
+        if (this.aiPicked.size === 0) this.aiPicked.add(index);
+      }
+
       refreshPicks();
       scrollDown();
-      return bubble;
+      return body;
     };
 
     /** All picked answers, joined in dialogue order. */
@@ -3002,10 +3356,20 @@ export class BoardView extends TextFileView {
       "组织语言中…",
     ];
 
-    const addPending = (): { row: HTMLElement; stop: () => void } => {
+    const addPending = (snapshot: AISendSnapshot | null): {
+      row: HTMLElement;
+      stop: () => void;
+      say: (text: string) => void;
+    } => {
       const row = stream.createDiv({ cls: "volis-ai-msg is-status" });
-      const bubble = row.createDiv({ cls: "volis-ai-bubble is-pending" });
-      const label = bubble.createSpan({ cls: "volis-ai-thinking", text: thinkingLines[0] });
+      const contextLabel = appendContext(row, snapshot);
+
+      // The rotating status replaces "已读取上下文"; node/token counts stay put.
+      const label = contextLabel ?? row.createSpan({
+        cls: "volis-ai-thinking",
+        text: thinkingLines[0],
+      });
+      label.setText(thinkingLines[0]);
 
       let step = 0;
       const timer = window.setInterval(() => {
@@ -3013,13 +3377,44 @@ export class BoardView extends TextFileView {
         label.setText(thinkingLines[step]);
       }, 1500);
 
+      const stop = () => window.clearInterval(timer);
+
+      // Long answers are continued in segments; tell the user instead of
+      // letting the spinner look stuck.
+      const say = (text: string) => {
+        stop();
+        label.setText(text);
+        scrollDown();
+      };
+
       scrollDown();
-      return { row, stop: () => window.clearInterval(timer) };
+      return { row, stop, say };
     };
 
-    const addError = (text: string) => {
-      const row = stream.createDiv({ cls: "volis-ai-msg is-status" });
-      row.createDiv({ cls: "volis-ai-bubble is-error", text });
+    /** Failures stay in the stream as a quiet, expandable message. */
+    const addError = (text: string, retry: () => void): void => {
+      const row = stream.createDiv({ cls: "volis-ai-msg is-error" });
+
+      const body = row.createDiv({ cls: "volis-ai-error" });
+      body.createDiv({ cls: "volis-ai-error-title", text: "请求未成功" });
+      body.createDiv({ cls: "volis-ai-error-summary", text });
+
+      const details = body.createEl("details", { cls: "volis-ai-error-detail" });
+      details.createEl("summary", { text: "查看原因" });
+      const pre = details.createEl("pre", { text });
+      pre.createEl("span", {
+        cls: "volis-ai-error-hint",
+        text: "可检查该模型的输出上限、思考模式或接口地址后重试。",
+      });
+
+      const bar = body.createDiv({ cls: "volis-ai-reply-bar" });
+      const retryBtn = bar.createEl("button", { cls: "volis-ai-reply-icon" });
+      setIcon(retryBtn, "rotate-ccw");
+      retryBtn.addEventListener("click", (evt) => {
+        evt.stopPropagation();
+        retry();
+      });
+
       scrollDown();
     };
 
@@ -3050,30 +3445,108 @@ export class BoardView extends TextFileView {
       this.aiCancelled = false;
       setBusy(true);
 
-      const pending = addPending();
+      // Each turn keeps the exact snapshot it was sent with.
+      const snapshot: AISendSnapshot | null = this.aiManifest
+        ? {
+            usedTokens: this.aiManifest.usedTokens,
+            stage: this.aiManifest.stage,
+            nodes: this.aiManifest.nodes.map((node) => ({
+              tag: node.tag,
+              label: node.label,
+              charsSent: node.charsSent,
+              charsTotal: node.charsTotal,
+              truncated: node.truncated,
+              readable: node.readable,
+              note: node.note,
+            })),
+            notes: [...this.aiManifest.notes],
+          }
+        : null;
+
+      const pending = addPending(snapshot);
       this.aiPending = pending;
 
       const aiSettings = this.plugin.settings.ai;
-      await this.compactHistory(this.aiProvider, aiSettings.compactThreshold);
+      const thinking = this.resolveThinking(profile);
+      // Anthropic caches the stable prefix; OpenAI-compatible providers do it
+      // on their own, so no marker is needed there.
+      const cache = profile?.protocol === "anthropic" && profile?.cache !== false;
+      let outCap = profile?.capability?.maxOutput ?? 8192;
 
-      let content = question;
-      if (!this.aiContextSent) {
-        const context = this.buildBoardContext(this.aiTargets, aiSettings.contextLimit);
-        if (context.note) new Notice(context.note);
-        content = `【白板内容】\n${context.text}\n\n【问题】\n${question}`;
+      // Rebuild only if a node changed while the panel was open.
+      this.ensureSystem(profile);
+      await this.compactHistory(profile);
+
+      // A trimmed turn says so once; the full detail lives in the reply block.
+      if (snapshot && snapshot.notes.length > 0) {
+        new Notice(`本次已读取上下文：${snapshot.notes.join("；")}`.slice(0, 160));
       }
 
-      this.aiHistory.push({ role: "user", content });
+      this.aiHistory.push({ role: "user", content: question });
+
+      let result: AIResult | null = null;
+      let capDoubled = false;
 
       try {
-        const reply = await this.aiProvider.complete(this.aiHistory, {
-          system:
-            "你是白板整理助手。用户给你白板上的节点内容和它们之间的关系，请用简洁的中文回答，" +
-            "不要复述原文，直接给判断和建议。必要时用列表。",
-        });
+        for (;;) {
+          try {
+            result = await this.aiProvider!.complete(this.aiHistory, {
+              system: this.aiSystem,
+              maxTokens: outCap,
+              thinking,
+              cache,
+            });
+            break;
+          } catch (error) {
+            // Thinking can eat the whole budget and leave no text at all.
+            // One retry with a bigger paper is cheaper than a failed turn.
+            if (!capDoubled && isThinkingBudgetError(error) && outCap < 32768) {
+              capDoubled = true;
+              outCap = Math.min(32768, outCap * 2);
+              pending.say(`思考占满了额度，用 ${formatTokens(outCap)} 重试一次…`);
+              continue;
+            }
+            throw error;
+          }
+        }
+
+        if (!result) throw new Error("请求没有返回结果");
+
+        let reply = result.text;
+        let rounds = 0;
+        let continueFailed = false;
+
+        // A long answer hits the per-request cap mid-sentence. Continue it
+        // instead of handing the user half a plan they must ask for again.
+        while (result.truncated && rounds < aiSettings.continuations && !this.aiCancelled) {
+          rounds += 1;
+          pending.say(`回答较长，正在续写第 ${rounds} 段…`);
+
+          try {
+            result = await this.aiProvider.complete(
+              [
+                ...this.aiHistory,
+                { role: "assistant", content: reply },
+                { role: "user", content: CONTINUE_PROMPT },
+              ],
+              { system: this.aiSystem, maxTokens: outCap, thinking, cache }
+            );
+          } catch (error) {
+            // Keep the first half instead of throwing the whole answer away.
+            continueFailed = true;
+            break;
+          }
+
+          const merged = mergeContinuation(reply, result.text);
+          // No real new text means the model had nothing more to add.
+          if (merged.length <= reply.length + 8) break;
+          reply = merged;
+        }
+
+        // Close quotes and emphasis left open by the cut, once, at the end.
+        if (result.truncated || rounds > 0) reply = balanceTail(reply);
 
         this.aiHistory.push({ role: "assistant", content: reply });
-        this.aiContextSent = true;
 
         pending.stop();
         pending.row.remove();
@@ -3085,8 +3558,14 @@ export class BoardView extends TextFileView {
           return;
         }
 
-        await addAiBubble(reply);
+        await addAiBubble(reply, snapshot);
         this.persistConversation(question);
+
+        if (continueFailed) {
+          new Notice("续写失败，这次答复可能不完整");
+        } else if (result.truncated) {
+          new Notice("回答仍被长度上限截断，可在模型配置里调大「单次输出上限」");
+        }
 
         insertBtn.disabled = false;
         noteBtn.disabled = false;
@@ -3098,7 +3577,11 @@ export class BoardView extends TextFileView {
         pending.row.remove();
         this.aiPending = null;
         if (!this.aiCancelled) {
-          addError(error instanceof Error ? error.message : String(error));
+          const failedQuestion = question;
+          addError(error instanceof Error ? error.message : String(error), () => {
+            input.value = failedQuestion;
+            void ask();
+          });
         }
       } finally {
         setBusy(false);
@@ -3134,8 +3617,8 @@ export class BoardView extends TextFileView {
     newBtn.addEventListener("click", () => {
       this.aiConversationId = null;
       this.aiHistory = [];
-      this.aiContextSent = false;
       this.aiAnswers = [];
+      this.aiSnapshots = [];
       this.aiPicked = new Set<number>();
       stream.empty();
       stream.createDiv({ cls: "volis-ai-empty-hint", text: "新对话已开始，选中的节点保持不变。" });
@@ -3152,37 +3635,24 @@ export class BoardView extends TextFileView {
         .filter((message) => message.role === "assistant")
         .map((message) => message.content);
 
-      this.aiAnswers = answers;
-      this.aiPicked = new Set(answers.length > 0 ? [answers.length - 1] : []);
-
-      let answerIndex = 0;
+      // `addAiBubble` pushes into `aiAnswers` itself. Start empty so the array
+      // indexes line up with the rows it renders — otherwise every restored
+      // answer is stored twice and the action bar counts two for one click.
+      this.aiAnswers = [];
+      this.aiSnapshots = [];
+      this.aiPicked = new Set<number>();
 
       for (const message of conv.messages) {
         if (message.role === "user") {
           addUserBubble(message.content);
           continue;
         }
-
-        const index = answerIndex++;
-        const row = stream.createDiv({ cls: "volis-ai-msg is-ai" });
-        row.dataset.answerIndex = String(index);
-
-        const bubble = row.createDiv({ cls: "volis-ai-bubble is-md" });
-        row.addEventListener("click", (evt) => {
-          if (!window.getSelection()?.isCollapsed) return;
-          evt.preventDefault();
-          togglePick(index);
-        });
-
-        void MarkdownRenderer.render(
-          this.app,
-          this.decorateAnswer(message.content),
-          bubble,
-          "",
-          this
-        );
+        void addAiBubble(message.content, message.send ?? null, true);
       }
 
+      // A restored conversation starts with nothing picked. Picking the last
+      // answer up front makes the next click add a second one.
+      this.aiPicked.clear();
       refreshPicks();
       scrollDown();
     };
@@ -3285,10 +3755,15 @@ export class BoardView extends TextFileView {
       this.aiConversationId = conversation.id;
     }
 
-    conversation.messages = this.aiHistory.map((message) => ({
-      role: message.role,
-      content: message.role === "user" ? this.stripContext(message.content) : message.content,
-    }));
+    let answerIndex = 0;
+    conversation.messages = this.aiHistory.map((message) => {
+      if (message.role === "user") {
+        return { role: "user" as const, content: this.stripContext(message.content) };
+      }
+      const snapshot = this.aiSnapshots[answerIndex] ?? undefined;
+      answerIndex += 1;
+      return { role: "assistant" as const, content: message.content, ...(snapshot ? { send: snapshot } : {}) };
+    });
     conversation.updatedAt = Date.now();
     conversation.nodeIds = this.aiTargets.map((node) => node.id);
 
@@ -3306,13 +3781,17 @@ export class BoardView extends TextFileView {
       role: message.role,
       content: message.content,
     }));
-    this.aiContextSent = false;
 
     const alive = conversation.nodeIds
       .map((id) => this.nodeMap.get(id))
       .filter((node): node is BoardNode => Boolean(node));
 
-    if (alive.length > 0) this.aiTargets = alive;
+    // Older conversations only stored the group id, so expand it again here:
+    // the members are still on the board and must be visible when asking on.
+    if (alive.length > 0) this.aiTargets = this.expandGroups(alive);
+
+    // The restored targets may differ from the ones the panel opened with.
+    this.ensureSystem(activeProfile(this.plugin.settings.ai), true);
 
     this.aiRestore?.(conversation);
 
@@ -3537,6 +4016,43 @@ export class BoardView extends TextFileView {
     return true;
   }
 
+  private centerWorld(): { x: number; y: number } {
+    const rect = this.root.getBoundingClientRect();
+    return this.toWorld(rect.left + rect.width / 2, rect.top + rect.height / 2);
+  }
+
+  /** Directly creates a new text node, optionally as a yellow sticky. */
+  private async createTextAtCenter(sticky = false): Promise<void> {
+    const point = this.centerWorld();
+    const node: TextNode = {
+      id: createId(),
+      type: "text",
+      text: "",
+      x: Math.round(point.x - DEFAULT_CARD_WIDTH / 2),
+      y: Math.round(point.y - 24),
+      width: DEFAULT_CARD_WIDTH,
+    };
+
+    if (sticky) node.sticky = true;
+
+    this.nodes.push(node);
+    this.nodeMap.set(node.id, node);
+
+    this.selection.clear();
+    this.selection.add(node.id);
+
+    const el = await this.renderNode(node);
+    this.paintSelection();
+    this.updateHint();
+    this.pushHistory();
+    this.scheduleSave();
+    this.openEditor(node, el);
+  }
+
+  private async createStickyAtCenter(): Promise<void> {
+    await this.createTextAtCenter(true);
+  }
+
   private async insertAIText(text: string, targets: BoardNode[]): Promise<void> {
     const box = this.selectionBox(targets);
     const anchor = box ?? { minX: 0, minY: 0, maxX: 0, maxY: 0 };
@@ -3579,6 +4095,44 @@ export class BoardView extends TextFileView {
     panel.addEventListener("dblclick", (evt) => evt.stopPropagation());
 
     const head = panel.createDiv({ cls: "volis-insert-head" });
+
+    // Drag by the header. The input and everything below stay interactive.
+    let dragOrigin: { x: number; y: number; left: number; top: number } | null = null;
+
+    head.addEventListener("pointerdown", (evt) => {
+      if ((evt.target as HTMLElement).closest("input, button")) return;
+
+      dragOrigin = {
+        x: evt.clientX,
+        y: evt.clientY,
+        left: panel.offsetLeft,
+        top: panel.offsetTop,
+      };
+
+      head.setPointerCapture(evt.pointerId);
+      panel.addClass("is-dragging");
+    });
+
+    head.addEventListener("pointermove", (evt) => {
+      if (!dragOrigin) return;
+      panel.style.left = `${Math.round(dragOrigin.left + evt.clientX - dragOrigin.x)}px`;
+      panel.style.top = `${Math.round(dragOrigin.top + evt.clientY - dragOrigin.y)}px`;
+    });
+
+    const endDrag = (evt: PointerEvent) => {
+      if (!dragOrigin) return;
+      dragOrigin = null;
+      panel.removeClass("is-dragging");
+      try {
+        head.releasePointerCapture(evt.pointerId);
+      } catch (error) {
+        // capture already released
+      }
+    };
+
+    head.addEventListener("pointerup", endDrag);
+    head.addEventListener("pointercancel", endDrag);
+
     const headIcon = head.createDiv({ cls: "volis-insert-head-icon" });
     setIcon(headIcon, "search");
 
@@ -3703,13 +4257,13 @@ export class BoardView extends TextFileView {
     window.setTimeout(() => input.focus(), 20);
   }
 
-  public openInsertPanelAtCenter(): void {
+  public openInsertPanelAtCenter(filter?: InsertFilter): void {
     const rect = this.root.getBoundingClientRect();
     const world = this.toWorld(
       rect.left + rect.width / 2,
       rect.top + rect.height / 2
     );
-    void this.openInsertPanel(world, null, null);
+    void this.openInsertPanel(world, null, null, filter);
   }
 
   private closeInsertPanel(): void {
@@ -3726,7 +4280,8 @@ export class BoardView extends TextFileView {
   private async openInsertPanel(
     world: { x: number; y: number },
     fromId: string | null,
-    fromSide: PortSide | null
+    fromSide: PortSide | null,
+    filter?: InsertFilter
   ): Promise<void> {
     this.closeInsertPanel();
 
@@ -3743,6 +4298,44 @@ export class BoardView extends TextFileView {
     panel.addEventListener("dblclick", (evt) => evt.stopPropagation());
 
     const head = panel.createDiv({ cls: "volis-insert-head" });
+
+    // Drag by the header. The input and everything below stay interactive.
+    let dragOrigin: { x: number; y: number; left: number; top: number } | null = null;
+
+    head.addEventListener("pointerdown", (evt) => {
+      if ((evt.target as HTMLElement).closest("input, button")) return;
+
+      dragOrigin = {
+        x: evt.clientX,
+        y: evt.clientY,
+        left: panel.offsetLeft,
+        top: panel.offsetTop,
+      };
+
+      head.setPointerCapture(evt.pointerId);
+      panel.addClass("is-dragging");
+    });
+
+    head.addEventListener("pointermove", (evt) => {
+      if (!dragOrigin) return;
+      panel.style.left = `${Math.round(dragOrigin.left + evt.clientX - dragOrigin.x)}px`;
+      panel.style.top = `${Math.round(dragOrigin.top + evt.clientY - dragOrigin.y)}px`;
+    });
+
+    const endDrag = (evt: PointerEvent) => {
+      if (!dragOrigin) return;
+      dragOrigin = null;
+      panel.removeClass("is-dragging");
+      try {
+        head.releasePointerCapture(evt.pointerId);
+      } catch (error) {
+        // capture already released
+      }
+    };
+
+    head.addEventListener("pointerup", endDrag);
+    head.addEventListener("pointercancel", endDrag);
+
     const headIcon = head.createDiv({ cls: "volis-insert-head-icon" });
     setIcon(headIcon, "search");
 
@@ -3774,7 +4367,13 @@ export class BoardView extends TextFileView {
         const iconEl = row.createDiv({ cls: "volis-insert-item-icon" });
         setIcon(
           iconEl,
-          item.kind === "card" ? "list" : item.kind === "note" ? "file-text" : "type"
+          item.kind === "card"
+            ? "list"
+            : item.kind === "note"
+              ? "file-text"
+              : item.kind === "media"
+                ? "image"
+                : "type"
         );
 
         const body = row.createDiv({ cls: "volis-insert-item-body" });
@@ -3787,7 +4386,12 @@ export class BoardView extends TextFileView {
 
     const reload = async (query: string) => {
       const mine = ++token;
-      const found = await searchInsertItems(this.app, this.plugin.settings.cardFolder, query);
+      const found = await searchInsertItems(
+        this.app,
+        this.plugin.settings.cardFolder,
+        query,
+        filter
+      );
       if (mine !== token || !this.insertPanel) return;
       items = found;
       active = 0;
@@ -3849,9 +4453,17 @@ export class BoardView extends TextFileView {
     if (item.kind === "text") {
       created = await this.createTextNode(world);
     } else if (item.kind === "note") {
-      const folder = this.plugin.settings.boardFolder ?? "";
-      const file = await createNoteFromText(this.app, folder, "", "未命名");
-      if (file) created = await this.addFileNode(file.path, world);
+      // A searched result already points at a real note; only the panel's
+      // "新建空白笔记" entry has no file and needs one created.
+      if (item.file) {
+        created = await this.addFileNode(item.file, world);
+      } else {
+        const folder = this.plugin.settings.boardFolder ?? "";
+        const file = await createNoteFromText(this.app, folder, "", "未命名");
+        if (file) created = await this.addFileNode(file.path, world);
+      }
+    } else if (item.kind === "media" && item.file) {
+      created = await this.addFileNode(item.file, world);
     } else if (item.kind === "card" && item.file && item.blockId) {
       created = await this.addCardNodeAt(
         item.file,
