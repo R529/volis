@@ -27,7 +27,7 @@ __export(main_exports, {
   default: () => VolisPlugin
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian16 = require("obsidian");
+var import_obsidian19 = require("obsidian");
 
 // src/ai/capability.ts
 var import_obsidian = require("obsidian");
@@ -902,7 +902,7 @@ function paint(badge, text, stale) {
 }
 
 // src/board/BoardView.ts
-var import_obsidian11 = require("obsidian");
+var import_obsidian14 = require("obsidian");
 
 // src/ui/inlineEditor.ts
 var InlineEditor = class {
@@ -1215,9 +1215,9 @@ var RenameModal = class extends import_obsidian6.Modal {
 // src/ui/confirmModal.ts
 var import_obsidian7 = require("obsidian");
 var ConfirmModal = class extends import_obsidian7.Modal {
-  constructor(app, heading, message, confirmText, onConfirm) {
+  constructor(app, heading2, message, confirmText, onConfirm) {
     super(app);
-    this.heading = heading;
+    this.heading = heading2;
     this.message = message;
     this.confirmText = confirmText;
     this.onConfirm = onConfirm;
@@ -1347,11 +1347,11 @@ async function appendCard(app, folder, content) {
     if (!file) {
       const blockId2 = uniqueBlockId([]);
       const cardLines2 = buildCardLines(text, time, blockId2);
-      const heading = `## ${date}
+      const heading2 = `## ${date}
 
 ${cardLines2.join("\n")}
 `;
-      file = await app.vault.create(monthPath, heading);
+      file = await app.vault.create(monthPath, heading2);
       const meta2 = await readCard(app, { file: monthPath, blockId: blockId2, linkpath: "" });
       if (meta2.stale)
         return null;
@@ -1873,7 +1873,8 @@ function buildBoardContext(input, budgetTokens, policy) {
   }
   const edgeLines = input.edges.filter((edge) => tagOf.has(edge.from) && tagOf.has(edge.to)).map((edge) => {
     const label = edge.label ? `\uFF08${edge.label}\uFF09` : "";
-    return `${tagOf.get(edge.from)} \u2192 ${tagOf.get(edge.to)}${label}`;
+    const relation = edge.relation ? ` -[${edge.relation}]-> ` : " \u2192 ";
+    return `${tagOf.get(edge.from)}${relation}${tagOf.get(edge.to)}${label}`;
   });
   const overheadChars = groupLines.join("\n").length + edgeLines.join("\n").length + 120;
   const bodies = contentNodes.map((node) => {
@@ -2093,14 +2094,954 @@ async function searchInsertItems(app, cardFolderSetting, query, filter) {
   return out;
 }
 
+// src/board/curve.ts
+var LABEL_T_MIN = 0.04;
+var LABEL_T_MAX = 0.96;
+function curvePath(curve) {
+  const { p1, c1, c2, p2 } = curve;
+  return `M ${p1.x} ${p1.y} C ${c1.x} ${c1.y}, ${c2.x} ${c2.y}, ${p2.x} ${p2.y}`;
+}
+function curvePoint(curve, t) {
+  const u = 1 - t;
+  const a = u * u * u;
+  const b = 3 * u * u * t;
+  const c = 3 * u * t * t;
+  const d = t * t * t;
+  return {
+    x: a * curve.p1.x + b * curve.c1.x + c * curve.c2.x + d * curve.p2.x,
+    y: a * curve.p1.y + b * curve.c1.y + c * curve.c2.y + d * curve.p2.y
+  };
+}
+function nearestCurveT(curve, target) {
+  const steps = 64;
+  let best = 0.5;
+  let bestDist = Infinity;
+  const consider = (t) => {
+    const point = curvePoint(curve, t);
+    const dist = (point.x - target.x) ** 2 + (point.y - target.y) ** 2;
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = t;
+    }
+  };
+  for (let i = 0; i <= steps; i++)
+    consider(i / steps);
+  let span = 1 / steps * 2;
+  for (let round = 0; round < 10; round++) {
+    consider(Math.max(0, best - span));
+    consider(Math.min(1, best + span));
+    span /= 2;
+  }
+  return best;
+}
+function clampLabelT(t) {
+  if (!Number.isFinite(t))
+    return 0.5;
+  return Math.min(LABEL_T_MAX, Math.max(LABEL_T_MIN, t));
+}
+
+// src/board/doctor.ts
+function doctorNodeName(node) {
+  var _a, _b;
+  if (node.type === "group")
+    return ((_a = node.label) == null ? void 0 : _a.trim()) || "\u672A\u547D\u540D\u5206\u7EC4";
+  if (node.type === "text") {
+    const first = (_b = node.text.split("\n").find((line) => line.trim())) != null ? _b : "";
+    return first.trim().slice(0, 20) || "\u7A7A\u767D\u6587\u672C";
+  }
+  return node.file.split("/").pop() || node.file;
+}
+function pairKey(a, b) {
+  return a < b ? `${a}|${b}` : `${b}|${a}`;
+}
+function normalise(text) {
+  return text.toLowerCase().replace(/\s+/g, "").replace(/[，。！？、；：,.!?;:'"“”‘’()（）[\]{}<>《》\-—_]/g, "");
+}
+var LEVEL_ORDER = { error: 0, warning: 1, hint: 2 };
+var KIND_ORDER = [
+  "stale-ref",
+  "dangling-edge",
+  "duplicate-ref",
+  "duplicate-text",
+  "unlabeled-edge",
+  "isolated-node",
+  "overlap",
+  "far-away",
+  "empty-node",
+  "empty-group"
+];
+function scanBoard(input) {
+  var _a, _b;
+  const issues = [];
+  const byId = new Map(input.nodes.map((node) => [node.id, node]));
+  const present = (id) => byId.has(id);
+  const name = (id) => {
+    const node = byId.get(id);
+    return node ? doctorNodeName(node) : "\u5DF2\u5220\u9664\u7684\u8282\u70B9";
+  };
+  for (const node of input.nodes) {
+    if (node.type !== "card" || !input.staleIds.has(node.id))
+      continue;
+    issues.push({
+      key: `stale:${node.id}`,
+      level: "error",
+      kind: "stale-ref",
+      title: "\u5F15\u7528\u5931\u6548",
+      detail: `${doctorNodeName(node)} \u7684\u5757\u5F15\u7528\u5728\u6E90\u7B14\u8BB0\u91CC\u627E\u4E0D\u5230\uFF0C\u5361\u7247\u6B63\u6587\u4E3A\u7A7A`,
+      nodeIds: [node.id],
+      removableNodeId: node.id
+    });
+  }
+  const danglingNodeIds = /* @__PURE__ */ new Set();
+  for (const edge of input.edges) {
+    if (present(edge.from) && present(edge.to))
+      continue;
+    danglingNodeIds.add(edge.from);
+    danglingNodeIds.add(edge.to);
+    issues.push({
+      key: `dangling:${edge.id}`,
+      level: "error",
+      kind: "dangling-edge",
+      title: "\u8FDE\u7EBF\u7AEF\u70B9\u4E22\u5931",
+      detail: `${name(edge.from)} \u2192 ${name(edge.to)} \u4E2D\u6709\u4E00\u7AEF\u5DF2\u4E0D\u5728\u767D\u677F\u4E0A`,
+      nodeIds: [],
+      edgeId: edge.id
+    });
+  }
+  const byRef = /* @__PURE__ */ new Map();
+  for (const node of input.nodes) {
+    if (node.type !== "card")
+      continue;
+    const ref = `${node.file}#^${node.blockId}`;
+    const list = (_a = byRef.get(ref)) != null ? _a : [];
+    list.push(node);
+    byRef.set(ref, list);
+  }
+  const duplicatePairs = /* @__PURE__ */ new Set();
+  for (const [ref, list] of byRef) {
+    if (list.length < 2)
+      continue;
+    for (let i = 1; i < list.length; i++) {
+      const first = list[0];
+      const duplicate = list[i];
+      duplicatePairs.add(pairKey(first.id, duplicate.id));
+      issues.push({
+        key: `dupref:${duplicate.id}`,
+        level: "warning",
+        kind: "duplicate-ref",
+        title: "\u91CD\u590D\u5361\u7247",
+        detail: `${ref.split("/").pop()} \u5728\u767D\u677F\u4E0A\u51FA\u73B0\u4E86 ${list.length} \u6B21`,
+        nodeIds: [first.id, duplicate.id],
+        removableNodeId: duplicate.id
+      });
+    }
+  }
+  const texts = input.nodes.filter((node) => node.type !== "group" && !input.staleIds.has(node.id)).slice(0, 300).map((node) => ({ node, text: normalise(input.textOf(node)) })).filter((item) => item.text.length >= 24);
+  for (let i = 0; i < texts.length; i++) {
+    for (let j = i + 1; j < texts.length; j++) {
+      const a = texts[i];
+      const b = texts[j];
+      if (duplicatePairs.has(pairKey(a.node.id, b.node.id)))
+        continue;
+      const longer = a.text.length >= b.text.length ? a.text : b.text;
+      const shorter = a.text.length >= b.text.length ? b.text : a.text;
+      const similar = a.text === b.text || shorter.length >= longer.length * 0.8 && longer.includes(shorter);
+      if (!similar)
+        continue;
+      issues.push({
+        key: `duptext:${a.node.id}:${b.node.id}`,
+        level: "warning",
+        kind: "duplicate-text",
+        title: "\u6B63\u6587\u9AD8\u5EA6\u76F8\u4F3C",
+        detail: `\u300C${doctorNodeName(a.node)}\u300D\u4E0E\u300C${doctorNodeName(b.node)}\u300D\u7684\u6B63\u6587\u51E0\u4E4E\u4E00\u6837\uFF0C\u8BF7\u4EBA\u5DE5\u786E\u8BA4`,
+        nodeIds: [a.node.id, b.node.id]
+      });
+    }
+  }
+  for (const edge of input.edges) {
+    if (!present(edge.from) || !present(edge.to))
+      continue;
+    if (((_b = edge.label) == null ? void 0 : _b.trim()) || edge.relation)
+      continue;
+    issues.push({
+      key: `unlabeled:${edge.id}`,
+      level: "warning",
+      kind: "unlabeled-edge",
+      title: "\u8FDE\u7EBF\u6CA1\u6709\u8BED\u4E49",
+      detail: `${name(edge.from)} \u2192 ${name(edge.to)} \u53EA\u6709\u65B9\u5411\uFF0C\u5EFA\u8BAE\u52A0\u6807\u7B7E\u6216\u5173\u7CFB`,
+      nodeIds: [],
+      edgeId: edge.id
+    });
+  }
+  const connected = /* @__PURE__ */ new Set();
+  for (const edge of input.edges) {
+    if (!present(edge.from) || !present(edge.to))
+      continue;
+    connected.add(edge.from);
+    connected.add(edge.to);
+  }
+  for (const node of input.nodes) {
+    if (node.type === "group")
+      continue;
+    if (connected.has(node.id) || danglingNodeIds.has(node.id))
+      continue;
+    issues.push({
+      key: `isolated:${node.id}`,
+      level: "hint",
+      kind: "isolated-node",
+      title: "\u5B64\u7ACB\u8282\u70B9",
+      detail: `\u300C${doctorNodeName(node)}\u300D\u6CA1\u6709\u4EFB\u4F55\u8FDE\u7EBF\uFF0C\u786E\u8BA4\u662F\u4E0D\u662F\u6F0F\u753B\u4E86\u5173\u7CFB`,
+      nodeIds: [node.id]
+    });
+  }
+  const boxes = input.nodes.filter((node) => node.type !== "group").slice(0, 400).map((node) => ({
+    node,
+    x: node.x,
+    y: node.y,
+    w: node.width,
+    h: Math.max(1, input.heightOf(node))
+  }));
+  for (let i = 0; i < boxes.length; i++) {
+    for (let j = i + 1; j < boxes.length; j++) {
+      const a = boxes[i];
+      const b = boxes[j];
+      const ix = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+      const iy = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
+      if (ix <= 0 || iy <= 0)
+        continue;
+      if (ix * iy < Math.min(a.w * a.h, b.w * b.h) * 0.4)
+        continue;
+      issues.push({
+        key: `overlap:${a.node.id}:${b.node.id}`,
+        level: "hint",
+        kind: "overlap",
+        title: "\u8282\u70B9\u91CD\u53E0",
+        detail: `\u300C${doctorNodeName(a.node)}\u300D\u4E0E\u300C${doctorNodeName(b.node)}\u300D\u5927\u9762\u79EF\u91CD\u53E0`,
+        nodeIds: [a.node.id, b.node.id]
+      });
+    }
+  }
+  if (input.nodes.length >= 4) {
+    const others = input.nodes.filter((node) => node.type !== "group");
+    for (const node of others) {
+      if (others.length < 4)
+        break;
+      const rest = others.filter((other) => other.id !== node.id);
+      if (rest.length === 0)
+        continue;
+      const minX = Math.min(...rest.map((item) => item.x));
+      const maxX = Math.max(...rest.map((item) => item.x + item.width));
+      const minY = Math.min(...rest.map((item) => item.y));
+      const maxY = Math.max(
+        ...rest.map((item) => item.y + Math.max(1, input.heightOf(item)))
+      );
+      const gapX = Math.max(0, minX - (node.x + node.width), node.x - maxX);
+      const gapY = Math.max(
+        0,
+        minY - (node.y + input.heightOf(node)),
+        node.y - maxY
+      );
+      if (Math.hypot(gapX, gapY) < 1200)
+        continue;
+      issues.push({
+        key: `far:${node.id}`,
+        level: "hint",
+        kind: "far-away",
+        title: "\u8FDC\u79BB\u5185\u5BB9\u533A",
+        detail: `\u300C${doctorNodeName(node)}\u300D\u79BB\u5176\u4ED6\u8282\u70B9\u5F88\u8FDC\uFF0C\u4ECD\u5728 AI \u4E0A\u4E0B\u6587\u91CC\u5360\u989D\u5EA6`,
+        nodeIds: [node.id]
+      });
+    }
+  }
+  for (const node of input.nodes) {
+    if (node.type === "text" && !node.text.trim()) {
+      issues.push({
+        key: `empty:${node.id}`,
+        level: "hint",
+        kind: "empty-node",
+        title: "\u7A7A\u767D\u6587\u672C\u8282\u70B9",
+        detail: "\u8FD9\u4E2A\u6587\u672C\u8282\u70B9\u6CA1\u6709\u5185\u5BB9\uFF0CAI \u4F1A\u8BFB\u5230\u5360\u4F4D\u7B26",
+        nodeIds: [node.id]
+      });
+    }
+    if (node.type === "group" && input.memberIdsOf(node).length === 0) {
+      issues.push({
+        key: `emptygroup:${node.id}`,
+        level: "hint",
+        kind: "empty-group",
+        title: "\u7A7A\u5206\u7EC4",
+        detail: `\u5206\u7EC4\u300C${doctorNodeName(node)}\u300D\u91CC\u6CA1\u6709\u8282\u70B9`,
+        nodeIds: [node.id]
+      });
+    }
+  }
+  return issues.sort((a, b) => {
+    const byLevel = LEVEL_ORDER[a.level] - LEVEL_ORDER[b.level];
+    if (byLevel !== 0)
+      return byLevel;
+    const byKind = KIND_ORDER.indexOf(a.kind) - KIND_ORDER.indexOf(b.kind);
+    return byKind !== 0 ? byKind : a.key.localeCompare(b.key);
+  });
+}
+
+// src/ui/doctorModal.ts
+var import_obsidian11 = require("obsidian");
+var GROUPS = [
+  { level: "error", label: "\u9519\u8BEF", note: "\u5F15\u7528\u6216\u7ED3\u6784\u5DF2\u7ECF\u4E0D\u5BF9" },
+  { level: "warning", label: "\u63D0\u9192", note: "\u6570\u636E\u6CA1\u574F\uFF0C\u4F46\u4F1A\u5F71\u54CD AI \u7406\u89E3" },
+  { level: "hint", label: "\u5EFA\u8BAE", note: "\u6309\u9700\u5904\u7406\uFF0C\u901A\u5E38\u53EF\u4EE5\u5FFD\u7565" }
+];
+var BoardDoctorModal = class extends import_obsidian11.Modal {
+  constructor(app, issues, actions) {
+    super(app);
+    this.issues = issues;
+    this.actions = actions;
+    this.dragStart = null;
+    this.dragOffset = { ...actions.offset() };
+  }
+  onOpen() {
+    this.modalEl.addClass("volis-doctor-modal");
+    this.contentEl.addClass("volis-doctor-content");
+    this.modalEl.style.width = "620px";
+    this.modalEl.style.maxWidth = "92vw";
+    this.modalEl.style.maxHeight = "74vh";
+    this.titleEl.setText("\u767D\u677F\u4F53\u68C0");
+    this.installDrag();
+    this.applyOffset();
+    this.render();
+  }
+  applyOffset() {
+    this.modalEl.style.transform = `translate(${this.dragOffset.x}px, ${this.dragOffset.y}px)`;
+  }
+  installDrag() {
+    const title = this.titleEl;
+    title.addClass("volis-doctor-drag");
+    title.setAttribute("title", "\u6309\u4F4F\u8FD9\u91CC\u53EF\u4EE5\u62D6\u52A8\u7A97\u53E3\uFF0C\u8BA9\u51FA\u767D\u677F");
+    title.addEventListener("pointerdown", (evt) => {
+      if (evt.button !== 0)
+        return;
+      evt.preventDefault();
+      this.dragStart = {
+        x: evt.clientX,
+        y: evt.clientY,
+        ox: this.dragOffset.x,
+        oy: this.dragOffset.y
+      };
+      title.setPointerCapture(evt.pointerId);
+    });
+    title.addEventListener("pointermove", (evt) => {
+      if (!this.dragStart)
+        return;
+      this.dragOffset = {
+        x: this.dragStart.ox + evt.clientX - this.dragStart.x,
+        y: this.dragStart.oy + evt.clientY - this.dragStart.y
+      };
+      this.applyOffset();
+    });
+    const finish = (evt) => {
+      if (!this.dragStart)
+        return;
+      this.dragStart = null;
+      if (title.hasPointerCapture(evt.pointerId)) {
+        title.releasePointerCapture(evt.pointerId);
+      }
+      this.actions.moved({ ...this.dragOffset });
+    };
+    title.addEventListener("pointerup", finish);
+    title.addEventListener("pointercancel", finish);
+  }
+  render() {
+    const host = this.contentEl;
+    host.empty();
+    host.createEl("p", {
+      cls: "volis-doctor-summary",
+      text: this.issues.length === 0 ? "\u672C\u6B21\u6CA1\u6709\u53D1\u73B0\u95EE\u9898\u3002\u62D6\u52A8\u6807\u9898\u680F\u53EF\u4EE5\u8BA9\u51FA\u767D\u677F\u3002" : `\u53D1\u73B0 ${this.issues.length} \u9879\u3002\u53EA\u662F\u62A5\u544A\uFF0C\u4E0D\u4F1A\u81EA\u52A8\u4FEE\u6539\u767D\u677F\uFF1B\u62D6\u52A8\u6807\u9898\u680F\u53EF\u4EE5\u8BA9\u51FA\u767D\u677F\u3002`
+    });
+    const scroll = host.createDiv({ cls: "volis-doctor-scroll" });
+    if (this.issues.length === 0) {
+      scroll.createDiv({ cls: "volis-doctor-empty", text: "\u6CA1\u6709\u95EE\u9898\uFF0C\u53EF\u4EE5\u76F4\u63A5\u5173\u95ED\u3002" });
+    }
+    for (const group of GROUPS) {
+      const rows = this.issues.filter((issue) => issue.level === group.level);
+      if (rows.length === 0)
+        continue;
+      const section = scroll.createDiv({ cls: "volis-doctor-group" });
+      const head = section.createDiv({ cls: "volis-doctor-group-head" });
+      head.createSpan({ text: group.label });
+      head.createSpan({ cls: "volis-doctor-group-note", text: group.note });
+      head.createSpan({ cls: "volis-doctor-count", text: `${rows.length}` });
+      for (const issue of rows) {
+        const row = section.createDiv({ cls: "volis-doctor-row" });
+        row.createDiv({ cls: `volis-doctor-dot is-${issue.level}` });
+        const body = row.createDiv({ cls: "volis-doctor-body" });
+        body.createDiv({ cls: "volis-doctor-title", text: issue.title });
+        body.createDiv({ cls: "volis-doctor-detail", text: issue.detail });
+        const actions = row.createDiv({ cls: "volis-doctor-actions" });
+        if (issue.nodeIds.length > 0 || issue.edgeId) {
+          const locate = actions.createEl("button", {
+            cls: "volis-doctor-btn",
+            text: "\u5B9A\u4F4D"
+          });
+          locate.addEventListener("click", () => this.actions.locate(issue));
+        }
+        if (issue.removableNodeId) {
+          const nodeId = issue.removableNodeId;
+          const remove = actions.createEl("button", {
+            cls: "volis-doctor-btn is-danger",
+            text: "\u79FB\u9664\u8282\u70B9"
+          });
+          remove.addEventListener("click", () => this.actions.removeNode(nodeId));
+        }
+        if (issue.kind === "dangling-edge" && issue.edgeId) {
+          const edgeId = issue.edgeId;
+          const remove = actions.createEl("button", {
+            cls: "volis-doctor-btn is-danger",
+            text: "\u5220\u9664\u8FDE\u7EBF"
+          });
+          remove.addEventListener("click", () => this.actions.removeEdge(edgeId));
+        }
+        if (issue.kind === "unlabeled-edge" && issue.edgeId) {
+          const edgeId = issue.edgeId;
+          const label = actions.createEl("button", {
+            cls: "volis-doctor-btn",
+            text: "\u6DFB\u52A0\u6807\u7B7E"
+          });
+          label.addEventListener("click", () => this.actions.addLabel(edgeId));
+        }
+      }
+    }
+    const footer = host.createDiv({ cls: "volis-doctor-footer" });
+    footer.createSpan({
+      cls: "volis-doctor-foot",
+      text: "\u6240\u6709\u4FEE\u590D\u90FD\u9700\u8981\u9010\u6761\u786E\u8BA4\uFF0C\u53EF Ctrl+Z \u64A4\u9500\u3002"
+    });
+    const rescan = footer.createEl("button", { cls: "volis-doctor-btn", text: "\u91CD\u65B0\u626B\u63CF" });
+    rescan.addEventListener("click", () => this.actions.rescan());
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+
+// src/ui/shortcutHelpModal.ts
+var import_obsidian12 = require("obsidian");
+
+// src/board/shortcuts.ts
+var BOARD_SHORTCUTS = [
+  {
+    title: "\u89C6\u56FE",
+    items: [
+      { label: "\u79FB\u52A8\u767D\u677F", keys: ["\u7A7A\u683C + \u62D6\u62FD", "\u4E2D\u952E\u62D6\u62FD"] },
+      { label: "\u6C34\u5E73\u79FB\u52A8\u767D\u677F", keys: ["Shift + \u6EDA\u8F6E"] },
+      { label: "\u7F29\u653E", keys: ["\u6EDA\u8F6E"] }
+    ]
+  },
+  {
+    title: "\u9009\u62E9",
+    items: [
+      { label: "\u52A0\u9009 / \u53D6\u6D88\u9009\u4E2D", keys: ["Shift + \u70B9\u51FB", "Ctrl / Cmd + \u70B9\u51FB"] },
+      { label: "\u6846\u9009\u5E76\u52A0\u9009", keys: ["Shift + \u62D6\u62FD", "Ctrl / Cmd + \u62D6\u62FD"] }
+    ]
+  },
+  {
+    title: "\u7F16\u8F91",
+    items: [
+      { label: "\u5220\u9664\u8282\u70B9\u6216\u8FDE\u7EBF", keys: ["Delete", "Backspace"] },
+      { label: "\u64A4\u9500", keys: ["Ctrl / Cmd + Z"] },
+      { label: "\u91CD\u505A", keys: ["Ctrl / Cmd + Y", "Ctrl / Cmd + Shift + Z"] },
+      { label: "\u590D\u5236\u9009\u4E2D\u8282\u70B9", keys: ["Ctrl / Cmd + C"] },
+      { label: "\u7C98\u8D34", keys: ["Ctrl / Cmd + V"] },
+      { label: "\u6682\u65F6\u5173\u95ED\u5438\u9644\u5BF9\u9F50", keys: ["\u6309\u4F4F Alt"] }
+    ]
+  },
+  {
+    title: "\u53CC\u51FB\u64CD\u4F5C",
+    items: [
+      { label: "\u7A7A\u767D\u5904\u65B0\u5EFA\u6587\u672C", keys: ["\u53CC\u51FB\u7A7A\u767D"] },
+      { label: "\u7F16\u8F91\u5361\u7247\u6216\u6253\u5F00\u6587\u4EF6", keys: ["\u53CC\u51FB\u8282\u70B9"] },
+      { label: "\u6DFB\u52A0\u8FDE\u7EBF\u6807\u7B7E", keys: ["\u53CC\u51FB\u8FDE\u7EBF"] },
+      { label: "\u4FEE\u6539\u8FDE\u7EBF\u6807\u7B7E", keys: ["\u53CC\u51FB\u6807\u7B7E"] }
+    ]
+  }
+];
+
+// src/ui/shortcutHelpModal.ts
+var ShortcutHelpModal = class extends import_obsidian12.Modal {
+  constructor(app) {
+    super(app);
+  }
+  onOpen() {
+    this.modalEl.addClass("volis-help-modal");
+    this.modalEl.style.width = "580px";
+    this.modalEl.style.maxWidth = "92vw";
+    this.modalEl.style.maxHeight = "76vh";
+    this.titleEl.setText("\u767D\u677F\u5FEB\u6377\u952E");
+    const host = this.contentEl;
+    host.empty();
+    host.addClass("volis-help-content");
+    host.createEl("p", {
+      cls: "volis-help-scope",
+      text: "\u4EC5\u9002\u7528\u4E8E Volis \u767D\u677F\u5185\u7684\u64CD\u4F5C\u3002"
+    });
+    const scroll = host.createDiv({ cls: "volis-help-scroll" });
+    for (const group of BOARD_SHORTCUTS) {
+      const section = scroll.createDiv({ cls: "volis-help-group" });
+      section.createDiv({ cls: "volis-help-group-title", text: group.title });
+      for (const item of group.items) {
+        const row = section.createDiv({ cls: "volis-help-row" });
+        row.createSpan({ cls: "volis-help-label", text: item.label });
+        const keys = row.createDiv({ cls: "volis-help-keys" });
+        for (const key of item.keys) {
+          keys.createSpan({ cls: "volis-help-key", text: key });
+        }
+      }
+    }
+    host.createDiv({
+      cls: "volis-help-foot",
+      text: "\u547D\u4EE4\u7C7B\u64CD\u4F5C\uFF08\u5982\u767D\u677F\u4F53\u68C0\u3001AI \u9762\u677F\uFF09\u7684\u5FEB\u6377\u952E\uFF0C\u53EF\u5728 \u8BBE\u7F6E \u2192 \u5FEB\u6377\u952E \u2192 Volis \u4E2D\u4FEE\u6539\u3002"
+    });
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+
 // src/board/types.ts
 var DEFAULT_CARD_WIDTH = 280;
 var DEFAULT_FILE_WIDTH = 360;
+
+// src/board/relations.ts
+var EDGE_RELATIONS = [
+  { id: "supports", label: "\u652F\u6301", color: "green", style: "solid", arrow: "target" },
+  { id: "refutes", label: "\u53CD\u9A73", color: "red", style: "dashed", arrow: "target" },
+  { id: "causes", label: "\u56E0\u679C", color: "orange", style: "solid", arrow: "target" },
+  { id: "derives", label: "\u63A8\u5BFC", color: "blue", style: "solid", arrow: "target" },
+  { id: "source", label: "\u6765\u6E90", color: "purple", style: "dashed", arrow: "target" },
+  { id: "sequence", label: "\u987A\u5E8F", color: "teal", style: "solid", arrow: "target" }
+];
+var EDGE_RELATION_BY_ID = new Map(
+  EDGE_RELATIONS.map((meta) => [meta.id, meta])
+);
+
+// src/board/outline.ts
+function emptyBadges() {
+  return { supports: 0, refutes: 0, source: 0 };
+}
+function byPosition(a, b, nodeById) {
+  const na = nodeById.get(a);
+  const nb = nodeById.get(b);
+  if (!na || !nb)
+    return a.localeCompare(b);
+  return na.y - nb.y || na.x - nb.x || a.localeCompare(b);
+}
+function orderSiblings(ids, seqOut, nodeById) {
+  var _a, _b, _c, _d;
+  if (ids.length <= 1)
+    return ids.slice();
+  const present = new Set(ids);
+  const indegree = /* @__PURE__ */ new Map();
+  const outgoing = /* @__PURE__ */ new Map();
+  for (const id of ids)
+    indegree.set(id, 0);
+  for (const id of ids) {
+    const targets = seqOut.get(id);
+    if (!targets)
+      continue;
+    for (const to of targets) {
+      if (!present.has(to) || to === id)
+        continue;
+      const bucket = (_a = outgoing.get(id)) != null ? _a : /* @__PURE__ */ new Set();
+      if (bucket.has(to))
+        continue;
+      bucket.add(to);
+      outgoing.set(id, bucket);
+      indegree.set(to, ((_b = indegree.get(to)) != null ? _b : 0) + 1);
+    }
+  }
+  const ready = ids.filter((id) => {
+    var _a2;
+    return ((_a2 = indegree.get(id)) != null ? _a2 : 0) === 0;
+  }).sort((a, b) => byPosition(a, b, nodeById));
+  const ordered = [];
+  while (ready.length > 0) {
+    const id = ready.shift();
+    ordered.push(id);
+    for (const to of (_c = outgoing.get(id)) != null ? _c : []) {
+      const next = ((_d = indegree.get(to)) != null ? _d : 0) - 1;
+      indegree.set(to, next);
+      if (next === 0) {
+        ready.push(to);
+        ready.sort((a, b) => byPosition(a, b, nodeById));
+      }
+    }
+  }
+  if (ordered.length < ids.length) {
+    const seen = new Set(ordered);
+    const rest = ids.filter((id) => !seen.has(id));
+    rest.sort((a, b) => byPosition(a, b, nodeById));
+    ordered.push(...rest);
+  }
+  return ordered;
+}
+function buildOutline(nodes, edges, infoOf) {
+  var _a, _b, _c, _d, _e;
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  const active = /* @__PURE__ */ new Set();
+  let cycle = false;
+  for (const edge of edges) {
+    if (!edge.relation)
+      continue;
+    if (edge.from === edge.to)
+      continue;
+    if (!nodeById.has(edge.from) || !nodeById.has(edge.to))
+      continue;
+    active.add(edge.from);
+    active.add(edge.to);
+  }
+  const included = nodes.filter(
+    (node) => node.kind !== "group" || active.has(node.id)
+  );
+  const includedIds = new Set(included.map((node) => node.id));
+  const candidates = /* @__PURE__ */ new Map();
+  const badges = /* @__PURE__ */ new Map();
+  const seqOut = /* @__PURE__ */ new Map();
+  let hasSequence = false;
+  for (const edge of edges) {
+    if (!edge.relation)
+      continue;
+    if (!includedIds.has(edge.from) || !includedIds.has(edge.to))
+      continue;
+    if (edge.from === edge.to) {
+      cycle = true;
+      continue;
+    }
+    if (edge.relation === "derives" || edge.relation === "causes") {
+      const parent = nodeById.get(edge.from);
+      if (!parent)
+        continue;
+      const list = (_a = candidates.get(edge.to)) != null ? _a : [];
+      list.push({
+        parent: edge.from,
+        relation: edge.relation,
+        y: parent.y,
+        x: parent.x
+      });
+      candidates.set(edge.to, list);
+      continue;
+    }
+    if (edge.relation === "sequence") {
+      hasSequence = true;
+      const bucket = (_b = seqOut.get(edge.from)) != null ? _b : /* @__PURE__ */ new Set();
+      bucket.add(edge.to);
+      seqOut.set(edge.from, bucket);
+      continue;
+    }
+    const counts = (_c = badges.get(edge.to)) != null ? _c : emptyBadges();
+    counts[edge.relation] += 1;
+    badges.set(edge.to, counts);
+  }
+  for (const list of candidates.values()) {
+    list.sort((a, b) => {
+      const rank = (relation) => relation === "derives" ? 0 : 1;
+      return rank(a.relation) - rank(b.relation) || a.y - b.y || a.x - b.x || a.parent.localeCompare(b.parent);
+    });
+  }
+  const parentOf = /* @__PURE__ */ new Map();
+  let hasHierarchy = false;
+  for (const node of included) {
+    const list = candidates.get(node.id);
+    if (!list)
+      continue;
+    for (const candidate of list) {
+      if (candidate.parent === node.id) {
+        cycle = true;
+        continue;
+      }
+      let current = candidate.parent;
+      let loops = false;
+      let guard = 0;
+      while (current && guard < 1e4) {
+        guard += 1;
+        if (current === node.id) {
+          loops = true;
+          break;
+        }
+        current = (_d = parentOf.get(current)) == null ? void 0 : _d.parent;
+      }
+      if (loops) {
+        cycle = true;
+        continue;
+      }
+      parentOf.set(node.id, {
+        parent: candidate.parent,
+        relation: candidate.relation
+      });
+      hasHierarchy = true;
+      break;
+    }
+  }
+  const childrenOf = /* @__PURE__ */ new Map();
+  for (const node of included) {
+    const parent = parentOf.get(node.id);
+    if (!parent)
+      continue;
+    const list = (_e = childrenOf.get(parent.parent)) != null ? _e : [];
+    list.push(node.id);
+    childrenOf.set(parent.parent, list);
+  }
+  const buildItem = (id) => {
+    var _a2, _b2, _c2, _d2;
+    const node = nodeById.get(id);
+    const info = node ? infoOf(node) : { title: "\u672A\u547D\u540D" };
+    const kids = orderSiblings((_a2 = childrenOf.get(id)) != null ? _a2 : [], seqOut, nodeById);
+    return {
+      id,
+      kind: (_b2 = node == null ? void 0 : node.kind) != null ? _b2 : "text",
+      title: info.title || "\u672A\u547D\u540D",
+      snippet: info.snippet,
+      relation: (_c2 = parentOf.get(id)) == null ? void 0 : _c2.relation,
+      badges: (_d2 = badges.get(id)) != null ? _d2 : emptyBadges(),
+      children: kids.map(buildItem)
+    };
+  };
+  const roots = included.filter((node) => !parentOf.has(node.id)).map((node) => node.id);
+  return {
+    roots: orderSiblings(roots, seqOut, nodeById).map(buildItem),
+    nodeCount: included.length,
+    hasHierarchy,
+    hasSequence,
+    cycle
+  };
+}
+
+// src/board/markdownExport.ts
+function emptyAnnotations() {
+  return { supports: [], refutes: [], sources: [] };
+}
+function collectAnnotations(input) {
+  var _a, _b;
+  const map = /* @__PURE__ */ new Map();
+  for (const edge of input.edges) {
+    const relation = edge.relation;
+    if (relation !== "supports" && relation !== "refutes" && relation !== "source")
+      continue;
+    if (edge.from === edge.to)
+      continue;
+    const label = (_a = edge.label) == null ? void 0 : _a.trim();
+    const title = input.titleOf(edge.from);
+    const text = label ? `${title}\uFF08${label}\uFF09` : title;
+    const bucket = (_b = map.get(edge.to)) != null ? _b : emptyAnnotations();
+    const list = relation === "supports" ? bucket.supports : relation === "refutes" ? bucket.refutes : bucket.sources;
+    if (!list.includes(text))
+      list.push(text);
+    map.set(edge.to, bucket);
+  }
+  return map;
+}
+function annotationLines(annotations, indent) {
+  if (!annotations)
+    return [];
+  const lines = [];
+  if (annotations.supports.length > 0) {
+    lines.push(`${indent}> \u652F\u6301\uFF1A${annotations.supports.join("\u3001")}`);
+  }
+  if (annotations.refutes.length > 0) {
+    lines.push(`${indent}> \u53CD\u9A73\uFF1A${annotations.refutes.join("\u3001")}`);
+  }
+  if (annotations.sources.length > 0) {
+    lines.push(`${indent}> \u6765\u6E90\uFF1A${annotations.sources.join("\u3001")}`);
+  }
+  return lines;
+}
+function heading(level, title) {
+  return `${"#".repeat(Math.min(level, 6))} ${title}`;
+}
+function indentBody(body, indent) {
+  return body.split(/\r?\n/).map((line) => line.trim() ? `${indent}${line}` : "");
+}
+function buildExportMarkdown(input, format) {
+  var _a;
+  const annotations = collectAnnotations(input);
+  const out = [`# ${input.boardTitle}`, ""];
+  const walk = (item, depth) => {
+    const info = input.infoOf(item.id);
+    const notes = annotations.get(item.id);
+    const body = info.body.trim();
+    if (format === "headings") {
+      out.push("", heading(depth + 2, info.title));
+      if (body)
+        out.push("", body);
+      const lines = annotationLines(notes, "");
+      if (lines.length > 0)
+        out.push("", ...lines);
+    } else {
+      const indent = "  ".repeat(depth);
+      out.push(`${indent}- **${info.title}**`);
+      if (body)
+        out.push("", ...indentBody(body, `${indent}  `), "");
+      const lines = annotationLines(notes, `${indent}  `);
+      if (lines.length > 0)
+        out.push(...lines);
+    }
+    for (const child of item.children)
+      walk(child, depth + 1);
+  };
+  if (input.outline.roots.length > 0) {
+    for (const root of input.outline.roots)
+      walk(root, 0);
+  } else {
+    out.push("", "_\u767D\u677F\u4E0A\u8FD8\u6CA1\u6709\u8282\u70B9\u3002_");
+  }
+  const loose = input.edges.filter((edge) => !edge.relation && edge.from !== edge.to);
+  if (loose.length > 0) {
+    out.push("", "## \u5173\u8054", "");
+    for (const edge of loose) {
+      const label = (_a = edge.label) == null ? void 0 : _a.trim();
+      const from = input.titleOf(edge.from);
+      const to = input.titleOf(edge.to);
+      out.push(`- ${from} \u2192 ${to}${label ? `\uFF1A${label}` : ""}`);
+    }
+  }
+  return `${out.join("\n").replace(/\n{3,}/g, "\n\n").trim()}
+`;
+}
+
+// src/ui/exportModal.ts
+var import_obsidian13 = require("obsidian");
+var MarkdownExportModal = class extends import_obsidian13.Modal {
+  constructor(app, options) {
+    super(app);
+    this.options = options;
+    this.format = "headings";
+    this.previewEl = null;
+    this.tabs = [];
+    this.markdown = "";
+    this.dragOffset = { x: 0, y: 0 };
+    this.dragStart = null;
+  }
+  onOpen() {
+    this.modalEl.addClass("volis-export-modal");
+    this.contentEl.addClass("volis-export-content");
+    this.modalEl.style.width = "680px";
+    this.modalEl.style.maxWidth = "94vw";
+    this.modalEl.style.maxHeight = "84vh";
+    this.titleEl.setText("\u5BFC\u51FA Markdown");
+    this.installDrag();
+    this.contentEl.createDiv({
+      cls: "volis-export-sub",
+      text: `\u767D\u677F\u300C${this.options.boardTitle}\u300D\xB7 ${this.options.nodeCount} \u4E2A\u8282\u70B9\u3002\u63A8\u5BFC\u4E0E\u56E0\u679C\u751F\u6210\u5C42\u7EA7\uFF0C\u652F\u6301\u3001\u53CD\u9A73\u3001\u6765\u6E90\u4FDD\u7559\u4E3A\u6CE8\u89E3\u3002`
+    });
+    const tabs = this.contentEl.createDiv({ cls: "volis-export-tabs" });
+    const makeTab = (format, label) => {
+      const button = tabs.createEl("button", { cls: "volis-export-tab", text: label });
+      button.dataset.format = format;
+      button.addEventListener("click", () => {
+        this.format = format;
+        this.refresh();
+      });
+      this.tabs.push(button);
+    };
+    makeTab("headings", "\u6807\u9898\u5C42\u7EA7");
+    makeTab("list", "\u5D4C\u5957\u5217\u8868");
+    this.previewEl = this.contentEl.createEl("textarea", { cls: "volis-export-preview" });
+    this.previewEl.readOnly = true;
+    this.previewEl.spellcheck = false;
+    const footer = this.contentEl.createDiv({ cls: "volis-export-footer" });
+    footer.createDiv({
+      cls: "volis-export-foot",
+      text: "\u4FDD\u5B58\u4F1A\u5728\u767D\u677F\u6240\u5728\u76EE\u5F55\u751F\u6210\u540C\u540D\u7B14\u8BB0\uFF0C\u91CD\u540D\u81EA\u52A8\u52A0\u5E8F\u53F7\u3002"
+    });
+    const actions = footer.createDiv({ cls: "volis-export-actions" });
+    const copyBtn = actions.createEl("button", { cls: "volis-export-btn", text: "\u590D\u5236" });
+    copyBtn.addEventListener("click", () => void this.copy());
+    const saveBtn = actions.createEl("button", {
+      cls: "mod-cta volis-export-btn",
+      text: "\u4FDD\u5B58\u4E3A\u7B14\u8BB0"
+    });
+    saveBtn.addEventListener("click", () => void this.save());
+    this.refresh();
+  }
+  applyOffset() {
+    this.modalEl.style.transform = `translate(${this.dragOffset.x}px, ${this.dragOffset.y}px)`;
+  }
+  installDrag() {
+    const title = this.titleEl;
+    title.addClass("volis-export-drag");
+    title.setAttribute("title", "\u6309\u4F4F\u8FD9\u91CC\u53EF\u4EE5\u62D6\u52A8\u7A97\u53E3");
+    title.addEventListener("pointerdown", (evt) => {
+      if (evt.button !== 0)
+        return;
+      evt.preventDefault();
+      this.dragStart = {
+        x: evt.clientX,
+        y: evt.clientY,
+        ox: this.dragOffset.x,
+        oy: this.dragOffset.y
+      };
+      title.setPointerCapture(evt.pointerId);
+    });
+    title.addEventListener("pointermove", (evt) => {
+      if (!this.dragStart)
+        return;
+      this.dragOffset = {
+        x: this.dragStart.ox + evt.clientX - this.dragStart.x,
+        y: this.dragStart.oy + evt.clientY - this.dragStart.y
+      };
+      this.applyOffset();
+    });
+    const finish = (evt) => {
+      if (!this.dragStart)
+        return;
+      this.dragStart = null;
+      if (title.hasPointerCapture(evt.pointerId)) {
+        title.releasePointerCapture(evt.pointerId);
+      }
+    };
+    title.addEventListener("pointerup", finish);
+    title.addEventListener("pointercancel", finish);
+  }
+  refresh() {
+    for (const tab of this.tabs) {
+      tab.toggleClass("is-active", tab.dataset.format === this.format);
+    }
+    this.markdown = this.options.build(this.format);
+    if (this.previewEl)
+      this.previewEl.value = this.markdown;
+  }
+  async copy() {
+    try {
+      await navigator.clipboard.writeText(this.markdown);
+      new import_obsidian13.Notice("\u5DF2\u590D\u5236 Markdown");
+    } catch (error) {
+      new import_obsidian13.Notice("\u590D\u5236\u5931\u8D25\uFF0C\u8BF7\u5728\u9884\u89C8\u6846\u4E2D\u624B\u52A8\u9009\u4E2D\u590D\u5236");
+    }
+  }
+  async save() {
+    try {
+      const path = await this.options.save(this.markdown);
+      new import_obsidian13.Notice(`\u5DF2\u4FDD\u5B58\u4E3A\u7B14\u8BB0\uFF1A${path}`);
+      this.close();
+    } catch (error) {
+      console.error("[Volis] export note failed", error);
+      new import_obsidian13.Notice("\u4FDD\u5B58\u5931\u8D25\uFF0C\u8BF7\u68C0\u67E5\u767D\u677F\u6240\u5728\u76EE\u5F55\u7684\u5199\u5165\u6743\u9650");
+    }
+  }
+  onClose() {
+    this.contentEl.empty();
+    this.previewEl = null;
+    this.tabs = [];
+  }
+};
 
 // src/board/BoardView.ts
 var VIEW_TYPE_VOLIS_BOARD = "volis-board";
 var GRID = 24;
 var MIN_GRID = 10;
+var EDGE_LABEL_MAX = 40;
+var EDGE_LABEL_FONT_SIZE = 17;
+var EDGE_LABEL_PAD_X = 12;
+var EDGE_LABEL_HEIGHT = 32;
+var EDGE_LABEL_RADIUS = 10;
 var MIN_SCALE = 0.05;
 var MAX_SCALE = 3;
 var IMAGE_EXT2 = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"];
@@ -2127,7 +3068,7 @@ var NODE_COLORS = [
   { name: "blue", label: "\u84DD", line: "#378add", bg: "#dfeafa" },
   { name: "purple", label: "\u7D2B", line: "#7f77dd", bg: "#e7e5f9" }
 ];
-var _BoardView = class _BoardView extends import_obsidian11.TextFileView {
+var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
   constructor(leaf, plugin) {
     super(leaf);
     this.plugin = plugin;
@@ -2157,6 +3098,15 @@ var _BoardView = class _BoardView extends import_obsidian11.TextFileView {
     /** Cached note bodies, keyed by path and validated by mtime. */
     this.noteTextCache = /* @__PURE__ */ new Map();
     this.aiPanel = null;
+    /** Floating outline. It lives in `root`, not `world`, so panning and
+     *  zooming never move it. */
+    this.outlinePanel = null;
+    this.outlineBodyEl = null;
+    this.outlineMetaEl = null;
+    this.outlineCollapsed = /* @__PURE__ */ new Set();
+    this.outlineTimer = null;
+    this.outlineSignatureCache = "";
+    this.outlinePos = { left: 16, top: 58 };
     this.aiOutside = null;
     this.aiProvider = null;
     this.aiTargets = [];
@@ -2168,6 +3118,10 @@ var _BoardView = class _BoardView extends import_obsidian11.TextFileView {
     this.aiManifest = null;
     /** One snapshot per answer, aligned with `aiAnswers`. */
     this.aiSnapshots = [];
+    /** N1 → node id, built from the exact snapshot the model was given. */
+    this.aiNumberMap = /* @__PURE__ */ new Map();
+    /** Number badges currently attached to nodes, for fast teardown. */
+    this.aiBadges = /* @__PURE__ */ new Map();
     /** Guards the lazy note-loading pass so it cannot loop. */
     this.aiNotesLoading = false;
     this.aiAnswers = [];
@@ -2187,6 +3141,23 @@ var _BoardView = class _BoardView extends import_obsidian11.TextFileView {
     this.lastPointerWorld = null;
     this.insertPanel = null;
     this.edgeBar = null;
+    this.edgeLabelBtn = null;
+    this.edgeRelationBtn = null;
+    /** Report panel for the read-only board health check. */
+    this.doctorModal = null;
+    /** Read-only in-board shortcut reference. */
+    this.helpModal = null;
+    /** Kept across rescans so a panel parked beside the board stays put. */
+    this.doctorOffset = { x: 0, y: 0 };
+    /** Inline editor for a connection's relation and label; lives in world space
+     *  so panning and zooming keep it glued to the line. `t` is where on the line
+     *  it sits, and becomes the label's stored position on commit. */
+    this.edgeLabelEditor = null;
+    /** Shared 2D context used to measure label text. Measuring with a canvas
+     *  keeps the chip sized correctly even while the board is hidden, where
+     *  layout-based APIs (getBBox, getComputedTextLength) report zero. */
+    this.labelMetrics = null;
+    this.labelFontCache = "";
     this.alignPop = null;
     this.alignOutside = null;
     this.colorPop = null;
@@ -2309,6 +3280,8 @@ var _BoardView = class _BoardView extends import_obsidian11.TextFileView {
         return;
       if (target == null ? void 0 : target.closest(".volis-ai-panel"))
         return;
+      if (target == null ? void 0 : target.closest(".volis-outline-panel"))
+        return;
       const hoveredBody = target == null ? void 0 : target.closest(".volis-bnode-body");
       if (hoveredBody) {
         const nodeEl = hoveredBody.closest(".volis-bnode");
@@ -2343,6 +3316,8 @@ var _BoardView = class _BoardView extends import_obsidian11.TextFileView {
       if (!target)
         return;
       if (target.closest(".volis-board-toolbar"))
+        return;
+      if (target.closest(".volis-outline-panel"))
         return;
       const nodeEl = target.closest(".volis-bnode");
       const nodeId = (_b = (_a = nodeEl == null ? void 0 : nodeEl.dataset) == null ? void 0 : _a.nodeId) != null ? _b : null;
@@ -2522,20 +3497,30 @@ var _BoardView = class _BoardView extends import_obsidian11.TextFileView {
         this.activateNode(node);
     };
     this.onDoubleClick = (evt) => {
-      var _a, _b, _c;
+      var _a, _b, _c, _d;
       const target = evt.target;
       if (!target)
         return;
       if (target.closest(".volis-board-toolbar"))
         return;
-      const nodeId = (_c = (_b = this.lastDownNodeId) != null ? _b : (_a = target.closest(".volis-bnode")) == null ? void 0 : _a.getAttribute("data-node-id")) != null ? _c : null;
+      const group = target.closest(".volis-edge-group");
+      const edgeId = (_a = group == null ? void 0 : group.getAttribute("data-edge-id")) != null ? _a : null;
+      if (edgeId) {
+        const onChip = target.closest(".volis-edge-label-bg, .volis-edge-label") !== null;
+        this.openEdgeLabelEditor(
+          edgeId,
+          onChip ? void 0 : this.toWorld(evt.clientX, evt.clientY)
+        );
+        return;
+      }
+      const nodeId = (_d = (_c = this.lastDownNodeId) != null ? _c : (_b = target.closest(".volis-bnode")) == null ? void 0 : _b.getAttribute("data-node-id")) != null ? _d : null;
       if (nodeId) {
         const node = this.nodeMap.get(nodeId);
         if (!node)
           return;
         if (node.type === "file") {
           const file = this.app.vault.getAbstractFileByPath(node.file);
-          if (file instanceof import_obsidian11.TFile && file.extension.toLowerCase() === "md") {
+          if (file instanceof import_obsidian14.TFile && file.extension.toLowerCase() === "md") {
             void this.openEditor(node);
             return;
           }
@@ -2587,7 +3572,7 @@ var _BoardView = class _BoardView extends import_obsidian11.TextFileView {
       const candidate = plain.trim();
       if (candidate) {
         const direct = this.app.vault.getAbstractFileByPath(candidate);
-        if (direct instanceof import_obsidian11.TFile) {
+        if (direct instanceof import_obsidian14.TFile) {
           await this.addFileNode(direct.path, point);
           return;
         }
@@ -2603,7 +3588,7 @@ var _BoardView = class _BoardView extends import_obsidian11.TextFileView {
             const rel = basePath && full.startsWith(basePath) ? full.slice(basePath.length).replace(/^\//, "") : "";
             if (rel) {
               const inside = this.app.vault.getAbstractFileByPath(rel);
-              if (inside instanceof import_obsidian11.TFile) {
+              if (inside instanceof import_obsidian14.TFile) {
                 await this.addFileNode(inside.path, point);
                 handled = true;
                 continue;
@@ -2664,13 +3649,13 @@ var _BoardView = class _BoardView extends import_obsidian11.TextFileView {
     });
     this.registerEvent(
       this.app.vault.on("modify", (file) => {
-        if (file instanceof import_obsidian11.TFile)
+        if (file instanceof import_obsidian14.TFile)
           void this.refreshNodesForFile(file.path, 80);
       })
     );
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
-        if (file instanceof import_obsidian11.TFile)
+        if (file instanceof import_obsidian14.TFile)
           this.handleFileRename(file.path, oldPath);
       })
     );
@@ -2695,6 +3680,7 @@ var _BoardView = class _BoardView extends import_obsidian11.TextFileView {
         continue;
       await this.renderNode(node);
     }
+    this.scheduleOutlineRefresh();
   }
   handleFileRename(newPath, oldPath) {
     let touched = false;
@@ -2709,14 +3695,24 @@ var _BoardView = class _BoardView extends import_obsidian11.TextFileView {
       this.scheduleSave();
   }
   async onClose() {
+    var _a, _b;
     if (this.saveTimer !== null) {
       window.clearTimeout(this.saveTimer);
       this.saveTimer = null;
+    }
+    if (this.outlineTimer !== null) {
+      window.clearTimeout(this.outlineTimer);
+      this.outlineTimer = null;
     }
     if (this.resizeObserver) {
       this.resizeObserver.disconnect();
       this.resizeObserver = null;
     }
+    this.closeEdgeLabelEditor(false);
+    (_a = this.doctorModal) == null ? void 0 : _a.close();
+    this.doctorModal = null;
+    (_b = this.helpModal) == null ? void 0 : _b.close();
+    this.helpModal = null;
   }
   handleResize() {
     const rect = this.root.getBoundingClientRect();
@@ -2752,7 +3748,7 @@ var _BoardView = class _BoardView extends import_obsidian11.TextFileView {
         cls: "volis-board-btn",
         attr: { "aria-label": label }
       });
-      (0, import_obsidian11.setIcon)(button, icon);
+      (0, import_obsidian14.setIcon)(button, icon);
       button.addEventListener("click", (evt) => {
         evt.preventDefault();
         evt.stopPropagation();
@@ -2770,14 +3766,18 @@ var _BoardView = class _BoardView extends import_obsidian11.TextFileView {
     addButton("image", "\u6DFB\u52A0\u5A92\u4F53\u6587\u4EF6", () => this.openInsertPanelAtCenter("media"));
     toolbar.createDiv({ cls: "volis-board-sep" });
     addButton("plus", "\u653E\u5927", () => this.zoomBy(1.2));
-    addButton("minus", "\u7F29\u5C0F", () => this.zoomBy(1 / 1.2));
     addButton("maximize", "\u603B\u89C8", () => {
       this.fitToContent();
       this.scheduleSave();
     });
+    addButton("minus", "\u7F29\u5C0F", () => this.zoomBy(1 / 1.2));
     toolbar.createDiv({ cls: "volis-board-sep" });
     this.undoBtn = addButton("undo-2", "\u64A4\u9500", () => void this.undo());
     this.redoBtn = addButton("redo-2", "\u91CD\u505A", () => void this.redo());
+    addButton("list-tree", "\u5927\u7EB2", () => this.toggleOutlinePanel());
+    addButton("download", "\u5BFC\u51FA Markdown", () => this.openExportModal());
+    toolbar.createDiv({ cls: "volis-board-sep" });
+    addButton("help-circle", "\u5E2E\u52A9", () => this.openBoardHelp());
     this.updateHistoryButtons();
     this.toolbarEl = this.root.createDiv({ cls: "volis-node-toolbar is-hidden" });
     this.toolbarEl.addEventListener("pointerdown", (evt) => evt.stopPropagation());
@@ -2818,6 +3818,7 @@ var _BoardView = class _BoardView extends import_obsidian11.TextFileView {
       if (!edgeId)
         return;
       evt.stopPropagation();
+      this.lastDownNodeId = null;
       this.selectEdge(edgeId);
     });
     this.resizeObserver = new ResizeObserver(() => this.handleResize());
@@ -2848,7 +3849,7 @@ var _BoardView = class _BoardView extends import_obsidian11.TextFileView {
         this.world.empty();
       this.updateHint();
       this.updateToolbar();
-      new import_obsidian11.Notice("\u767D\u677F\u6587\u4EF6\u65E0\u6CD5\u89E3\u6790\uFF0C\u5DF2\u4FDD\u62A4\u539F\u6587\u4EF6\u4E0D\u88AB\u8986\u76D6");
+      new import_obsidian14.Notice("\u767D\u677F\u6587\u4EF6\u65E0\u6CD5\u89E3\u6790\uFF0C\u5DF2\u4FDD\u62A4\u539F\u6587\u4EF6\u4E0D\u88AB\u8986\u76D6");
       return;
     }
     this.rawFallback = null;
@@ -2864,6 +3865,7 @@ var _BoardView = class _BoardView extends import_obsidian11.TextFileView {
     }
     this.world.style.visibility = "hidden";
     this.hintEl.addClass("is-hidden");
+    this.closeEdgeLabelEditor(false);
     try {
       this.world.empty();
       this.edgesEl = null;
@@ -2886,6 +3888,9 @@ var _BoardView = class _BoardView extends import_obsidian11.TextFileView {
     }
     this.updateHint();
     this.resetHistory();
+    this.outlineSignatureCache = "";
+    if (this.outlinePanel)
+      this.renderOutlinePanel();
   }
   selectedNodes() {
     const out = [];
@@ -2909,7 +3914,7 @@ var _BoardView = class _BoardView extends import_obsidian11.TextFileView {
     if (node.type === "group")
       return;
     const file = this.app.vault.getAbstractFileByPath(node.file);
-    if (!(file instanceof import_obsidian11.TFile))
+    if (!(file instanceof import_obsidian14.TFile))
       return;
     const leaf = this.app.workspace.getLeaf(mode === "window" ? "window" : "tab");
     void leaf.openFile(file);
@@ -2922,8 +3927,8 @@ var _BoardView = class _BoardView extends import_obsidian11.TextFileView {
    */
   async openCardView(node, mode) {
     const source = this.app.vault.getAbstractFileByPath(node.file);
-    if (!(source instanceof import_obsidian11.TFile)) {
-      new import_obsidian11.Notice("\u6E90\u7B14\u8BB0\u4E0D\u5B58\u5728");
+    if (!(source instanceof import_obsidian14.TFile)) {
+      new import_obsidian14.Notice("\u6E90\u7B14\u8BB0\u4E0D\u5B58\u5728");
       return;
     }
     const baseName = source.basename;
@@ -2944,7 +3949,7 @@ var _BoardView = class _BoardView extends import_obsidian11.TextFileView {
       await leaf.openFile(file, { state: { mode: "preview" } });
     } catch (error) {
       console.error("[Volis] open card view failed", error);
-      new import_obsidian11.Notice("\u6253\u5F00\u5361\u7247\u5931\u8D25");
+      new import_obsidian14.Notice("\u6253\u5F00\u5361\u7247\u5931\u8D25");
     }
   }
   /**
@@ -3041,7 +4046,7 @@ var _BoardView = class _BoardView extends import_obsidian11.TextFileView {
       cls: "volis-swatch is-clear",
       attr: { "aria-label": "\u65E0\u989C\u8272" }
     });
-    (0, import_obsidian11.setIcon)(clear, "ban");
+    (0, import_obsidian14.setIcon)(clear, "ban");
     clear.addEventListener("click", () => {
       this.applyNodeColor(nodes, "");
       this.closeColorPop();
@@ -3091,7 +4096,7 @@ var _BoardView = class _BoardView extends import_obsidian11.TextFileView {
         cls: "volis-tool-btn",
         attr: { "aria-label": action.label }
       });
-      (0, import_obsidian11.setIcon)(button, action.icon);
+      (0, import_obsidian14.setIcon)(button, action.icon);
       button.addEventListener("click", () => action.run());
     }
     const rect = this.root.getBoundingClientRect();
@@ -3219,7 +4224,7 @@ var _BoardView = class _BoardView extends import_obsidian11.TextFileView {
     this.scheduleSave();
   }
   showMoreMenu(node, evt) {
-    const menu = new import_obsidian11.Menu();
+    const menu = new import_obsidian14.Menu();
     if (node.type === "text") {
       menu.addItem(
         (item) => item.setTitle("\u8F6C\u4E3A\u5361\u7247\u7B14\u8BB0").setIcon("list").onClick(() => {
@@ -3258,12 +4263,12 @@ var _BoardView = class _BoardView extends import_obsidian11.TextFileView {
       linkpath: ""
     });
     if (meta.stale) {
-      new import_obsidian11.Notice("\u5361\u7247\u5DF2\u4E0D\u5B58\u5728");
+      new import_obsidian14.Notice("\u5361\u7247\u5DF2\u4E0D\u5B58\u5728");
       return;
     }
     const text = meta.editable.trim();
     if (!text) {
-      new import_obsidian11.Notice("\u5361\u7247\u5185\u5BB9\u4E3A\u7A7A");
+      new import_obsidian14.Notice("\u5361\u7247\u5185\u5BB9\u4E3A\u7A7A");
       return;
     }
     const title = this.deriveTitle(text);
@@ -3277,7 +4282,7 @@ ${text}
     const folder = (_a = this.plugin.settings.boardFolder) != null ? _a : "";
     const file = await createNoteFromText(this.app, folder, content, title);
     if (!file) {
-      new import_obsidian11.Notice("\u8F6C\u6362\u5931\u8D25\uFF1A\u65E0\u6CD5\u521B\u5EFA\u7B14\u8BB0");
+      new import_obsidian14.Notice("\u8F6C\u6362\u5931\u8D25\uFF1A\u65E0\u6CD5\u521B\u5EFA\u7B14\u8BB0");
       return;
     }
     const next = {
@@ -3299,7 +4304,7 @@ ${text}
     this.pushHistory();
     this.scheduleSave();
     this.updateToolbar();
-    new import_obsidian11.Notice("\u5DF2\u8F6C\u4E3A\u72EC\u7ACB\u7B14\u8BB0\uFF0C\u6E90\u5361\u7247\u4FDD\u7559");
+    new import_obsidian14.Notice("\u5DF2\u8F6C\u4E3A\u72EC\u7ACB\u7B14\u8BB0\uFF0C\u6E90\u5361\u7247\u4FDD\u7559");
   }
   async convertToCard(node) {
     const current = this.nodeMap.get(node.id);
@@ -3307,13 +4312,13 @@ ${text}
       return;
     const text = current.text.trim();
     if (!text) {
-      new import_obsidian11.Notice("\u5185\u5BB9\u4E3A\u7A7A\uFF0C\u65E0\u6CD5\u8F6C\u6362");
+      new import_obsidian14.Notice("\u5185\u5BB9\u4E3A\u7A7A\uFF0C\u65E0\u6CD5\u8F6C\u6362");
       return;
     }
     const folder = await resolveCardFolder(this.app, this.plugin.settings.cardFolder);
     const result = await appendCard(this.app, folder, text);
     if (!result) {
-      new import_obsidian11.Notice("\u8F6C\u6362\u5931\u8D25\uFF1A\u5199\u5165\u5361\u7247\u6587\u4EF6\u540E\u6821\u9A8C\u672A\u901A\u8FC7");
+      new import_obsidian14.Notice("\u8F6C\u6362\u5931\u8D25\uFF1A\u5199\u5165\u5361\u7247\u6587\u4EF6\u540E\u6821\u9A8C\u672A\u901A\u8FC7");
       return;
     }
     const { x, y, width, height } = current;
@@ -3323,7 +4328,7 @@ ${text}
     this.detachNodeElement(current.id);
     const added = await this.addCardNodeAt(result.file, result.blockId, x, y, width, height);
     if (!added) {
-      new import_obsidian11.Notice("\u5361\u7247\u5DF2\u5199\u5165\u7B14\u8BB0\uFF0C\u4F46\u672A\u80FD\u6DFB\u52A0\u5230\u767D\u677F");
+      new import_obsidian14.Notice("\u5361\u7247\u5DF2\u5199\u5165\u7B14\u8BB0\uFF0C\u4F46\u672A\u80FD\u6DFB\u52A0\u5230\u767D\u677F");
       this.scheduleSave();
       return;
     }
@@ -3333,7 +4338,7 @@ ${text}
     this.updateHint();
     this.pushHistory();
     this.updateToolbar();
-    new import_obsidian11.Notice("\u5DF2\u8F6C\u4E3A\u5361\u7247\u7B14\u8BB0");
+    new import_obsidian14.Notice("\u5DF2\u8F6C\u4E3A\u5361\u7247\u7B14\u8BB0");
   }
   async addCardNodeAt(file, blockId, x, y, width, height) {
     const node = {
@@ -3359,12 +4364,12 @@ ${text}
       return;
     const text = current.text.trim();
     if (!text) {
-      new import_obsidian11.Notice("\u5185\u5BB9\u4E3A\u7A7A\uFF0C\u65E0\u6CD5\u8F6C\u6362");
+      new import_obsidian14.Notice("\u5185\u5BB9\u4E3A\u7A7A\uFF0C\u65E0\u6CD5\u8F6C\u6362");
       return;
     }
     const file = await createNoteFromText(this.app, (_a = this.plugin.settings.boardFolder) != null ? _a : "", text);
     if (!file) {
-      new import_obsidian11.Notice("\u8F6C\u6362\u5931\u8D25\uFF1A\u65E0\u6CD5\u521B\u5EFA\u7B14\u8BB0\u6587\u4EF6");
+      new import_obsidian14.Notice("\u8F6C\u6362\u5931\u8D25\uFF1A\u65E0\u6CD5\u521B\u5EFA\u7B14\u8BB0\u6587\u4EF6");
       return;
     }
     const next = {
@@ -3386,7 +4391,7 @@ ${text}
     this.pushHistory();
     this.scheduleSave();
     this.updateToolbar();
-    new import_obsidian11.Notice("\u5DF2\u8F6C\u4E3A\u72EC\u7ACB\u7B14\u8BB0");
+    new import_obsidian14.Notice("\u5DF2\u8F6C\u4E3A\u72EC\u7ACB\u7B14\u8BB0");
   }
   buildToolbarActions() {
     const single = (nodes) => nodes.length === 1;
@@ -3467,7 +4472,7 @@ ${text}
     try {
       await this.app.fileManager.renameFile(file, `${prefix}${name}.volis`);
     } catch (error) {
-      new import_obsidian11.Notice("\u91CD\u547D\u540D\u5931\u8D25\uFF1A\u540D\u79F0\u53EF\u80FD\u91CD\u590D\u6216\u5305\u542B\u975E\u6CD5\u5B57\u7B26");
+      new import_obsidian14.Notice("\u91CD\u547D\u540D\u5931\u8D25\uFF1A\u540D\u79F0\u53EF\u80FD\u91CD\u590D\u6216\u5305\u542B\u975E\u6CD5\u5B57\u7B26");
     }
   }
   repaintColors() {
@@ -3605,7 +4610,7 @@ ${text}
           attr: { "aria-label": action.label }
         });
         button.disabled = action.enabled ? !action.enabled(nodes) : false;
-        (0, import_obsidian11.setIcon)(button, action.icon);
+        (0, import_obsidian14.setIcon)(button, action.icon);
         button.addEventListener("click", (evt) => {
           evt.preventDefault();
           evt.stopPropagation();
@@ -3747,7 +4752,7 @@ ${text}
   }
   async undo() {
     if (this.hasEditingNode()) {
-      new import_obsidian11.Notice("\u8BF7\u5148\u7ED3\u675F\u7F16\u8F91\u518D\u64A4\u9500");
+      new import_obsidian14.Notice("\u8BF7\u5148\u7ED3\u675F\u7F16\u8F91\u518D\u64A4\u9500");
       return;
     }
     if (this.historyIndex <= 0)
@@ -3758,7 +4763,7 @@ ${text}
   }
   async redo() {
     if (this.hasEditingNode()) {
-      new import_obsidian11.Notice("\u8BF7\u5148\u7ED3\u675F\u7F16\u8F91\u518D\u91CD\u505A");
+      new import_obsidian14.Notice("\u8BF7\u5148\u7ED3\u675F\u7F16\u8F91\u518D\u91CD\u505A");
       return;
     }
     if (this.historyIndex >= this.history.length - 1)
@@ -3794,6 +4799,7 @@ ${text}
       this.nodeEls.delete(id);
     }
     const previousMap = this.nodeMap;
+    this.closeEdgeLabelEditor(false);
     this.nodes = next;
     this.edges = nextEdges;
     this.nodeMap = new Map(next.map((node) => [node.id, node]));
@@ -3944,7 +4950,12 @@ ${text}
         return { x: 1, y: 0 };
     }
   }
-  /** Curve that leaves along the side's normal, like the native canvas does. */
+  /**
+   * Curve that leaves along the side's normal, like the native canvas does.
+   * Returns the control points as well as the path: the label, its editor and
+   * the style bar all need a point along the same curve, so they resolve it
+   * from here instead of each keeping their own idea of "the middle".
+   */
   orientedPath(p1, side1, p2, side2) {
     const dist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
     const offset = Math.max(28, Math.min(150, dist * 0.35));
@@ -3952,7 +4963,40 @@ ${text}
     const n2 = this.sideNormal(side2);
     const c1 = { x: p1.x + n1.x * offset, y: p1.y + n1.y * offset };
     const c2 = { x: p2.x + n2.x * offset, y: p2.y + n2.y * offset };
-    return `M ${p1.x} ${p1.y} C ${c1.x} ${c1.y}, ${c2.x} ${c2.y}, ${p2.x} ${p2.y}`;
+    const curve = { p1, c1, c2, p2 };
+    return { ...curve, d: curvePath(curve) };
+  }
+  /** One edge's geometry, shared by the renderer and the label editor. */
+  edgeGeometry(edge) {
+    var _a, _b;
+    const from = this.nodeMap.get(edge.from);
+    const to = this.nodeMap.get(edge.to);
+    if (!from || !to)
+      return null;
+    const fromSide = (_a = edge.fromSide) != null ? _a : this.nearestSide(from, to.x + to.width / 2, to.y);
+    const toSide = (_b = edge.toSide) != null ? _b : this.nearestSide(to, from.x + from.width / 2, from.y);
+    const start = this.portPoint(from, fromSide);
+    const end = this.portPoint(to, toSide);
+    return this.orientedPath(start, fromSide, end, toSide);
+  }
+  /** Stored label, trimmed and capped. Hand-edited files must not throw. */
+  edgeLabelOf(edge) {
+    const raw = typeof edge.label === "string" ? edge.label.trim() : "";
+    return raw.slice(0, EDGE_LABEL_MAX);
+  }
+  /** What the chip shows: the user's label if present, otherwise the relation
+   *  name, so a semantic edge stays readable without opening the editor. */
+  edgeDisplayLabel(edge) {
+    var _a, _b;
+    const label = this.edgeLabelOf(edge);
+    if (label)
+      return label;
+    return edge.relation ? (_b = (_a = EDGE_RELATION_BY_ID.get(edge.relation)) == null ? void 0 : _a.label) != null ? _b : "" : "";
+  }
+  /** Where the label sits on the line. Missing or out-of-range values in a
+   *  hand-edited file fall back to the middle rather than throwing. */
+  edgeLabelT(edge) {
+    return typeof edge.labelAt === "number" ? clampLabelT(edge.labelAt) : 0.5;
   }
   nearestSide(node, x, y) {
     const height = this.nodeHeight(node);
@@ -3984,7 +5028,7 @@ ${text}
     return (_a = NODE_COLORS.find((item) => item.name === color)) == null ? void 0 : _a.line;
   }
   renderEdges() {
-    var _a, _b, _c;
+    var _a, _b, _c, _d;
     if (!this.edgesEl || !this.world.contains(this.edgesEl))
       this.ensureLayers();
     const svg = this.edgesEl;
@@ -4027,11 +5071,10 @@ ${text}
       const to = this.nodeMap.get(edge.to);
       if (!from || !to)
         continue;
-      const fromSide = (_a = edge.fromSide) != null ? _a : this.nearestSide(from, to.x + to.width / 2, to.y);
-      const toSide = (_b = edge.toSide) != null ? _b : this.nearestSide(to, from.x + from.width / 2, from.y);
-      const start = this.portPoint(from, fromSide);
-      const end = this.portPoint(to, toSide);
-      const d = this.orientedPath(start, fromSide, end, toSide);
+      const geometry = this.edgeGeometry(edge);
+      if (!geometry)
+        continue;
+      const d = geometry.d;
       const group = this.svgNode("g");
       group.setAttribute("class", "volis-edge-group");
       group.dataset.edgeId = edge.id;
@@ -4043,13 +5086,15 @@ ${text}
       const path = this.svgNode("path");
       path.setAttribute("d", d);
       path.setAttribute("class", "volis-edge");
+      const relation = edge.relation ? EDGE_RELATION_BY_ID.get(edge.relation) : void 0;
+      const style = (_a = edge.style) != null ? _a : relation == null ? void 0 : relation.style;
       path.setAttribute("marker-end", "url(#volis-arrow)");
-      if (edge.style === "dashed")
+      if (style === "dashed")
         path.setAttribute("stroke-dasharray", "6 4");
-      const stroke = this.lineColorOf(edge.color);
+      const stroke = (_b = this.lineColorOf(edge.color)) != null ? _b : this.lineColorOf(relation == null ? void 0 : relation.color);
       if (stroke)
         path.style.stroke = stroke;
-      const arrow = (_c = edge.arrow) != null ? _c : "target";
+      const arrow = (_d = (_c = edge.arrow) != null ? _c : relation == null ? void 0 : relation.arrow) != null ? _d : "target";
       if (arrow === "none") {
         path.removeAttribute("marker-end");
       } else {
@@ -4060,8 +5105,72 @@ ${text}
       }
       group.appendChild(hit);
       group.appendChild(path);
+      this.attachEdgeLabel(group, edge, geometry);
       svg.appendChild(group);
     }
+  }
+  /**
+   * Label chip drawn above the stroke at the label's own point on the line: a
+   * rounded plate in the card colour plus a hairline border, so the stroke
+   * reads as interrupted behind the text instead of cutting through it. Both
+   * shapes live in the edge group, so they scale, pan and get selected along
+   * with the line and need no repositioning of their own.
+   */
+  attachEdgeLabel(group, edge, curve) {
+    const stored = this.edgeLabelOf(edge);
+    const label = stored || this.edgeDisplayLabel(edge);
+    if (!label)
+      return;
+    const anchor = curvePoint(curve, this.edgeLabelT(edge));
+    const text = this.svgNode("text");
+    text.setAttribute("class", stored ? "volis-edge-label" : "volis-edge-label is-relation");
+    text.setAttribute("x", String(anchor.x));
+    text.setAttribute("y", String(anchor.y));
+    text.setAttribute("text-anchor", "middle");
+    text.setAttribute("dominant-baseline", "central");
+    text.style.font = this.labelFont();
+    text.textContent = label;
+    const width = this.edgeLabelWidth(label) + EDGE_LABEL_PAD_X * 2;
+    const chip = this.svgNode("rect");
+    chip.setAttribute("class", "volis-edge-label-bg");
+    chip.setAttribute("x", String(anchor.x - width / 2));
+    chip.setAttribute("y", String(anchor.y - EDGE_LABEL_HEIGHT / 2));
+    chip.setAttribute("width", String(width));
+    chip.setAttribute("height", String(EDGE_LABEL_HEIGHT));
+    chip.setAttribute("rx", String(EDGE_LABEL_RADIUS));
+    group.appendChild(chip);
+    group.appendChild(text);
+  }
+  /**
+   * Font spec for a label. The interface font comes from the theme, the rest
+   * from the constants above, and the result is applied inline — reading it
+   * back off the `<text>` element is not an option, because these labels are
+   * measured while the group is still detached (and the board is hidden), where
+   * `getComputedStyle` returns empty values and any measurement built on it
+   * silently falls back to the canvas default.
+   */
+  labelFont() {
+    if (this.labelFontCache)
+      return this.labelFontCache;
+    const family = window.getComputedStyle(this.root).getPropertyValue("--font-interface").trim() || "sans-serif";
+    this.labelFontCache = `500 ${EDGE_LABEL_FONT_SIZE}px ${family}`;
+    return this.labelFontCache;
+  }
+  /**
+   * Rendered width of the label, in board units, from canvas metrics.
+   * `getBBox()`/`getComputedTextLength()` would be exact but report zero
+   * whenever the board is not laid out, so a chip sized from them would
+   * collapse to a dot on load and in a background tab.
+   */
+  edgeLabelWidth(value) {
+    if (!this.labelMetrics) {
+      this.labelMetrics = document.createElement("canvas").getContext("2d");
+      if (this.labelMetrics)
+        this.labelMetrics.font = this.labelFont();
+    }
+    if (!this.labelMetrics)
+      return value.length * EDGE_LABEL_FONT_SIZE;
+    return this.labelMetrics.measureText(value).width;
   }
   /** Small icon sitting on the top border, so the node type stays readable
    *  even when the content is scaled down to an illegible blur. */
@@ -4088,7 +5197,7 @@ ${text}
     }
     const badge = el.createDiv({ cls: "volis-type-badge" });
     badge.dataset.kind = kind;
-    (0, import_obsidian11.setIcon)(badge, icon);
+    (0, import_obsidian14.setIcon)(badge, icon);
   }
   renderGroupBody(el, node) {
     var _a, _b;
@@ -4117,6 +5226,8 @@ ${text}
     input.addEventListener("keydown", (evt) => {
       var _a2;
       evt.stopPropagation();
+      if (evt.isComposing)
+        return;
       if (evt.key === "Enter") {
         evt.preventDefault();
         input.blur();
@@ -4236,6 +5347,14 @@ ${text}
     this.nodeEls.set(node.id, el);
     if (previous && previous !== el)
       previous.remove();
+    if (this.aiPanel && this.aiNumberMap.size >= 2 && this.aiNumberMap.has(node.id)) {
+      const badge = el.createDiv({
+        cls: "volis-ai-node-number",
+        text: this.aiNumberMap.get(node.id)
+      });
+      badge.setAttribute("aria-hidden", "true");
+      this.aiBadges.set(node.id, badge);
+    }
     this.updateToolbar();
     return el;
   }
@@ -4244,7 +5363,7 @@ ${text}
     this.nodeText.set(node.id, node.text);
     if (!node.text.trim())
       return;
-    await import_obsidian11.MarkdownRenderer.render(this.app, node.text, body, "", this);
+    await import_obsidian14.MarkdownRenderer.render(this.app, node.text, body, "", this);
     this.decorateNumericTags(body);
   }
   async renderCardBody(el, node) {
@@ -4262,7 +5381,7 @@ ${text}
     }
     this.nodeText.set(node.id, meta.editable);
     this.nodeMeta.set(node.id, { date: meta.date, time: meta.time, tags: meta.tags });
-    await import_obsidian11.MarkdownRenderer.render(this.app, normalizeTags(meta.body), body, node.file, this);
+    await import_obsidian14.MarkdownRenderer.render(this.app, normalizeTags(meta.body), body, node.file, this);
     this.decorateNumericTags(body);
     const parts = [];
     if (meta.date)
@@ -4295,11 +5414,11 @@ ${text}
   async renderFileBody(el, node) {
     el.addClass("is-file");
     const file = this.app.vault.getAbstractFileByPath(node.file);
-    if (file instanceof import_obsidian11.TFile) {
+    if (file instanceof import_obsidian14.TFile) {
       const isNote = file.extension.toLowerCase() === "md";
       this.nodeText.set(node.id, isNote ? await this.readNoteText(file) : file.basename);
     }
-    if (!(file instanceof import_obsidian11.TFile)) {
+    if (!(file instanceof import_obsidian14.TFile)) {
       this.staleIds.add(node.id);
       el.createDiv({ cls: "volis-bnode-placeholder", text: "\u6587\u4EF6\u7F3A\u5931" });
       return;
@@ -4317,7 +5436,7 @@ ${text}
         content = "";
       }
       if (content.trim()) {
-        await import_obsidian11.MarkdownRenderer.render(this.app, content, body, file.path, this);
+        await import_obsidian14.MarkdownRenderer.render(this.app, content, body, file.path, this);
         this.decorateNumericTags(body);
       } else {
         body.createDiv({ cls: "volis-bnode-placeholder", text: "\u7A7A\u7B14\u8BB0" });
@@ -4431,6 +5550,7 @@ ${text}
     this.zoomEl.setText(`${Math.round(this.scale * 100)}%`);
     this.updateToolbar();
     this.updateEdgeBar();
+    this.syncEdgeLabelEditor();
     this.updateMinimap();
   }
   toWorld(clientX, clientY) {
@@ -4456,14 +5576,14 @@ ${text}
   }
   showBoardMenu(evt) {
     var _a;
-    const menu = new import_obsidian11.Menu();
-    const stale = this.staleIds.size;
+    const menu = new import_obsidian14.Menu();
+    const issueCount = scanBoard(this.doctorInput()).length;
     menu.addItem(
       (item) => item.setTitle("\u67E5\u627E\u8282\u70B9").setIcon("search").onClick(() => this.openNodeSearch())
     );
     menu.addSeparator();
     menu.addItem(
-      (item) => item.setTitle(stale > 0 ? `\u6E05\u7406\u5931\u6548\u8282\u70B9\uFF08${stale}\uFF09` : "\u6CA1\u6709\u5931\u6548\u8282\u70B9").setIcon("eraser").setDisabled(stale === 0).onClick(() => this.cleanupStaleNodes())
+      (item) => item.setTitle(issueCount > 0 ? `\u767D\u677F\u4F53\u68C0\uFF08${issueCount}\uFF09` : "\u767D\u677F\u4F53\u68C0").setIcon("stethoscope").onClick(() => this.openBoardDoctor())
     );
     const rect = (_a = this.moreBtn) == null ? void 0 : _a.getBoundingClientRect();
     if (!rect) {
@@ -4476,6 +5596,131 @@ ${text}
       dom.style.left = `${Math.max(8, Math.round(rect.right - dom.offsetWidth + 16))}px`;
       dom.style.top = `${Math.round(rect.bottom + 6)}px`;
     }
+  }
+  /** Snapshot for the read-only scan. Reuses the view's own maps and caches. */
+  doctorInput() {
+    return {
+      nodes: this.nodes,
+      edges: this.edges,
+      staleIds: this.staleIds,
+      textOf: (node) => {
+        var _a;
+        return (_a = this.nodeText.get(node.id)) != null ? _a : node.type === "text" ? node.text : "";
+      },
+      heightOf: (node) => this.nodeHeight(node),
+      memberIdsOf: (group) => this.groupMembers(group).map((member) => member.id)
+    };
+  }
+  /** Opens the health report. Scanning is read-only; nothing is applied here. */
+  openBoardDoctor() {
+    var _a;
+    const issues = scanBoard(this.doctorInput());
+    const actions = {
+      locate: (issue) => this.locateDoctorIssue(issue),
+      removeNode: (id) => this.confirmDoctorRemoveNode(id),
+      removeEdge: (id) => this.confirmDoctorRemoveEdge(id),
+      addLabel: (id) => {
+        var _a2;
+        if (!this.centerOnEdge(id))
+          return;
+        (_a2 = this.doctorModal) == null ? void 0 : _a2.close();
+        this.doctorModal = null;
+        window.setTimeout(() => this.openEdgeLabelEditor(id), 0);
+      },
+      rescan: () => this.openBoardDoctor(),
+      offset: () => ({ ...this.doctorOffset }),
+      moved: (offset) => {
+        this.doctorOffset = { ...offset };
+      }
+    };
+    (_a = this.doctorModal) == null ? void 0 : _a.close();
+    this.doctorModal = new BoardDoctorModal(this.app, issues, actions);
+    this.doctorModal.open();
+  }
+  /** Read-only reference for the gestures available inside this board. */
+  openBoardHelp() {
+    var _a;
+    (_a = this.helpModal) == null ? void 0 : _a.close();
+    this.helpModal = new ShortcutHelpModal(this.app);
+    this.helpModal.open();
+  }
+  /** Jump to the subject of a finding without changing any board data. */
+  locateDoctorIssue(issue) {
+    const firstId = issue.nodeIds[0];
+    if (firstId) {
+      const node = this.nodeMap.get(firstId);
+      if (node) {
+        this.centerOnNode(node);
+        return;
+      }
+    }
+    if (!issue.edgeId)
+      return;
+    this.centerOnEdge(issue.edgeId);
+  }
+  /**
+   * Centre and select a connection. Shared by the report's "定位" and by
+   * "添加标签", so the inline editor always opens where the user can see it.
+   */
+  centerOnEdge(edgeId) {
+    const edge = this.edges.find((item) => item.id === edgeId);
+    if (!edge)
+      return false;
+    this.selectedEdgeId = edge.id;
+    this.selection.clear();
+    this.paintSelection();
+    this.paintEdgeSelection();
+    this.updateEdgeBar();
+    const curve = this.edgeGeometry(edge);
+    if (curve) {
+      const anchor = curvePoint(curve, this.edgeLabelT(edge));
+      const rect = this.root.getBoundingClientRect();
+      this.tx = rect.width / 2 - anchor.x * this.scale;
+      this.ty = rect.height / 2 - anchor.y * this.scale;
+      this.applyTransform();
+      this.scheduleSave();
+    }
+    return true;
+  }
+  confirmDoctorRemoveNode(nodeId) {
+    var _a;
+    const node = this.nodeMap.get(nodeId);
+    if (!node)
+      return;
+    if ((_a = this.nodeEls.get(nodeId)) == null ? void 0 : _a.hasClass("volis-editing")) {
+      new import_obsidian14.Notice("\u8BF7\u5148\u7ED3\u675F\u8FD9\u5F20\u5361\u7247\u7684\u7F16\u8F91\u518D\u79FB\u9664");
+      return;
+    }
+    new ConfirmModal(
+      this.app,
+      "\u79FB\u9664\u8FD9\u4E2A\u8282\u70B9\uFF1F",
+      `\u5C06\u4ECE\u767D\u677F\u79FB\u9664\u300C${doctorNodeName(node)}\u300D\uFF0C\u76F8\u5173\u8FDE\u7EBF\u4E00\u5E76\u6E05\u9664\u3002\u6E90\u7B14\u8BB0\u4E0D\u4F1A\u88AB\u4FEE\u6539\uFF0C\u53EF\u6309 Ctrl+Z \u64A4\u9500\u3002`,
+      "\u79FB\u9664\u8282\u70B9",
+      () => {
+        this.selection.clear();
+        this.selection.add(nodeId);
+        this.deleteSelection();
+        new import_obsidian14.Notice("\u5DF2\u79FB\u9664\u8282\u70B9\uFF0C\u53EF\u6309 Ctrl+Z \u64A4\u9500");
+        this.openBoardDoctor();
+      }
+    ).open();
+  }
+  confirmDoctorRemoveEdge(edgeId) {
+    const edge = this.edges.find((item) => item.id === edgeId);
+    if (!edge)
+      return;
+    new ConfirmModal(
+      this.app,
+      "\u5220\u9664\u8FD9\u6761\u8FDE\u7EBF\uFF1F",
+      "\u53EA\u5220\u9664\u8FD9\u6761\u8FDE\u7EBF\uFF0C\u8282\u70B9\u4E0D\u53D7\u5F71\u54CD\uFF0C\u53EF\u6309 Ctrl+Z \u64A4\u9500\u3002",
+      "\u5220\u9664\u8FDE\u7EBF",
+      () => {
+        this.selectedEdgeId = edgeId;
+        this.deleteSelectedEdge();
+        new import_obsidian14.Notice("\u5DF2\u5220\u9664\u8FDE\u7EBF\uFF0C\u53EF\u6309 Ctrl+Z \u64A4\u9500");
+        this.openBoardDoctor();
+      }
+    ).open();
   }
   /**
    * Drops connections whose endpoints no longer exist. Both delete paths call
@@ -4492,32 +5737,10 @@ ${text}
       this.selectedEdgeId = null;
       this.updateEdgeBar();
     }
-  }
-  cleanupStaleNodes() {
-    if (this.hasEditingNode()) {
-      new import_obsidian11.Notice("\u8BF7\u5148\u7ED3\u675F\u7F16\u8F91\u518D\u6E05\u7406");
-      return;
+    const editor = this.edgeLabelEditor;
+    if (editor && !this.edges.some((edge) => edge.id === editor.edgeId)) {
+      this.closeEdgeLabelEditor(false);
     }
-    if (this.staleIds.size === 0)
-      return;
-    const ids = new Set(this.staleIds);
-    this.nodes = this.nodes.filter((node) => !ids.has(node.id));
-    for (const id of ids) {
-      const el = this.nodeEls.get(id);
-      if (el)
-        el.remove();
-      this.nodeEls.delete(id);
-      this.nodeMap.delete(id);
-      this.selection.delete(id);
-    }
-    this.staleIds.clear();
-    this.pruneEdges();
-    this.renderEdges();
-    this.updateFrame();
-    this.updateHint();
-    this.pushHistory();
-    this.scheduleSave();
-    new import_obsidian11.Notice(`\u5DF2\u6E05\u7406 ${ids.size} \u4E2A\u5931\u6548\u8282\u70B9\uFF0C\u53EF\u6309 Ctrl+Z \u64A4\u9500`);
   }
   updateHistoryButtons() {
     if (this.undoBtn)
@@ -4647,6 +5870,7 @@ ${text}
       document.removeEventListener("mousedown", this.aiOutside, true);
       this.aiOutside = null;
     }
+    this.clearNodeNumbers();
     (_a = this.aiPanel) == null ? void 0 : _a.remove();
     this.aiPanel = null;
   }
@@ -4699,7 +5923,15 @@ ${text}
         color: "color" in node ? node.color : void 0
       });
     }
-    const edges = this.edges.filter((edge) => present.has(edge.from) && present.has(edge.to)).map((edge) => ({ from: edge.from, to: edge.to, label: edge.label }));
+    const edges = this.edges.filter((edge) => present.has(edge.from) && present.has(edge.to)).map((edge) => {
+      var _a2;
+      return {
+        from: edge.from,
+        to: edge.to,
+        label: edge.label,
+        relation: edge.relation ? (_a2 = EDGE_RELATION_BY_ID.get(edge.relation)) == null ? void 0 : _a2.label : void 0
+      };
+    });
     return { nodes: inputs, groups, edges };
   }
   /** Tokens available for board content: window minus answer minus safety. */
@@ -4716,11 +5948,17 @@ ${text}
    * turns. `force` is used after an edit or when the model profile changes.
    */
   ensureSystem(profile, force = false) {
-    const key = this.aiTargets.map((node) => {
+    const nodeKey = this.aiTargets.map((node) => {
       var _a;
       const text = (_a = this.nodeText.get(node.id)) != null ? _a : "";
       return `${node.id}:${node.type}:${text.length}:${"label" in node ? node.label : ""}`;
     }).join("|");
+    const targetIds = new Set(this.aiTargets.map((node) => node.id));
+    const edgeKey = this.edges.filter((edge) => targetIds.has(edge.from) && targetIds.has(edge.to)).map((edge) => {
+      var _a;
+      return `${edge.from}>${edge.to}:${(_a = edge.label) != null ? _a : ""}`;
+    }).join("|");
+    const key = `${nodeKey}#${edgeKey}`;
     if (!force && key === this.aiSystemKey && this.aiSystem.length > 0)
       return;
     const policy = this.plugin.settings.ai.policy;
@@ -4730,6 +5968,9 @@ ${text}
       policy
     );
     this.aiManifest = result.manifest;
+    this.aiNumberMap = new Map(
+      result.manifest.nodes.map((node) => [node.tag, node.id])
+    );
     this.aiSystemKey = key;
     this.aiSystem = [
       { text: AI_ROLE_PROMPT },
@@ -4749,15 +5990,38 @@ ${result.text}`, cache: true }
           if (node.type !== "file")
             return;
           const file = this.app.vault.getAbstractFileByPath(node.file);
-          if (!(file instanceof import_obsidian11.TFile))
+          if (!(file instanceof import_obsidian14.TFile))
             return;
           this.nodeText.set(node.id, await this.readNoteText(file));
         })
       ).then(() => {
         this.aiNotesLoading = false;
         this.ensureSystem(profile, true);
+        this.applyNodeNumbers();
       });
     }
+  }
+  /**
+   * Number badges are decoration only: they live on the node element, never in
+   * the board JSON, and disappear when the AI panel closes.
+   */
+  applyNodeNumbers() {
+    this.clearNodeNumbers();
+    if (this.aiNumberMap.size < 2)
+      return;
+    for (const [tag, nodeId] of this.aiNumberMap) {
+      const el = this.nodeEls.get(nodeId);
+      if (!el || el.querySelector(":scope > .volis-ai-node-number"))
+        continue;
+      const badge = el.createDiv({ cls: "volis-ai-node-number", text: tag });
+      badge.setAttribute("aria-hidden", "true");
+      this.aiBadges.set(nodeId, badge);
+    }
+  }
+  clearNodeNumbers() {
+    for (const badge of this.aiBadges.values())
+      badge.remove();
+    this.aiBadges.clear();
   }
   historyTokens() {
     return this.aiHistory.reduce((sum, message) => sum + estimateTokens(message.content), 0);
@@ -4812,7 +6076,7 @@ ${summary.trim()}`;
     this.aiHistory = head.role === "user" ? [{ role: "user", content: `${block}
 
 ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...recent];
-    new import_obsidian11.Notice("\u5BF9\u8BDD\u8F83\u957F\uFF0C\u65E9\u671F\u7684\u5F80\u6765\u5DF2\u538B\u7F29\u4E3A\u6458\u8981\uFF08\u767D\u677F\u5185\u5BB9\u4E0D\u53D7\u5F71\u54CD\uFF09");
+    new import_obsidian14.Notice("\u5BF9\u8BDD\u8F83\u957F\uFF0C\u65E9\u671F\u7684\u5F80\u6765\u5DF2\u538B\u7F29\u4E3A\u6458\u8981\uFF08\u767D\u677F\u5185\u5BB9\u4E0D\u53D7\u5F71\u54CD\uFF09");
   }
   openAIPanel() {
     var _a;
@@ -4820,19 +6084,19 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     const profile = activeProfile(this.plugin.settings.ai);
     const provider = createProvider(profile);
     if (!this.plugin.settings.ai.enabled || !provider.configured) {
-      new import_obsidian11.Notice("\u8BF7\u5148\u5728\u8BBE\u7F6E\u4E2D\u542F\u7528 AI \u5E76\u6DFB\u52A0\u4E00\u4E2A\u6A21\u578B\u914D\u7F6E");
+      new import_obsidian14.Notice("\u8BF7\u5148\u5728\u8BBE\u7F6E\u4E2D\u542F\u7528 AI \u5E76\u6DFB\u52A0\u4E00\u4E2A\u6A21\u578B\u914D\u7F6E");
       return;
     }
     const selected = this.selectedNodes();
     const expanded = selected.length > 0 ? this.expandGroups(selected) : [];
     const contentNodes = expanded.filter((node) => node.type !== "group");
     if (selected.length > 0 && contentNodes.length === 0) {
-      new import_obsidian11.Notice("\u9009\u4E2D\u7684\u5206\u7EC4\u91CC\u8FD8\u6CA1\u6709\u5185\u5BB9\uFF0C\u5148\u628A\u5361\u7247\u653E\u8FDB\u53BB\u518D\u5206\u6790");
+      new import_obsidian14.Notice("\u9009\u4E2D\u7684\u5206\u7EC4\u91CC\u8FD8\u6CA1\u6709\u5185\u5BB9\uFF0C\u5148\u628A\u5361\u7247\u653E\u8FDB\u53BB\u518D\u5206\u6790");
       return;
     }
     const targets = expanded.length > 0 ? expanded : this.nodes.slice(0, 200);
     if (targets.length === 0) {
-      new import_obsidian11.Notice("\u767D\u677F\u4E0A\u8FD8\u6CA1\u6709\u8282\u70B9");
+      new import_obsidian14.Notice("\u767D\u677F\u4E0A\u8FD8\u6CA1\u6709\u8282\u70B9");
       return;
     }
     const targetCount = targets.filter((node) => node.type !== "group").length || targets.length;
@@ -4849,6 +6113,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     this.aiConversationId = null;
     this.aiExpanded = false;
     this.ensureSystem(profile, true);
+    this.applyNodeNumbers();
     const rect = this.root.getBoundingClientRect();
     const box = this.selectionBox(targets);
     const panel = this.root.createDiv({ cls: "volis-ai-panel" });
@@ -4857,7 +6122,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     panel.addEventListener("dblclick", (evt) => evt.stopPropagation());
     const head = panel.createDiv({ cls: "volis-ai-head" });
     const headIcon = head.createDiv({ cls: "volis-ai-head-icon" });
-    (0, import_obsidian11.setIcon)(headIcon, "sparkles");
+    (0, import_obsidian14.setIcon)(headIcon, "sparkles");
     head.createDiv({
       cls: "volis-ai-head-title",
       text: `${selected.length > 0 ? "\u5206\u6790\u9009\u4E2D\u7684" : "\u5206\u6790\u5168\u90E8"} ${targetCount} \u4E2A\u8282\u70B9`
@@ -4868,22 +6133,22 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       cls: "volis-ai-head-btn",
       attr: { "aria-label": "\u65B0\u5BF9\u8BDD" }
     });
-    (0, import_obsidian11.setIcon)(newBtn, "square-pen");
+    (0, import_obsidian14.setIcon)(newBtn, "square-pen");
     const historyBtn = head.createEl("button", {
       cls: "volis-ai-head-btn",
       attr: { "aria-label": "\u5386\u53F2\u5BF9\u8BDD" }
     });
-    (0, import_obsidian11.setIcon)(historyBtn, "history");
+    (0, import_obsidian14.setIcon)(historyBtn, "history");
     const expandBtn = head.createEl("button", {
       cls: "volis-ai-head-btn",
       attr: { "aria-label": "\u5C55\u5F00" }
     });
-    (0, import_obsidian11.setIcon)(expandBtn, "maximize-2");
+    (0, import_obsidian14.setIcon)(expandBtn, "maximize-2");
     const closeBtn = head.createEl("button", {
       cls: "volis-ai-head-btn",
       attr: { "aria-label": "\u5173\u95ED" }
     });
-    (0, import_obsidian11.setIcon)(closeBtn, "x");
+    (0, import_obsidian14.setIcon)(closeBtn, "x");
     const stream = panel.createDiv({ cls: "volis-ai-stream" });
     const dock = panel.createDiv({ cls: "volis-ai-dock" });
     const compose = dock.createDiv({ cls: "volis-ai-compose" });
@@ -4895,7 +6160,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       cls: "volis-ai-send",
       attr: { "aria-label": "\u53D1\u9001" }
     });
-    (0, import_obsidian11.setIcon)(sendBtn, "arrow-up");
+    (0, import_obsidian14.setIcon)(sendBtn, "arrow-up");
     const actions = dock.createDiv({ cls: "volis-ai-actions" });
     const insertBtn = actions.createEl("button", {
       cls: "volis-ai-btn is-primary",
@@ -5042,19 +6307,19 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     };
     const appendCopy = (host, text) => {
       const button = host.createEl("button", { cls: "volis-ai-reply-icon" });
-      (0, import_obsidian11.setIcon)(button, "copy");
+      (0, import_obsidian14.setIcon)(button, "copy");
       button.addEventListener("click", (evt) => {
         evt.stopPropagation();
         void navigator.clipboard.writeText(text).then(
           () => {
-            (0, import_obsidian11.setIcon)(button, "check");
+            (0, import_obsidian14.setIcon)(button, "check");
             button.addClass("is-done");
             window.setTimeout(() => {
-              (0, import_obsidian11.setIcon)(button, "copy");
+              (0, import_obsidian14.setIcon)(button, "copy");
               button.removeClass("is-done");
             }, 1200);
           },
-          () => new import_obsidian11.Notice("\u590D\u5236\u5931\u8D25\uFF0C\u8BF7\u68C0\u67E5\u526A\u8D34\u677F\u6743\u9650")
+          () => new import_obsidian14.Notice("\u590D\u5236\u5931\u8D25\uFF0C\u8BF7\u68C0\u67E5\u526A\u8D34\u677F\u6743\u9650")
         );
       });
     };
@@ -5065,8 +6330,10 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       const row = stream.createDiv({ cls: "volis-ai-msg is-ai" });
       row.dataset.answerIndex = String(index);
       appendContext(row, snapshot);
+      const refMap = snapshot ? new Map(snapshot.nodes.map((node) => [node.tag, node.id])) : this.aiNumberMap;
       const body = row.createDiv({ cls: "volis-ai-reply" });
-      await import_obsidian11.MarkdownRenderer.render(this.app, this.decorateAnswer(text), body, "", this);
+      await import_obsidian14.MarkdownRenderer.render(this.app, this.decorateAnswer(text, refMap), body, "", this);
+      this.linkAnswerRefs(body, refMap);
       const bar = row.createDiv({ cls: "volis-ai-reply-bar" });
       appendCopy(bar, text);
       if (selectable) {
@@ -5132,7 +6399,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       });
       const bar = body.createDiv({ cls: "volis-ai-reply-bar" });
       const retryBtn = bar.createEl("button", { cls: "volis-ai-reply-icon" });
-      (0, import_obsidian11.setIcon)(retryBtn, "rotate-ccw");
+      (0, import_obsidian14.setIcon)(retryBtn, "rotate-ccw");
       retryBtn.addEventListener("click", (evt) => {
         evt.stopPropagation();
         retry();
@@ -5143,7 +6410,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       this.aiBusy = value;
       input.disabled = value;
       sendBtn.empty();
-      (0, import_obsidian11.setIcon)(sendBtn, value ? "square" : "arrow-up");
+      (0, import_obsidian14.setIcon)(sendBtn, value ? "square" : "arrow-up");
       sendBtn.toggleClass("is-stop", value);
       sendBtn.setAttribute("aria-label", value ? "\u505C\u6B62\u751F\u6210" : "\u53D1\u9001");
       if (value) {
@@ -5167,6 +6434,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
         usedTokens: this.aiManifest.usedTokens,
         stage: this.aiManifest.stage,
         nodes: this.aiManifest.nodes.map((node) => ({
+          id: node.id,
           tag: node.tag,
           label: node.label,
           charsSent: node.charsSent,
@@ -5186,7 +6454,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       this.ensureSystem(profile);
       await this.compactHistory(profile);
       if (snapshot && snapshot.notes.length > 0) {
-        new import_obsidian11.Notice(`\u672C\u6B21\u5DF2\u8BFB\u53D6\u4E0A\u4E0B\u6587\uFF1A${snapshot.notes.join("\uFF1B")}`.slice(0, 160));
+        new import_obsidian14.Notice(`\u672C\u6B21\u5DF2\u8BFB\u53D6\u4E0A\u4E0B\u6587\uFF1A${snapshot.notes.join("\uFF1B")}`.slice(0, 160));
       }
       this.aiHistory.push({ role: "user", content: question });
       let result = null;
@@ -5251,9 +6519,9 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
         await addAiBubble(reply, snapshot);
         this.persistConversation(question);
         if (continueFailed) {
-          new import_obsidian11.Notice("\u7EED\u5199\u5931\u8D25\uFF0C\u8FD9\u6B21\u7B54\u590D\u53EF\u80FD\u4E0D\u5B8C\u6574");
+          new import_obsidian14.Notice("\u7EED\u5199\u5931\u8D25\uFF0C\u8FD9\u6B21\u7B54\u590D\u53EF\u80FD\u4E0D\u5B8C\u6574");
         } else if (result.truncated) {
-          new import_obsidian11.Notice("\u56DE\u7B54\u4ECD\u88AB\u957F\u5EA6\u4E0A\u9650\u622A\u65AD\uFF0C\u53EF\u5728\u6A21\u578B\u914D\u7F6E\u91CC\u8C03\u5927\u300C\u5355\u6B21\u8F93\u51FA\u4E0A\u9650\u300D");
+          new import_obsidian14.Notice("\u56DE\u7B54\u4ECD\u88AB\u957F\u5EA6\u4E0A\u9650\u622A\u65AD\uFF0C\u53EF\u5728\u6A21\u578B\u914D\u7F6E\u91CC\u8C03\u5927\u300C\u5355\u6B21\u8F93\u51FA\u4E0A\u9650\u300D");
         }
         insertBtn.disabled = false;
         noteBtn.disabled = false;
@@ -5295,7 +6563,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
         (_b = this.aiPending) == null ? void 0 : _b.row.remove();
         this.aiPending = null;
         setBusy(false);
-        new import_obsidian11.Notice("\u5DF2\u505C\u6B62\u751F\u6210");
+        new import_obsidian14.Notice("\u5DF2\u505C\u6B62\u751F\u6210");
         return;
       }
       void ask();
@@ -5315,18 +6583,27 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       input.focus();
     });
     this.aiRestore = (conv) => {
-      var _a2;
+      var _a2, _b;
       stream.empty();
       const answers = conv.messages.filter((message) => message.role === "assistant").map((message) => message.content);
       this.aiAnswers = [];
       this.aiSnapshots = [];
       this.aiPicked = /* @__PURE__ */ new Set();
+      const firstSnapshot = (_a2 = conv.messages.find(
+        (message) => message.role === "assistant" && message.send
+      )) == null ? void 0 : _a2.send;
+      if (firstSnapshot) {
+        this.aiNumberMap = new Map(
+          firstSnapshot.nodes.map((node) => [node.tag, node.id])
+        );
+        this.applyNodeNumbers();
+      }
       for (const message of conv.messages) {
         if (message.role === "user") {
           addUserBubble(message.content);
           continue;
         }
-        void addAiBubble(message.content, (_a2 = message.send) != null ? _a2 : null, true);
+        void addAiBubble(message.content, (_b = message.send) != null ? _b : null, true);
       }
       this.aiPicked.clear();
       refreshPicks();
@@ -5336,7 +6613,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     expandBtn.addEventListener("click", () => {
       this.aiExpanded = !this.aiExpanded;
       panel.toggleClass("is-expanded", this.aiExpanded);
-      (0, import_obsidian11.setIcon)(expandBtn, this.aiExpanded ? "minimize-2" : "maximize-2");
+      (0, import_obsidian14.setIcon)(expandBtn, this.aiExpanded ? "minimize-2" : "maximize-2");
       place();
     });
     closeBtn.addEventListener("click", () => this.closeAiPanel());
@@ -5359,7 +6636,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
         "AI \u6574\u7406"
       ).then((file) => {
         if (file)
-          new import_obsidian11.Notice(`\u5DF2\u4FDD\u5B58\u4E3A ${file.basename}`);
+          new import_obsidian14.Notice(`\u5DF2\u4FDD\u5B58\u4E3A ${file.basename}`);
       });
       this.closeAiPanel();
     });
@@ -5380,10 +6657,10 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
         () => {
           void this.overwriteNode(overwriteTarget, text).then((ok) => {
             if (ok) {
-              new import_obsidian11.Notice("\u5DF2\u8986\u76D6\u539F\u8282\u70B9\u5185\u5BB9\uFF0C\u53EF\u6309 Ctrl+Z \u64A4\u9500");
+              new import_obsidian14.Notice("\u5DF2\u8986\u76D6\u539F\u8282\u70B9\u5185\u5BB9\uFF0C\u53EF\u6309 Ctrl+Z \u64A4\u9500");
               this.closeAiPanel();
             } else {
-              new import_obsidian11.Notice("\u8986\u76D6\u5931\u8D25");
+              new import_obsidian14.Notice("\u8986\u76D6\u5931\u8D25");
             }
           });
         }
@@ -5441,9 +6718,10 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     if (alive.length > 0)
       this.aiTargets = this.expandGroups(alive);
     this.ensureSystem(activeProfile(this.plugin.settings.ai), true);
+    this.applyNodeNumbers();
     (_a = this.aiRestore) == null ? void 0 : _a.call(this, conversation);
     if (alive.length < conversation.nodeIds.length) {
-      new import_obsidian11.Notice("\u90E8\u5206\u8282\u70B9\u5DF2\u4E0D\u5B58\u5728\uFF0C\u8FD9\u6B21\u5BF9\u8BDD\u53EA\u80FD\u67E5\u770B\uFF0C\u8FFD\u95EE\u65F6 AI \u770B\u4E0D\u5230\u5B83\u4EEC");
+      new import_obsidian14.Notice("\u90E8\u5206\u8282\u70B9\u5DF2\u4E0D\u5B58\u5728\uFF0C\u8FD9\u6B21\u5BF9\u8BDD\u53EA\u80FD\u67E5\u770B\uFF0C\u8FFD\u95EE\u65F6 AI \u770B\u4E0D\u5230\u5B83\u4EEC");
     }
   }
   deleteConversation(id) {
@@ -5508,7 +6786,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       if (conversation.id === this.aiConversationId)
         row.addClass("is-current");
       const iconEl = row.createDiv({ cls: "volis-ai-history-icon" });
-      (0, import_obsidian11.setIcon)(iconEl, "message-square");
+      (0, import_obsidian14.setIcon)(iconEl, "message-square");
       const body = row.createDiv({ cls: "volis-ai-history-body" });
       body.createDiv({ cls: "volis-ai-history-name", text: conversation.title });
       body.createDiv({
@@ -5519,7 +6797,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
         cls: "volis-ai-history-del",
         attr: { "aria-label": "\u5220\u9664\u8FD9\u6761\u8BB0\u5F55" }
       });
-      (0, import_obsidian11.setIcon)(del, "trash-2");
+      (0, import_obsidian14.setIcon)(del, "trash-2");
       del.addEventListener("click", (evt) => {
         evt.stopPropagation();
         this.deleteConversation(conversation.id);
@@ -5549,20 +6827,81 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     };
     document.addEventListener("mousedown", this.historyOutside, true);
   }
-  /** Turns bare references like N3 into N3「content preview」 so the reader can
-   *  tell which card is meant without looking at the board. */
-  decorateAnswer(text) {
+  /**
+   * Turns bare references like N3 into N3「content preview」. The lookup uses
+   * the explicit N→id map, never the targets array: a selected group occupies
+   * a slot there and would shift every number by one.
+   */
+  decorateAnswer(text, map) {
     return text.replace(/\bN(\d+)\b/g, (match, digits) => {
       var _a;
-      const node = this.aiTargets[Number(digits) - 1];
-      if (!node)
+      const nodeId = map.get(`N${digits}`);
+      if (!nodeId)
         return match;
-      const preview = ((_a = this.nodeText.get(node.id)) != null ? _a : "").replace(/\s+/g, " ").trim();
+      const preview = ((_a = this.nodeText.get(nodeId)) != null ? _a : "").replace(/\s+/g, " ").trim();
       if (!preview)
         return match;
       const short = preview.length > 12 ? `${preview.slice(0, 12)}\u2026` : preview;
       return `${match}\u300C${short}\u300D`;
     });
+  }
+  /**
+   * After Markdown is rendered, turn N1「…」 into a clickable reference. Doing
+   * this on the DOM keeps the copied answer as plain Markdown.
+   */
+  linkAnswerRefs(host, map) {
+    var _a, _b, _c;
+    if (map.size === 0)
+      return;
+    const walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT);
+    const texts = [];
+    while (walker.nextNode())
+      texts.push(walker.currentNode);
+    const pattern = /\b(N\d+)「[^」]*」/g;
+    for (const textNode of texts) {
+      const value = (_a = textNode.textContent) != null ? _a : "";
+      const matches = Array.from(value.matchAll(pattern));
+      if (matches.length === 0)
+        continue;
+      const fragment = document.createDocumentFragment();
+      let cursor = 0;
+      for (const match of matches) {
+        const index = (_b = match.index) != null ? _b : 0;
+        if (index > cursor) {
+          fragment.appendChild(document.createTextNode(value.slice(cursor, index)));
+        }
+        const tag = match[1];
+        const nodeId = map.get(tag);
+        if (!nodeId) {
+          fragment.appendChild(document.createTextNode(match[0]));
+        } else {
+          const button = document.createElement("button");
+          button.className = "volis-ai-nref";
+          button.type = "button";
+          button.textContent = match[0];
+          button.addEventListener("click", (evt) => {
+            evt.stopPropagation();
+            evt.preventDefault();
+            this.jumpToNumberedNode(nodeId);
+          });
+          fragment.appendChild(button);
+        }
+        cursor = index + match[0].length;
+      }
+      if (cursor < value.length) {
+        fragment.appendChild(document.createTextNode(value.slice(cursor)));
+      }
+      (_c = textNode.parentNode) == null ? void 0 : _c.replaceChild(fragment, textNode);
+    }
+  }
+  /** Centre and briefly highlight the node an answer referred to. */
+  jumpToNumberedNode(nodeId) {
+    const node = this.nodeMap.get(nodeId);
+    if (!node || !this.nodeEls.has(nodeId)) {
+      new import_obsidian14.Notice("\u8FD9\u4E2A\u8282\u70B9\u5DF2\u7ECF\u4E0D\u5728\u5F53\u524D\u767D\u677F\u4E0A\u4E86");
+      return;
+    }
+    this.centerOnNode(node);
   }
   /** Selected text inside the panel, otherwise the latest full answer. */
   replyTextForOverwrite() {
@@ -5585,9 +6924,9 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       const line = raw.trim();
       if (!line)
         continue;
-      const heading = /^#{1,6}\s+(.*)$/.exec(line);
-      if (heading) {
-        out.push(`**${heading[1].replace(/\*\*/g, "")}**`);
+      const heading2 = /^#{1,6}\s+(.*)$/.exec(line);
+      if (heading2) {
+        out.push(`**${heading2[1].replace(/\*\*/g, "")}**`);
         continue;
       }
       const bullet = /^[-*+]\s+(.*)$/.exec(line);
@@ -5622,7 +6961,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       await this.renderNode(node);
     } else if (node.type === "file") {
       const file = this.app.vault.getAbstractFileByPath(node.file);
-      if (!(file instanceof import_obsidian11.TFile) || file.extension.toLowerCase() !== "md")
+      if (!(file instanceof import_obsidian14.TFile) || file.extension.toLowerCase() !== "md")
         return false;
       await this.app.vault.modify(file, content);
       await this.renderNode(node);
@@ -5729,7 +7068,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     head.addEventListener("pointerup", endDrag);
     head.addEventListener("pointercancel", endDrag);
     const headIcon = head.createDiv({ cls: "volis-insert-head-icon" });
-    (0, import_obsidian11.setIcon)(headIcon, "search");
+    (0, import_obsidian14.setIcon)(headIcon, "search");
     const input = head.createEl("input", {
       cls: "volis-insert-input",
       attr: { type: "text", placeholder: "\u5728\u767D\u677F\u4E2D\u67E5\u627E\u8282\u70B9\u2026" }
@@ -5757,7 +7096,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
           window.requestAnimationFrame(() => row.scrollIntoView({ block: "nearest" }));
         }
         const iconEl = row.createDiv({ cls: "volis-insert-item-icon" });
-        (0, import_obsidian11.setIcon)(
+        (0, import_obsidian14.setIcon)(
           iconEl,
           node.type === "card" ? "list" : node.type === "group" ? "group" : node.type === "text" ? "type" : "file-text"
         );
@@ -5887,7 +7226,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     head.addEventListener("pointerup", endDrag);
     head.addEventListener("pointercancel", endDrag);
     const headIcon = head.createDiv({ cls: "volis-insert-head-icon" });
-    (0, import_obsidian11.setIcon)(headIcon, "search");
+    (0, import_obsidian14.setIcon)(headIcon, "search");
     const input = head.createEl("input", {
       cls: "volis-insert-input",
       attr: { type: "text", placeholder: "\u641C\u7D22\u5361\u7247\u3001\u7B14\u8BB0\uFF0C\u6216\u65B0\u5EFA\u2026" }
@@ -5909,7 +7248,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
           });
         }
         const iconEl = row.createDiv({ cls: "volis-insert-item-icon" });
-        (0, import_obsidian11.setIcon)(
+        (0, import_obsidian14.setIcon)(
           iconEl,
           item.kind === "card" ? "list" : item.kind === "note" ? "file-text" : item.kind === "media" ? "image" : "type"
         );
@@ -6263,18 +7602,37 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
         cls: "volis-tool-btn",
         attr: { "aria-label": label }
       });
-      (0, import_obsidian11.setIcon)(button, icon);
+      (0, import_obsidian14.setIcon)(button, icon);
       button.addEventListener("click", () => this.styleSelectedEdge({ arrow }));
     };
     arrowBtn("target", "arrow-right", "\u5355\u5411\u7BAD\u5934");
     arrowBtn("both", "arrow-left-right", "\u53CC\u5411\u7BAD\u5934");
     arrowBtn("none", "minus", "\u65E0\u7BAD\u5934");
     bar.createDiv({ cls: "volis-edge-sep" });
+    this.edgeRelationBtn = bar.createEl("button", {
+      cls: "volis-tool-btn",
+      attr: { "aria-label": "\u8BBE\u7F6E\u5173\u7CFB" }
+    });
+    (0, import_obsidian14.setIcon)(this.edgeRelationBtn, "git-branch");
+    this.edgeRelationBtn.addEventListener("click", () => {
+      if (this.selectedEdgeId)
+        this.openEdgeLabelEditor(this.selectedEdgeId, void 0, "relation");
+    });
+    this.edgeLabelBtn = bar.createEl("button", {
+      cls: "volis-tool-btn",
+      attr: { "aria-label": "\u6DFB\u52A0\u6807\u7B7E" }
+    });
+    (0, import_obsidian14.setIcon)(this.edgeLabelBtn, "tag");
+    this.edgeLabelBtn.addEventListener("click", () => {
+      if (this.selectedEdgeId)
+        this.openEdgeLabelEditor(this.selectedEdgeId);
+    });
+    bar.createDiv({ cls: "volis-edge-sep" });
     const remove = bar.createEl("button", {
       cls: "volis-tool-btn is-danger",
       attr: { "aria-label": "\u5220\u9664\u8FDE\u7EBF" }
     });
-    (0, import_obsidian11.setIcon)(remove, "trash-2");
+    (0, import_obsidian14.setIcon)(remove, "trash-2");
     remove.addEventListener("click", () => this.deleteSelectedEdge());
   }
   styleSelectedEdge(patch) {
@@ -6295,7 +7653,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     const bar = this.edgeBar;
     if (!bar)
       return;
-    if (!this.selectedEdgeId) {
+    if (!this.selectedEdgeId || this.edgeLabelEditor) {
       bar.addClass("is-hidden");
       return;
     }
@@ -6307,34 +7665,198 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     if (!bar.hasChildNodes())
       this.buildEdgeBar();
     bar.removeClass("is-hidden");
-    const rect = this.root.getBoundingClientRect();
-    const path = (_a = this.edgesEl) == null ? void 0 : _a.querySelector(
-      `[data-edge-id="${edge.id}"] .volis-edge`
-    );
-    let mid = { x: 0, y: 0 };
-    if (path) {
-      const point = path.getPointAtLength(path.getTotalLength() / 2);
-      mid = { x: point.x, y: point.y };
+    if (this.edgeLabelBtn) {
+      this.edgeLabelBtn.setAttribute(
+        "aria-label",
+        this.edgeLabelOf(edge) ? "\u4FEE\u6539\u6807\u7B7E" : "\u6DFB\u52A0\u6807\u7B7E"
+      );
     }
-    const screenX = mid.x * this.scale + this.tx;
-    const screenY = mid.y * this.scale + this.ty;
+    if (this.edgeRelationBtn) {
+      const meta = edge.relation ? EDGE_RELATION_BY_ID.get(edge.relation) : void 0;
+      this.edgeRelationBtn.setAttribute("aria-label", meta ? `\u5173\u7CFB\uFF1A${meta.label}` : "\u8BBE\u7F6E\u5173\u7CFB");
+      const color = (_a = this.lineColorOf(edge.color)) != null ? _a : this.lineColorOf(meta == null ? void 0 : meta.color);
+      this.edgeRelationBtn.style.color = color != null ? color : "";
+    }
+    const rect = this.root.getBoundingClientRect();
+    const curve = this.edgeGeometry(edge);
+    const anchor = curve ? curvePoint(curve, this.edgeLabelT(edge)) : { x: 0, y: 0 };
+    const screenX = anchor.x * this.scale + this.tx;
+    const screenY = anchor.y * this.scale + this.ty;
     const width = bar.offsetWidth || 240;
     const height = bar.offsetHeight || 36;
     const left = Math.max(8, Math.min(screenX - width / 2, rect.width - width - 8));
-    const top = Math.max(8, screenY - height - 12);
+    const chipLift = this.edgeDisplayLabel(edge) ? EDGE_LABEL_HEIGHT / 2 * this.scale : 0;
+    const top = Math.max(8, screenY - height - 12 - chipLift);
     bar.style.left = `${Math.round(left)}px`;
     bar.style.top = `${Math.round(top)}px`;
   }
+  /**
+   * Inline editor for a connection's relation and label, anchored in world
+   * space on the label's point on the line. Enter commits, Escape cancels,
+   * clicking away commits.
+   *
+   * `at` is the board point the user aimed at (a double-click on the line); it
+   * is projected onto the curve and becomes the label's position. Without it
+   * the label keeps the position it already has, or lands in the middle.
+   * `focus` decides which control receives focus when the popup opens.
+   */
+  openEdgeLabelEditor(edgeId, at, focus = "label") {
+    var _a;
+    const edge = this.edges.find((item) => item.id === edgeId);
+    if (!edge)
+      return;
+    const curve = this.edgeGeometry(edge);
+    if (!curve)
+      return;
+    const t = at ? clampLabelT(nearestCurveT(curve, at)) : this.edgeLabelT(edge);
+    this.closeEdgeLabelEditor(true);
+    const wrap = this.world.createDiv({ cls: "volis-edge-label-editor" });
+    wrap.addEventListener("pointerdown", (evt) => evt.stopPropagation());
+    wrap.addEventListener("dblclick", (evt) => evt.stopPropagation());
+    const select = wrap.createEl("select", {
+      cls: "volis-edge-relation-select",
+      attr: { "aria-label": "\u8FDE\u7EBF\u5173\u7CFB" }
+    });
+    select.createEl("option", { text: "\u65E0\u5173\u7CFB", value: "" });
+    for (const meta of EDGE_RELATIONS) {
+      select.createEl("option", { text: meta.label, value: meta.id });
+    }
+    select.value = (_a = edge.relation) != null ? _a : "";
+    const input = wrap.createEl("input", {
+      cls: "volis-edge-label-input",
+      attr: {
+        type: "text",
+        placeholder: "\u8F93\u5165\u6807\u7B7E",
+        maxlength: String(EDGE_LABEL_MAX),
+        spellcheck: "false"
+      }
+    });
+    input.value = this.edgeLabelOf(edge);
+    const onKeydown = (evt) => {
+      evt.stopPropagation();
+      if (evt.isComposing)
+        return;
+      if (evt.key === "Enter") {
+        evt.preventDefault();
+        this.closeEdgeLabelEditor(true);
+      } else if (evt.key === "Escape") {
+        evt.preventDefault();
+        this.closeEdgeLabelEditor(false);
+      }
+    };
+    input.addEventListener("keydown", onKeydown);
+    select.addEventListener("keydown", onKeydown);
+    wrap.addEventListener("focusout", (evt) => {
+      const next = evt.relatedTarget;
+      if (next && wrap.contains(next))
+        return;
+      this.closeEdgeLabelEditor(true);
+    });
+    this.edgeLabelEditor = { el: wrap, input, select, edgeId, t };
+    this.syncEdgeLabelEditor();
+    if (focus === "relation") {
+      select.focus();
+    } else {
+      input.focus();
+      input.select();
+    }
+    this.updateEdgeBar();
+  }
+  /**
+   * Pins the field to the label's point on the line and cancels the board zoom,
+   * so the input stays a normal, readable size however far the board is scaled.
+   * The chip under it scales with the board, but a text field that shrinks to a
+   * few pixels would be unusable.
+   */
+  syncEdgeLabelEditor() {
+    const editor = this.edgeLabelEditor;
+    if (!editor)
+      return;
+    const edge = this.edges.find((item) => item.id === editor.edgeId);
+    const curve = edge ? this.edgeGeometry(edge) : null;
+    if (curve) {
+      const anchor = curvePoint(curve, editor.t);
+      editor.el.style.left = `${Math.round(anchor.x)}px`;
+      editor.el.style.top = `${Math.round(anchor.y)}px`;
+    }
+    editor.el.style.transform = `translate(-50%, -50%) scale(${1 / this.scale})`;
+  }
+  closeEdgeLabelEditor(commit) {
+    const editor = this.edgeLabelEditor;
+    if (!editor)
+      return;
+    this.edgeLabelEditor = null;
+    const value = editor.input.value;
+    const relation = editor.select.value ? editor.select.value : void 0;
+    editor.el.remove();
+    if (commit)
+      this.commitEdgeEdit(editor.edgeId, value, editor.t, relation);
+    this.updateEdgeBar();
+  }
+  commitEdgeEdit(edgeId, raw, t, relation) {
+    const edge = this.edges.find((item) => item.id === edgeId);
+    if (!edge)
+      return;
+    const value = raw.trim().slice(0, EDGE_LABEL_MAX);
+    const position = clampLabelT(t);
+    const moved = Math.abs(position - this.edgeLabelT(edge)) > 1e-3;
+    const relationChanged = edge.relation !== relation;
+    if (value === this.edgeLabelOf(edge) && !moved && !relationChanged)
+      return;
+    if (value) {
+      edge.label = value;
+      edge.labelAt = position;
+    } else {
+      delete edge.label;
+      if (relation)
+        edge.labelAt = position;
+      else
+        delete edge.labelAt;
+    }
+    if (relationChanged) {
+      if (relation) {
+        edge.relation = relation;
+        delete edge.color;
+        delete edge.style;
+        delete edge.arrow;
+      } else {
+        delete edge.relation;
+      }
+    }
+    this.renderEdges();
+    this.updateEdgeBar();
+    this.pushHistory();
+    this.scheduleSave();
+  }
+  /**
+   * Selecting is a class toggle, never a re-render. Rebuilding the SVG here
+   * would replace the very path the user just pressed, and the browser drops
+   * the second click of a double-click when the two clicks land on different
+   * elements — which is why double-clicking a line did nothing at all.
+   */
   selectEdge(edgeId) {
     this.selectedEdgeId = edgeId;
     this.selection.clear();
     this.paintSelection();
-    this.renderEdges();
+    this.paintEdgeSelection();
     this.updateEdgeBar();
   }
+  paintEdgeSelection() {
+    var _a;
+    const groups = (_a = this.edgesEl) == null ? void 0 : _a.querySelectorAll(".volis-edge-group");
+    if (!groups)
+      return;
+    for (const group of Array.from(groups)) {
+      group.classList.toggle("is-selected", group.dataset.edgeId === this.selectedEdgeId);
+    }
+  }
   deleteSelectedEdge() {
+    var _a;
     if (!this.selectedEdgeId)
       return false;
+    if (((_a = this.edgeLabelEditor) == null ? void 0 : _a.edgeId) === this.selectedEdgeId) {
+      this.closeEdgeLabelEditor(false);
+    }
     this.edges = this.edges.filter((edge) => edge.id !== this.selectedEdgeId);
     this.selectedEdgeId = null;
     this.updateEdgeBar();
@@ -6429,7 +7951,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     this.stopAllPlayback();
     if (this.selectedEdgeId) {
       this.selectedEdgeId = null;
-      this.renderEdges();
+      this.paintEdgeSelection();
       this.updateEdgeBar();
     }
     if (!evt.ctrlKey && !evt.metaKey && !evt.shiftKey) {
@@ -6480,7 +8002,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       return;
     if (node.type === "file") {
       const file = this.app.vault.getAbstractFileByPath(node.file);
-      if (file instanceof import_obsidian11.TFile && file.extension.toLowerCase() === "md") {
+      if (file instanceof import_obsidian14.TFile && file.extension.toLowerCase() === "md") {
         void this.openEditor(node);
       }
       return;
@@ -6492,6 +8014,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       el.toggleClass("is-selected", this.selection.has(id));
     }
     this.updateFrame();
+    this.updateOutlineActive();
   }
   updateFrame() {
     var _a;
@@ -6540,7 +8063,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
   }
   openMedia(path) {
     const file = this.app.vault.getAbstractFileByPath(path);
-    if (file instanceof import_obsidian11.TFile)
+    if (file instanceof import_obsidian14.TFile)
       new MediaModal(this.app, file).open();
   }
   async createTextNode(point) {
@@ -6619,7 +8142,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     }
     if (node.type === "file") {
       const file = this.app.vault.getAbstractFileByPath(node.file);
-      if (!(file instanceof import_obsidian11.TFile) || file.extension.toLowerCase() !== "md")
+      if (!(file instanceof import_obsidian14.TFile) || file.extension.toLowerCase() !== "md")
         return;
       const content = await this.app.vault.read(file);
       new MarkdownNodeEditor(
@@ -6710,7 +8233,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
   async addFileNode(file, point) {
     const target = this.app.vault.getAbstractFileByPath(file);
     const width = DEFAULT_FILE_WIDTH;
-    const ext = target instanceof import_obsidian11.TFile ? target.extension.toLowerCase() : "";
+    const ext = target instanceof import_obsidian14.TFile ? target.extension.toLowerCase() : "";
     const isImage = IMAGE_EXT2.includes(ext);
     const isNote = ext === "md";
     const node = {
@@ -6730,9 +8253,407 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     this.scheduleSave();
     return node;
   }
+  toggleOutlinePanel() {
+    if (this.outlinePanel) {
+      this.closeOutlinePanel();
+      return;
+    }
+    this.openOutlinePanel();
+  }
+  /** Opens the floating outline. Public so a command can reach it directly. */
+  openOutlinePanel() {
+    if (this.outlinePanel) {
+      this.renderOutlinePanel();
+      return;
+    }
+    const panel = this.root.createDiv({ cls: "volis-outline-panel" });
+    panel.style.left = `${this.outlinePos.left}px`;
+    panel.style.top = `${this.outlinePos.top}px`;
+    panel.addEventListener("pointerdown", (evt) => evt.stopPropagation());
+    panel.addEventListener("dblclick", (evt) => evt.stopPropagation());
+    panel.addEventListener("wheel", (evt) => evt.stopPropagation(), { passive: true });
+    const head = panel.createDiv({ cls: "volis-outline-head" });
+    const headIcon = head.createDiv({ cls: "volis-outline-head-icon" });
+    (0, import_obsidian14.setIcon)(headIcon, "list-tree");
+    head.createDiv({ cls: "volis-outline-head-title", text: "\u5927\u7EB2" });
+    this.outlineMetaEl = head.createDiv({ cls: "volis-outline-head-meta" });
+    head.createDiv({ cls: "volis-outline-head-spacer" });
+    const closeBtn = head.createEl("button", {
+      cls: "volis-outline-head-btn",
+      attr: { "aria-label": "\u5173\u95ED" }
+    });
+    (0, import_obsidian14.setIcon)(closeBtn, "x");
+    closeBtn.addEventListener("click", () => this.closeOutlinePanel());
+    this.outlineBodyEl = panel.createDiv({ cls: "volis-outline-body" });
+    this.outlinePanel = panel;
+    this.installOutlineDrag(panel, head);
+    this.outlineSignatureCache = "";
+    this.renderOutlinePanel();
+    this.outlineSignatureCache = this.outlineSignature();
+  }
+  closeOutlinePanel() {
+    if (this.outlineTimer !== null) {
+      window.clearTimeout(this.outlineTimer);
+      this.outlineTimer = null;
+    }
+    if (this.outlinePanel) {
+      this.outlinePos = {
+        left: this.outlinePanel.offsetLeft,
+        top: this.outlinePanel.offsetTop
+      };
+      this.outlinePanel.remove();
+    }
+    this.outlinePanel = null;
+    this.outlineBodyEl = null;
+    this.outlineMetaEl = null;
+  }
+  installOutlineDrag(panel, head) {
+    let start = null;
+    head.addEventListener("pointerdown", (evt) => {
+      if (evt.target.closest("button"))
+        return;
+      start = {
+        x: evt.clientX,
+        y: evt.clientY,
+        left: panel.offsetLeft,
+        top: panel.offsetTop
+      };
+      head.setPointerCapture(evt.pointerId);
+      panel.addClass("is-dragging");
+    });
+    head.addEventListener("pointermove", (evt) => {
+      if (!start)
+        return;
+      panel.style.left = `${Math.round(start.left + evt.clientX - start.x)}px`;
+      panel.style.top = `${Math.round(start.top + evt.clientY - start.y)}px`;
+    });
+    const end = (evt) => {
+      if (!start)
+        return;
+      start = null;
+      panel.removeClass("is-dragging");
+      try {
+        head.releasePointerCapture(evt.pointerId);
+      } catch (error) {
+      }
+    };
+    head.addEventListener("pointerup", end);
+    head.addEventListener("pointercancel", end);
+  }
+  renderOutlinePanel() {
+    const body = this.outlineBodyEl;
+    if (!body)
+      return;
+    const scrollTop = body.scrollTop;
+    body.empty();
+    const inputs = this.nodes.map((node) => ({
+      id: node.id,
+      x: node.x,
+      y: node.y,
+      kind: node.type
+    }));
+    const result = buildOutline(inputs, this.edges, (input) => this.outlineInfoOf(input));
+    if (result.nodeCount === 0) {
+      body.createDiv({
+        cls: "volis-outline-empty",
+        text: "\u767D\u677F\u4E0A\u8FD8\u6CA1\u6709\u8282\u70B9\u3002\u65B0\u5EFA\u5361\u7247\u6216\u4FBF\u7B7E\u540E\uFF0C\u8FD9\u91CC\u4F1A\u6309\u7ED3\u6784\u5217\u51FA\u5B83\u4EEC\u3002"
+      });
+      this.updateOutlineMeta(result);
+      return;
+    }
+    for (const item of result.roots) {
+      this.renderOutlineItem(body, item, 0);
+    }
+    if (result.cycle) {
+      body.createDiv({
+        cls: "volis-outline-note",
+        text: "\u68C0\u6D4B\u5230\u5FAA\u73AF\u7684\u63A8\u5BFC/\u56E0\u679C\u5173\u7CFB\uFF0C\u73AF\u4E0A\u7684\u4E00\u6761\u8FDE\u7EBF\u5DF2\u5728\u5927\u7EB2\u4E2D\u8DF3\u8FC7\u3002"
+      });
+    } else if (!result.hasHierarchy) {
+      body.createDiv({
+        cls: "volis-outline-note",
+        text: "\u8FD8\u6CA1\u6709\u63A8\u5BFC\u6216\u56E0\u679C\u8FDE\u7EBF\uFF0C\u8282\u70B9\u6309\u4F4D\u7F6E\u5E73\u94FA\u3002\u7ED9\u8FDE\u7EBF\u8BBE\u7F6E\u300C\u63A8\u5BFC\u300D\u6216\u300C\u56E0\u679C\u300D\u5373\u53EF\u751F\u6210\u5C42\u7EA7\u3002"
+      });
+    }
+    this.updateOutlineMeta(result);
+    body.scrollTop = scrollTop;
+  }
+  updateOutlineMeta(result) {
+    if (!this.outlineMetaEl)
+      return;
+    const parts = [`${result.nodeCount} \u4E2A\u8282\u70B9`];
+    if (result.hasHierarchy)
+      parts.push(result.hasSequence ? "\u5206\u5C42 + \u987A\u5E8F" : "\u5206\u5C42");
+    else
+      parts.push("\u5E73\u94FA");
+    this.outlineMetaEl.setText(parts.join(" \xB7 "));
+  }
+  renderOutlineItem(host, item, depth) {
+    const collapsed = this.outlineCollapsed.has(item.id);
+    const row = host.createDiv({ cls: "volis-outline-row" });
+    row.dataset.nodeId = item.id;
+    row.toggleClass("is-root", depth === 0);
+    row.toggleClass("is-active", this.selection.has(item.id));
+    row.toggleClass("is-group", item.kind === "group");
+    if (item.children.length > 0) {
+      const toggle = row.createEl("button", {
+        cls: "volis-outline-toggle",
+        attr: { "aria-label": collapsed ? "\u5C55\u5F00" : "\u6298\u53E0" }
+      });
+      (0, import_obsidian14.setIcon)(toggle, collapsed ? "chevron-right" : "chevron-down");
+      toggle.addEventListener("click", (evt) => {
+        evt.stopPropagation();
+        if (collapsed)
+          this.outlineCollapsed.delete(item.id);
+        else
+          this.outlineCollapsed.add(item.id);
+        this.renderOutlinePanel();
+      });
+    } else {
+      row.createDiv({ cls: "volis-outline-toggle is-empty" });
+    }
+    const main = row.createDiv({ cls: "volis-outline-main" });
+    const titleRow = main.createDiv({ cls: "volis-outline-title-row" });
+    const title = titleRow.createDiv({ cls: "volis-outline-title", text: item.title });
+    title.setAttribute("title", item.title);
+    if (item.relation) {
+      titleRow.createSpan({
+        cls: `volis-outline-relation is-${item.relation}`,
+        text: item.relation === "derives" ? "\u63A8\u5BFC" : "\u56E0\u679C"
+      });
+    }
+    const badges = titleRow.createDiv({ cls: "volis-outline-badges" });
+    if (item.badges.supports > 0) {
+      badges.createSpan({
+        cls: "volis-outline-badge is-supports",
+        text: `\u652F\u6301 ${item.badges.supports}`
+      });
+    }
+    if (item.badges.refutes > 0) {
+      badges.createSpan({
+        cls: "volis-outline-badge is-refutes",
+        text: `\u53CD\u9A73 ${item.badges.refutes}`
+      });
+    }
+    if (item.badges.source > 0) {
+      badges.createSpan({
+        cls: "volis-outline-badge is-source",
+        text: `\u6765\u6E90 ${item.badges.source}`
+      });
+    }
+    if (item.snippet) {
+      main.createDiv({ cls: "volis-outline-snippet", text: item.snippet });
+    }
+    row.addEventListener("click", () => this.focusNodeInBoard(item.id));
+    if (collapsed || item.children.length === 0)
+      return;
+    const kids = host.createDiv({ cls: "volis-outline-children" });
+    for (const child of item.children) {
+      this.renderOutlineItem(kids, child, depth + 1);
+    }
+  }
+  focusNodeInBoard(nodeId) {
+    var _a, _b;
+    const node = this.nodeMap.get(nodeId);
+    if (!node)
+      return;
+    const el = this.nodeEls.get(nodeId);
+    const height = (_b = (_a = el == null ? void 0 : el.offsetHeight) != null ? _a : node.height) != null ? _b : 100;
+    const rect = this.root.getBoundingClientRect();
+    const centerX = node.x + node.width / 2;
+    const centerY = node.y + height / 2;
+    this.tx = rect.width / 2 - centerX * this.scale;
+    this.ty = rect.height / 2 - centerY * this.scale;
+    this.selectedEdgeId = null;
+    this.selection.clear();
+    this.selection.add(nodeId);
+    this.paintSelection();
+    this.paintEdgeSelection();
+    this.applyTransform();
+    this.updateHint();
+    this.scheduleSave();
+  }
+  updateOutlineActive() {
+    if (!this.outlinePanel)
+      return;
+    const rows = this.outlinePanel.querySelectorAll(".volis-outline-row");
+    rows.forEach((row) => {
+      row.toggleClass(
+        "is-active",
+        !!row.dataset.nodeId && this.selection.has(row.dataset.nodeId)
+      );
+    });
+  }
+  scheduleOutlineRefresh() {
+    if (!this.outlinePanel)
+      return;
+    if (this.outlineTimer !== null)
+      window.clearTimeout(this.outlineTimer);
+    this.outlineTimer = window.setTimeout(() => {
+      this.outlineTimer = null;
+      if (!this.outlinePanel)
+        return;
+      const signature = this.outlineSignature();
+      if (signature === this.outlineSignatureCache)
+        return;
+      this.outlineSignatureCache = signature;
+      this.renderOutlinePanel();
+    }, 220);
+  }
+  outlineSignature() {
+    const nodes = this.nodes.map((node) => {
+      var _a;
+      const label = node.type === "group" ? (_a = node.label) != null ? _a : "" : "";
+      return `${node.id}@${Math.round(node.x)},${Math.round(node.y)}:${node.type}:${label}`;
+    }).join("|");
+    const edges = this.edges.map((edge) => {
+      var _a;
+      return `${edge.from}>${edge.to}:${(_a = edge.relation) != null ? _a : ""}`;
+    }).join("|");
+    const text = this.nodes.map((node) => {
+      var _a;
+      return ((_a = this.nodeText.get(node.id)) != null ? _a : "").slice(0, 120);
+    }).join("|");
+    return `${nodes}##${edges}##${text}`;
+  }
+  /** Opens the Markdown export dialog. Public so a command can reach it. */
+  openExportModal() {
+    var _a, _b;
+    const inputs = this.nodes.map((node) => ({
+      id: node.id,
+      x: node.x,
+      y: node.y,
+      kind: node.type
+    }));
+    const result = buildOutline(inputs, this.edges, (input) => this.outlineInfoOf(input));
+    const infoById = /* @__PURE__ */ new Map();
+    const collect = (items) => {
+      for (const item of items) {
+        infoById.set(item.id, this.exportInfoOf(item));
+        collect(item.children);
+      }
+    };
+    collect(result.roots);
+    new MarkdownExportModal(this.app, {
+      boardTitle: (_b = (_a = this.file) == null ? void 0 : _a.basename) != null ? _b : "\u767D\u677F",
+      nodeCount: result.nodeCount,
+      build: (format) => {
+        var _a2, _b2;
+        return buildExportMarkdown(
+          {
+            boardTitle: (_b2 = (_a2 = this.file) == null ? void 0 : _a2.basename) != null ? _b2 : "\u767D\u677F",
+            outline: result,
+            infoOf: (id) => {
+              var _a3;
+              return (_a3 = infoById.get(id)) != null ? _a3 : { title: "\u672A\u547D\u540D", body: "" };
+            },
+            edges: this.edges,
+            titleOf: (id) => {
+              var _a3, _b3;
+              return (_b3 = (_a3 = infoById.get(id)) == null ? void 0 : _a3.title) != null ? _b3 : this.exportTitleOf(id);
+            }
+          },
+          format
+        );
+      },
+      save: (markdown) => this.saveExportNote(markdown)
+    }).open();
+  }
+  exportTitleOf(id) {
+    const node = this.nodeMap.get(id);
+    if (!node)
+      return "\u672A\u547D\u540D";
+    return this.outlineInfoOf({ id, x: node.x, y: node.y, kind: node.type }).title;
+  }
+  exportInfoOf(item) {
+    var _a;
+    const node = this.nodeMap.get(item.id);
+    if (!node || node.type === "group")
+      return { title: item.title, body: "" };
+    if (node.type === "file") {
+      return { title: item.title, body: `[[${node.file}|${item.title}]]` };
+    }
+    const full = (_a = this.nodeText.get(node.id)) != null ? _a : node.type === "text" ? node.text : "";
+    return { title: item.title, body: this.exportBody(full) };
+  }
+  /** The first line already became the heading; the rest is the body. */
+  exportBody(text) {
+    const lines = text.split(/\r?\n/);
+    const first = lines.findIndex((line) => line.trim() !== "");
+    if (first === -1)
+      return "";
+    return lines.slice(first + 1).join("\n").trim();
+  }
+  async saveExportNote(markdown) {
+    var _a, _b, _c, _d;
+    const boardPath = (_b = (_a = this.file) == null ? void 0 : _a.path) != null ? _b : "";
+    const folder = boardPath.includes("/") ? boardPath.slice(0, boardPath.lastIndexOf("/")) : "";
+    const base = ((_d = (_c = this.file) == null ? void 0 : _c.basename) != null ? _d : "\u767D\u677F").replace(/[\\/:*?"<>|]/g, " ").trim() || "\u767D\u677F";
+    const adapter = this.app.vault.adapter;
+    let name = `${base}.md`;
+    let path = folder ? `${folder}/${name}` : name;
+    let index = 1;
+    while (await adapter.exists(path)) {
+      name = `${base} ${index}.md`;
+      path = folder ? `${folder}/${name}` : name;
+      index += 1;
+    }
+    const file = await this.app.vault.create(path, markdown);
+    return file.path;
+  }
+  outlineInfoOf(node) {
+    var _a, _b, _c;
+    const source = this.nodeMap.get(node.id);
+    if (!source)
+      return { title: "\u672A\u547D\u540D" };
+    if (source.type === "group") {
+      return { title: ((_a = source.label) == null ? void 0 : _a.trim()) || "\u672A\u547D\u540D\u5206\u7EC4" };
+    }
+    if (source.type === "file") {
+      const file = this.app.vault.getAbstractFileByPath(source.file);
+      const name = file instanceof import_obsidian14.TFile ? file.basename : (_b = source.file.split("/").pop()) != null ? _b : "\u6587\u4EF6";
+      const body = this.nodeText.get(source.id);
+      const snippet = body ? this.outlineSnippet(body) : "";
+      return { title: name, snippet: snippet || void 0 };
+    }
+    const text = (_c = this.nodeText.get(source.id)) != null ? _c : source.type === "text" ? source.text : "";
+    return this.outlineTextInfo(text);
+  }
+  outlineTextInfo(text) {
+    const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    if (lines.length === 0)
+      return { title: "\u672A\u547D\u540D" };
+    const cleaned = lines.map((line) => this.outlineClean(line)).filter(Boolean);
+    if (cleaned.length === 0)
+      return { title: "\u672A\u547D\u540D" };
+    const title = cleaned[0];
+    const snippet = cleaned.slice(1).join(" ");
+    return {
+      title: this.outlineTruncate(title, 40),
+      snippet: snippet ? this.outlineTruncate(snippet, 70) : void 0
+    };
+  }
+  outlineSnippet(text) {
+    const lines = text.split(/\r?\n/).map((line) => this.outlineClean(line)).filter(Boolean);
+    return lines.length > 1 ? this.outlineTruncate(lines.slice(1).join(" "), 70) : "";
+  }
+  /** Strips the Markdown that would only add noise in a one-line outline. */
+  outlineClean(raw) {
+    return raw.replace(/^\s{0,3}#{1,6}\s+/, "").replace(/^\s*>\s?/, "").replace(/^\s*[-*+]\s+\[[ xX]\]\s+/, "").replace(/^\s*[-*+]\s+/, "").replace(/!?\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_match, target, alias) => {
+      if (alias)
+        return alias;
+      const clean = target.split("#")[0];
+      return clean.split("/").pop() || target;
+    }).replace(/\[([^\]]+)\]\([^)]*\)/g, "$1").replace(/`([^`]*)`/g, "$1").replace(/\*\*|__|~~/g, "").replace(/(^|\s)#[\p{L}\p{N}_/-]+/gu, " ").replace(/\s+/g, " ").trim();
+  }
+  outlineTruncate(text, max) {
+    const chars = Array.from(text);
+    return chars.length > max ? `${chars.slice(0, max).join("")}\u2026` : text;
+  }
   scheduleSave() {
     if (!this.loaded)
       return;
+    this.scheduleOutlineRefresh();
     if (this.saveTimer !== null)
       window.clearTimeout(this.saveTimer);
     this.saveTimer = window.setTimeout(() => {
@@ -6768,26 +8689,8 @@ function normalizeTags(text) {
 
 // src/board/boardStore.ts
 var BOARD_EXTENSION = "volis";
-var LEGACY_BOARD_PATH = ".volis/board.json";
-async function loadBoardFile(app, path) {
-  try {
-    const adapter = app.vault.adapter;
-    if (!await adapter.exists(path))
-      return null;
-    const raw = await adapter.read(path);
-    const parsed = JSON.parse(raw);
-    if (!parsed || !Array.isArray(parsed.nodes))
-      return null;
-    return {
-      version: 1,
-      nodes: parsed.nodes,
-      edges: Array.isArray(parsed.edges) ? parsed.edges : [],
-      viewport: parsed.viewport
-    };
-  } catch (error) {
-    console.error("[Volis] load board failed", error);
-    return null;
-  }
+function blankBoardData() {
+  return { version: 1, nodes: [], edges: [] };
 }
 async function nextBoardPath(app, folder) {
   const dir = folder.replace(/^\/+|\/+$/g, "");
@@ -6808,8 +8711,8 @@ function listBoards(app) {
 }
 
 // src/board/boardPicker.ts
-var import_obsidian12 = require("obsidian");
-var BoardPickerModal = class extends import_obsidian12.FuzzySuggestModal {
+var import_obsidian15 = require("obsidian");
+var BoardPickerModal = class extends import_obsidian15.FuzzySuggestModal {
   constructor(app, onPick) {
     super(app);
     this.onPick = onPick;
@@ -6869,8 +8772,8 @@ var ContextMenuInjector = class {
 };
 
 // src/ui/cardEditor.ts
-var import_obsidian13 = require("obsidian");
-var CardEditorModal = class extends import_obsidian13.Modal {
+var import_obsidian16 = require("obsidian");
+var CardEditorModal = class extends import_obsidian16.Modal {
   constructor(app, meta, onSave) {
     super(app);
     this.meta = meta;
@@ -6925,7 +8828,7 @@ var CardEditorModal = class extends import_obsidian13.Modal {
     }
     const ok = await this.onSave(this.value);
     if (!ok) {
-      new import_obsidian13.Notice("\u4FDD\u5B58\u5931\u8D25\uFF1A\u5361\u7247\u53EF\u80FD\u5DF2\u79FB\u52A8\u6216\u5220\u9664");
+      new import_obsidian16.Notice("\u4FDD\u5B58\u5931\u8D25\uFF1A\u5361\u7247\u53EF\u80FD\u5DF2\u79FB\u52A8\u6216\u5220\u9664");
       return;
     }
     this.close();
@@ -6936,10 +8839,10 @@ var CardEditorModal = class extends import_obsidian13.Modal {
 };
 
 // src/settingsTab.ts
-var import_obsidian15 = require("obsidian");
+var import_obsidian18 = require("obsidian");
 
 // src/ui/aiProfileModal.ts
-var import_obsidian14 = require("obsidian");
+var import_obsidian17 = require("obsidian");
 var PRESETS = {
   deepseek: { name: "DeepSeek", protocol: "openai", baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat" },
   kimi: { name: "Kimi", protocol: "openai", baseUrl: "https://api.moonshot.cn/v1", model: "moonshot-v1-8k" },
@@ -6949,7 +8852,7 @@ var PRESETS = {
   anthropic: { name: "Anthropic", protocol: "anthropic", baseUrl: "https://api.anthropic.com", model: "claude-sonnet-4-20250514" },
   ollama: { name: "\u672C\u5730 Ollama", protocol: "openai", baseUrl: "http://localhost:11434/v1", model: "qwen2.5" }
 };
-var AIProfileModal = class extends import_obsidian14.Modal {
+var AIProfileModal = class extends import_obsidian17.Modal {
   constructor(app, profile, onSubmit) {
     super(app);
     this.onSubmit = onSubmit;
@@ -6972,7 +8875,7 @@ var AIProfileModal = class extends import_obsidian14.Modal {
     contentEl.empty();
     contentEl.addClass("volis-ai-modal");
     contentEl.createEl("h3", { text: this.draft.name ? "\u7F16\u8F91\u6A21\u578B\u914D\u7F6E" : "\u6DFB\u52A0\u6A21\u578B\u914D\u7F6E" });
-    new import_obsidian14.Setting(contentEl).setName("\u5FEB\u901F\u586B\u5165").setDesc("\u9009\u4E00\u4E2A\u670D\u52A1\u81EA\u52A8\u586B\u597D\u5730\u5740\u548C\u6A21\u578B\uFF0CKey \u4ECD\u9700\u81EA\u5DF1\u586B\u3002").addDropdown((dropdown) => {
+    new import_obsidian17.Setting(contentEl).setName("\u5FEB\u901F\u586B\u5165").setDesc("\u9009\u4E00\u4E2A\u670D\u52A1\u81EA\u52A8\u586B\u597D\u5730\u5740\u548C\u6A21\u578B\uFF0CKey \u4ECD\u9700\u81EA\u5DF1\u586B\u3002").addDropdown((dropdown) => {
       dropdown.addOption("", "\u9009\u62E9\u670D\u52A1\u2026");
       for (const [key, preset] of Object.entries(PRESETS)) {
         dropdown.addOption(key, preset.name);
@@ -6991,7 +8894,7 @@ var AIProfileModal = class extends import_obsidian14.Modal {
       });
     });
     this.fieldsEl = contentEl.createDiv();
-    new import_obsidian14.Setting(contentEl).addButton((button) => button.setButtonText("\u53D6\u6D88").onClick(() => this.close())).addButton((button) => button.setButtonText("\u4FDD\u5B58").setCta().onClick(() => this.submit()));
+    new import_obsidian17.Setting(contentEl).addButton((button) => button.setButtonText("\u53D6\u6D88").onClick(() => this.close())).addButton((button) => button.setButtonText("\u4FDD\u5B58").setCta().onClick(() => this.submit()));
     this.renderFields();
   }
   renderFields() {
@@ -7000,22 +8903,22 @@ var AIProfileModal = class extends import_obsidian14.Modal {
     if (!host)
       return;
     host.empty();
-    new import_obsidian14.Setting(host).setName("\u540D\u79F0").addText((text) => {
+    new import_obsidian17.Setting(host).setName("\u540D\u79F0").addText((text) => {
       text.setPlaceholder("\u4F8B\u5982 DeepSeek").setValue(this.draft.name).onChange((value) => {
         this.draft.name = value.trim();
       });
     });
-    new import_obsidian14.Setting(host).setName("\u63A5\u53E3\u534F\u8BAE").addDropdown(
+    new import_obsidian17.Setting(host).setName("\u63A5\u53E3\u534F\u8BAE").addDropdown(
       (dropdown) => dropdown.addOption("openai", "OpenAI \u517C\u5BB9").addOption("anthropic", "Anthropic Messages").setValue(this.draft.protocol).onChange((value) => {
         this.draft.protocol = value === "anthropic" ? "anthropic" : "openai";
       })
     );
-    new import_obsidian14.Setting(host).setName("\u63A5\u53E3\u5730\u5740").setDesc("\u4F8B\u5982 https://api.deepseek.com/v1").addText((text) => {
+    new import_obsidian17.Setting(host).setName("\u63A5\u53E3\u5730\u5740").setDesc("\u4F8B\u5982 https://api.deepseek.com/v1").addText((text) => {
       text.setPlaceholder("https://").setValue(this.draft.baseUrl).onChange((value) => {
         this.draft.baseUrl = value.trim();
       });
     });
-    new import_obsidian14.Setting(host).setName("\u6A21\u578B").setDesc("\u6539\u52A8\u6A21\u578B\u540D\u540E\uFF0C\u80FD\u529B\u503C\u4F1A\u6309\u540D\u5B57\u91CD\u65B0\u63A8\u65AD\uFF1B\u4E5F\u53EF\u70B9\u4E0B\u9762\u7684\u300C\u63A2\u6D4B\u300D\u3002").addText((text) => {
+    new import_obsidian17.Setting(host).setName("\u6A21\u578B").setDesc("\u6539\u52A8\u6A21\u578B\u540D\u540E\uFF0C\u80FD\u529B\u503C\u4F1A\u6309\u540D\u5B57\u91CD\u65B0\u63A8\u65AD\uFF1B\u4E5F\u53EF\u70B9\u4E0B\u9762\u7684\u300C\u63A2\u6D4B\u300D\u3002").addText((text) => {
       text.setPlaceholder("deepseek-chat").setValue(this.draft.model).onChange((value) => {
         var _a2;
         this.draft.model = value.trim();
@@ -7024,7 +8927,7 @@ var AIProfileModal = class extends import_obsidian14.Modal {
         }
       });
     });
-    new import_obsidian14.Setting(host).setName("API Key").setDesc("\u4EC5\u4FDD\u5B58\u5728\u672C\u673A\u63D2\u4EF6\u914D\u7F6E\u4E2D\u3002").addText((text) => {
+    new import_obsidian17.Setting(host).setName("API Key").setDesc("\u4EC5\u4FDD\u5B58\u5728\u672C\u673A\u63D2\u4EF6\u914D\u7F6E\u4E2D\u3002").addText((text) => {
       text.inputEl.type = "password";
       text.setPlaceholder("sk-\u2026").setValue(this.draft.apiKey).onChange((value) => {
         this.draft.apiKey = value.trim();
@@ -7036,7 +8939,7 @@ var AIProfileModal = class extends import_obsidian14.Modal {
       text: "\u8FD9\u4E24\u9879\u586B\u7684\u662F\u300C\u8FD9\u4E2A\u6A21\u578B\u80FD\u5403\u591A\u5C11\u300D\uFF0C\u4E0D\u662F\u63D2\u4EF6\u7684\u9650\u5236\u3002\u7559\u7A7A\u8868\u793A\u6309\u6A21\u578B\u540D\u81EA\u52A8\u63A8\u65AD\uFF1B\u586B\u9519\u4E86\u53EA\u4F1A\u8BA9\u63D2\u4EF6\u5C11\u7528\u6216\u591A\u7528\u4E00\u70B9\u4F59\u91CF\uFF0C\u4E0D\u4F1A\u635F\u574F\u6570\u636E\u3002"
     });
     const capability = (_a = this.draft.capability) != null ? _a : inferCapability(this.draft.model);
-    new import_obsidian14.Setting(host).setName("\u4E0A\u4E0B\u6587\u7A97\u53E3\uFF08token\uFF09").setDesc(`\u5F53\u524D\uFF1A${describeCapability(capability)} \xB7 ${capabilitySourceLabel(capability.source)}`).addText((text) => {
+    new import_obsidian17.Setting(host).setName("\u4E0A\u4E0B\u6587\u7A97\u53E3\uFF08token\uFF09").setDesc(`\u5F53\u524D\uFF1A${describeCapability(capability)} \xB7 ${capabilitySourceLabel(capability.source)}`).addText((text) => {
       text.inputEl.type = "number";
       text.setPlaceholder(String(capability.contextWindow)).setValue(String(capability.contextWindow)).onChange((value) => {
         var _a2, _b;
@@ -7054,7 +8957,7 @@ var AIProfileModal = class extends import_obsidian14.Modal {
         };
       });
     });
-    new import_obsidian14.Setting(host).setName("\u5355\u6B21\u8F93\u51FA\u4E0A\u9650\uFF08token\uFF09").setDesc(
+    new import_obsidian17.Setting(host).setName("\u5355\u6B21\u8F93\u51FA\u4E0A\u9650\uFF08token\uFF09").setDesc(
       "\u6A21\u578B\u4E00\u6B21\u6700\u591A\u80FD\u5199\u591A\u5C11\u3002\u601D\u8003\u8FC7\u7A0B\u4E5F\u82B1\u8FD9\u4EFD\u989D\u5EA6\uFF0C\u6240\u4EE5\u5E26\u601D\u8003\u7684\u6A21\u578B\u5EFA\u8BAE 16384 \u4EE5\u4E0A\u3002"
     ).addText((text) => {
       text.inputEl.type = "number";
@@ -7079,13 +8982,13 @@ var AIProfileModal = class extends import_obsidian14.Modal {
         };
       });
     });
-    new import_obsidian14.Setting(host).setName("\u63A2\u6D4B\u771F\u5B9E\u4E0A\u9650").setDesc("\u5411\u63A5\u53E3\u95EE\u4E00\u6B21\uFF0C\u80FD\u8BFB\u5230\u5C31\u5199\u8FDB\u6765\uFF1B\u8BFB\u4E0D\u5230\u4F1A\u8BF4\u660E\u539F\u56E0\uFF0C\u4E0D\u4F1A\u778E\u731C\u3002").addButton(
+    new import_obsidian17.Setting(host).setName("\u63A2\u6D4B\u771F\u5B9E\u4E0A\u9650").setDesc("\u5411\u63A5\u53E3\u95EE\u4E00\u6B21\uFF0C\u80FD\u8BFB\u5230\u5C31\u5199\u8FDB\u6765\uFF1B\u8BFB\u4E0D\u5230\u4F1A\u8BF4\u660E\u539F\u56E0\uFF0C\u4E0D\u4F1A\u778E\u731C\u3002").addButton(
       (button) => button.setButtonText(this.probing ? "\u63A2\u6D4B\u4E2D\u2026" : "\u63A2\u6D4B").onClick(async () => {
         var _a2, _b;
         if (this.probing)
           return;
         if (!this.draft.baseUrl.trim() || !this.draft.model.trim() || !this.draft.apiKey.trim()) {
-          new import_obsidian14.Notice("\u5148\u586B\u597D\u5730\u5740\u3001\u6A21\u578B\u548C Key \u518D\u63A2\u6D4B");
+          new import_obsidian17.Notice("\u5148\u586B\u597D\u5730\u5740\u3001\u6A21\u578B\u548C Key \u518D\u63A2\u6D4B");
           return;
         }
         this.probing = true;
@@ -7097,12 +9000,12 @@ var AIProfileModal = class extends import_obsidian14.Modal {
           });
           if (result.capability) {
             this.draft.capability = result.capability;
-            new import_obsidian14.Notice(`\u5DF2\u63A2\u6D4B\uFF1A${describeCapability(result.capability)}`);
+            new import_obsidian17.Notice(`\u5DF2\u63A2\u6D4B\uFF1A${describeCapability(result.capability)}`);
           } else {
-            new import_obsidian14.Notice((_b = result.notes[0]) != null ? _b : "\u6CA1\u6709\u63A2\u6D4B\u5230\uFF0C\u4FDD\u7559\u5F53\u524D\u503C");
+            new import_obsidian17.Notice((_b = result.notes[0]) != null ? _b : "\u6CA1\u6709\u63A2\u6D4B\u5230\uFF0C\u4FDD\u7559\u5F53\u524D\u503C");
           }
         } catch (error) {
-          new import_obsidian14.Notice(`\u63A2\u6D4B\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`);
+          new import_obsidian17.Notice(`\u63A2\u6D4B\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`);
         } finally {
           this.probing = false;
           this.renderFields();
@@ -7110,7 +9013,7 @@ var AIProfileModal = class extends import_obsidian14.Modal {
       })
     );
     host.createEl("h4", { text: "\u8C03\u7528\u504F\u597D" });
-    new import_obsidian14.Setting(host).setName("\u601D\u8003\u6A21\u5F0F").setDesc(
+    new import_obsidian17.Setting(host).setName("\u601D\u8003\u6A21\u5F0F").setDesc(
       "\u81EA\u52A8\uFF1A\u4E0D\u53D1\u9001\u601D\u8003\u53C2\u6570\uFF0C\u6CBF\u7528\u6A21\u578B\u9ED8\u8BA4\u884C\u4E3A\u3002\u5F00\u542F\uFF1A\u663E\u5F0F\u8BF7\u6C42\u63A8\u7406\uFF0C\u4F1A\u6D88\u8017\u8F93\u51FA\u989D\u5EA6\u3002\u5173\u95ED\uFF1A\u8DF3\u8FC7\u63A8\u7406\uFF0C\u6B63\u6587\u66F4\u591A\u3001\u54CD\u5E94\u66F4\u5FEB\uFF0C\u5206\u6790\u6DF1\u5EA6\u53EF\u80FD\u4E0B\u964D\u3002"
     ).addDropdown(
       (dropdown) => {
@@ -7120,7 +9023,7 @@ var AIProfileModal = class extends import_obsidian14.Modal {
         });
       }
     );
-    new import_obsidian14.Setting(host).setName("\u7F13\u5B58\u524D\u7F00").setDesc(
+    new import_obsidian17.Setting(host).setName("\u7F13\u5B58\u524D\u7F00").setDesc(
       "\u4EC5 Anthropic \u534F\u8BAE\u751F\u6548\uFF1A\u7ED9\u767D\u677F\u5185\u5BB9\u6253\u7F13\u5B58\u6807\u8BB0\uFF0C\u8FDE\u7EED\u8FFD\u95EE\u65F6\u8F93\u5165\u8D39\u5927\u5E45\u4E0B\u964D\uFF08\u5B9E\u6D4B\u53EF\u7701 99%\uFF09\u3002\u7F51\u5173\u4E0D\u652F\u6301\u65F6\u4F1A\u81EA\u52A8\u53BB\u6389\u91CD\u8BD5\u3002"
     ).addToggle(
       (toggle) => toggle.setValue(this.draft.cache !== false).onChange((value) => {
@@ -7137,15 +9040,15 @@ var AIProfileModal = class extends import_obsidian14.Modal {
     var _a, _b;
     const baseUrl = sanitizeBaseUrl(this.draft.baseUrl);
     if (!this.draft.name.trim()) {
-      new import_obsidian14.Notice("\u8BF7\u586B\u5199\u540D\u79F0");
+      new import_obsidian17.Notice("\u8BF7\u586B\u5199\u540D\u79F0");
       return;
     }
     if (!baseUrl) {
-      new import_obsidian14.Notice("\u8BF7\u586B\u5199\u63A5\u53E3\u5730\u5740");
+      new import_obsidian17.Notice("\u8BF7\u586B\u5199\u63A5\u53E3\u5730\u5740");
       return;
     }
     if (!this.draft.model.trim()) {
-      new import_obsidian14.Notice("\u8BF7\u586B\u5199\u6A21\u578B\u540D");
+      new import_obsidian17.Notice("\u8BF7\u586B\u5199\u6A21\u578B\u540D");
       return;
     }
     const capability = (_a = this.draft.capability) != null ? _a : inferCapability(this.draft.model.trim());
@@ -7167,7 +9070,7 @@ var AIProfileModal = class extends import_obsidian14.Modal {
 };
 
 // src/settingsTab.ts
-var VolisSettingTab = class extends import_obsidian15.PluginSettingTab {
+var VolisSettingTab = class extends import_obsidian18.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
@@ -7179,13 +9082,13 @@ var VolisSettingTab = class extends import_obsidian15.PluginSettingTab {
     containerEl.createEl("h2", { text: "Volis" });
     this.divider(containerEl);
     containerEl.createEl("h3", { text: "\u89D2\u6807" });
-    new import_obsidian15.Setting(containerEl).setName("\u663E\u793A\u89D2\u6807").setDesc("\u5728\u5361\u7247\u8282\u70B9\u53F3\u4E0B\u89D2\u663E\u793A\u65E5\u671F\u3002\u4EC5\u5728\u753B\u5E03\u89C6\u56FE\u4E2D\u751F\u6548\uFF0C\u4E0D\u5F71\u54CD\u5361\u7247\u6B63\u6587\u3002").addToggle(
+    new import_obsidian18.Setting(containerEl).setName("\u663E\u793A\u89D2\u6807").setDesc("\u5728\u5361\u7247\u8282\u70B9\u53F3\u4E0B\u89D2\u663E\u793A\u65E5\u671F\u3002\u4EC5\u5728\u753B\u5E03\u89C6\u56FE\u4E2D\u751F\u6548\uFF0C\u4E0D\u5F71\u54CD\u5361\u7247\u6B63\u6587\u3002").addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.showBadge).onChange(async (value) => {
         this.plugin.settings.showBadge = value;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian15.Setting(containerEl).setName("\u89D2\u6807\u5185\u5BB9").setDesc("\u7CBE\u7B80\u53EA\u663E\u793A\u65E5\u671F\uFF1B\u5B8C\u6574\u663E\u793A\u6807\u7B7E\u3001\u65E5\u671F\u548C\u65F6\u95F4\u3002").addDropdown(
+    new import_obsidian18.Setting(containerEl).setName("\u89D2\u6807\u5185\u5BB9").setDesc("\u7CBE\u7B80\u53EA\u663E\u793A\u65E5\u671F\uFF1B\u5B8C\u6574\u663E\u793A\u6807\u7B7E\u3001\u65E5\u671F\u548C\u65F6\u95F4\u3002").addDropdown(
       (dropdown) => dropdown.addOption("date", "\u7CBE\u7B80\uFF0811-11\uFF09").addOption("full", "\u5B8C\u6574\uFF08#\u6807\u7B7E 11-11 11:08\uFF09").setValue(this.plugin.settings.badgeFormat).onChange(async (value) => {
         this.plugin.settings.badgeFormat = value === "full" ? "full" : "date";
         await this.plugin.saveSettings();
@@ -7193,13 +9096,13 @@ var VolisSettingTab = class extends import_obsidian15.PluginSettingTab {
     );
     this.divider(containerEl);
     containerEl.createEl("h3", { text: "\u767D\u677F" });
-    new import_obsidian15.Setting(containerEl).setName("\u767D\u677F\u4FDD\u5B58\u4F4D\u7F6E").setDesc("\u65B0\u5EFA\u767D\u677F\u65F6\u628A\u6587\u4EF6\u5B58\u5230\u8FD9\u4E2A\u6587\u4EF6\u5939\uFF1B\u7559\u7A7A\u8868\u793A\u5E93\u6839\u76EE\u5F55\u3002\u6BCF\u6B21\u65B0\u5EFA\u90FD\u4F1A\u751F\u6210\u4E00\u4E2A\u72EC\u7ACB\u6587\u4EF6\u3002").addText(
+    new import_obsidian18.Setting(containerEl).setName("\u767D\u677F\u4FDD\u5B58\u4F4D\u7F6E").setDesc("\u65B0\u5EFA\u767D\u677F\u65F6\u628A\u6587\u4EF6\u5B58\u5230\u8FD9\u4E2A\u6587\u4EF6\u5939\uFF1B\u7559\u7A7A\u8868\u793A\u5E93\u6839\u76EE\u5F55\u3002\u6BCF\u6B21\u65B0\u5EFA\u90FD\u4F1A\u751F\u6210\u4E00\u4E2A\u72EC\u7ACB\u6587\u4EF6\u3002").addText(
       (text) => text.setPlaceholder("\u7559\u7A7A = \u5E93\u6839\u76EE\u5F55").setValue(this.plugin.settings.boardFolder).onChange(async (value) => {
         this.plugin.settings.boardFolder = value.trim();
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian15.Setting(containerEl).setName("\u5361\u7247\u7B14\u8BB0\u76EE\u5F55").setDesc("\u4ECE\u767D\u677F\u8F6C\u6210\u5361\u7247\u65F6\u5199\u5230\u8FD9\u91CC\u3002\u7559\u7A7A\u5219\u81EA\u52A8\u8BFB Collis \u7684\u8BBE\u7F6E\uFF0C\u8BFB\u4E0D\u5230\u7528 00-Inbox/\u901F\u8BB0\u3002").addText(
+    new import_obsidian18.Setting(containerEl).setName("\u5361\u7247\u7B14\u8BB0\u76EE\u5F55").setDesc("\u4ECE\u767D\u677F\u8F6C\u6210\u5361\u7247\u65F6\u5199\u5230\u8FD9\u91CC\u3002\u7559\u7A7A\u5219\u81EA\u52A8\u8BFB Collis \u7684\u8BBE\u7F6E\uFF0C\u8BFB\u4E0D\u5230\u7528 00-Inbox/\u901F\u8BB0\u3002").addText(
       (text) => text.setPlaceholder("\u7559\u7A7A = \u8DDF\u968F Collis").setValue(this.plugin.settings.cardFolder).onChange(async (value) => {
         this.plugin.settings.cardFolder = value.trim();
         await this.plugin.saveSettings();
@@ -7218,7 +9121,7 @@ var VolisSettingTab = class extends import_obsidian15.PluginSettingTab {
     containerEl.createEl("h3", { text: "AI" });
     const ai = this.plugin.settings.ai;
     const save = () => this.plugin.saveSettings();
-    new import_obsidian15.Setting(containerEl).setName("\u542F\u7528 AI").setDesc("\u5F00\u542F\u540E\u53EF\u5728\u767D\u677F\u4E2D\u9009\u4E2D\u8282\u70B9\u63D0\u95EE\uFF0C\u5185\u5BB9\u53D1\u9001\u81F3\u5F53\u524D\u542F\u7528\u7684\u6A21\u578B\u3002").addToggle(
+    new import_obsidian18.Setting(containerEl).setName("\u542F\u7528 AI").setDesc("\u5F00\u542F\u540E\u53EF\u5728\u767D\u677F\u4E2D\u9009\u4E2D\u8282\u70B9\u63D0\u95EE\uFF0C\u5185\u5BB9\u53D1\u9001\u81F3\u5F53\u524D\u542F\u7528\u7684\u6A21\u578B\u3002").addToggle(
       (toggle) => toggle.setValue(ai.enabled).onChange(async (value) => {
         ai.enabled = value;
         await save();
@@ -7228,7 +9131,7 @@ var VolisSettingTab = class extends import_obsidian15.PluginSettingTab {
       cls: "volis-ai-hint",
       text: "\u53D1\u9001\u91CF\u7531\u6A21\u578B\u81EA\u5DF1\u7684\u7A97\u53E3\u51B3\u5B9A\uFF0C\u63D2\u4EF6\u4E0D\u989D\u5916\u8BBE\u9650\uFF1B\u5B9E\u9645\u7528\u91CF\u89C1 AI \u9762\u677F\u9876\u90E8\u3002\u6279\u91CF\u5904\u7406\u4E0A\u767E\u6761\u5361\u7247\u65F6\u5EFA\u8BAE\u9009 200K \u4EE5\u4E0A\u7A97\u53E3\u7684\u6A21\u578B\u3002"
     });
-    new import_obsidian15.Setting(containerEl).setName("\u9ED8\u8BA4\u601D\u8003\u6A21\u5F0F").setDesc(
+    new import_obsidian18.Setting(containerEl).setName("\u9ED8\u8BA4\u601D\u8003\u6A21\u5F0F").setDesc(
       "\u65B0\u5EFA\u914D\u7F6E\u672A\u5355\u72EC\u6307\u5B9A\u65F6\u91C7\u7528\u3002\u5F00\u542F\uFF1A\u6A21\u578B\u5148\u63A8\u7406\u518D\u4F5C\u7B54\uFF0C\u5360\u7528\u8F93\u51FA\u989D\u5EA6\uFF0C\u5206\u6790\u66F4\u6DF1\u3002\u5173\u95ED\uFF1A\u8DF3\u8FC7\u63A8\u7406\uFF0C\u6B63\u6587\u66F4\u591A\u3001\u54CD\u5E94\u66F4\u5FEB\u3002\u81EA\u52A8\uFF1A\u6CBF\u7528\u6A21\u578B\u5382\u5546\u7684\u9ED8\u8BA4\u884C\u4E3A\u3002"
     ).addDropdown(
       (dropdown) => dropdown.addOption("auto", "\u81EA\u52A8\uFF08\u6CBF\u7528\u6A21\u578B\u9ED8\u8BA4\uFF09").addOption("on", "\u5F00\u542F\uFF08\u663E\u5F0F\u542F\u7528\u63A8\u7406\uFF09").addOption("off", "\u5173\u95ED\uFF08\u8DF3\u8FC7\u63A8\u7406\uFF09").setValue(ai.thinking).onChange(async (value) => {
@@ -7236,13 +9139,13 @@ var VolisSettingTab = class extends import_obsidian15.PluginSettingTab {
         await save();
       })
     );
-    new import_obsidian15.Setting(containerEl).setName("\u5185\u5BB9\u88C5\u4E0D\u4E0B\u65F6").setDesc("\u8D85\u51FA\u6A21\u578B\u7A97\u53E3\u65F6\u7684\u5904\u7406\u65B9\u5F0F\u3002\u4E24\u79CD\u65B9\u5F0F\u90FD\u4E0D\u4F1A\u9759\u9ED8\u5C11\u53D1\u3002").addDropdown(
+    new import_obsidian18.Setting(containerEl).setName("\u5185\u5BB9\u88C5\u4E0D\u4E0B\u65F6").setDesc("\u8D85\u51FA\u6A21\u578B\u7A97\u53E3\u65F6\u7684\u5904\u7406\u65B9\u5F0F\u3002\u4E24\u79CD\u65B9\u5F0F\u90FD\u4E0D\u4F1A\u9759\u9ED8\u5C11\u53D1\u3002").addDropdown(
       (dropdown) => dropdown.addOption("auto", "\u81EA\u52A8\u538B\u7F29\uFF08\u9762\u677F\u6807\u6CE8\u8C03\u6574\u5185\u5BB9\uFF09").addOption("ask", "\u5148\u8BE2\u95EE\u6211").setValue(ai.onOverflow).onChange(async (value) => {
         ai.onOverflow = value === "ask" ? "ask" : "auto";
         await save();
       })
     );
-    new import_obsidian15.Setting(containerEl).setName("\u6700\u591A\u7EED\u5199\u6BB5\u6570").setDesc("\u56DE\u7B54\u88AB\u8F93\u51FA\u4E0A\u9650\u622A\u65AD\u65F6\u81EA\u52A8\u7EED\u5199\u7684\u6BB5\u6570\uFF1B0 \u8868\u793A\u4E0D\u7EED\u5199\u3002").addSlider(
+    new import_obsidian18.Setting(containerEl).setName("\u6700\u591A\u7EED\u5199\u6BB5\u6570").setDesc("\u56DE\u7B54\u88AB\u8F93\u51FA\u4E0A\u9650\u622A\u65AD\u65F6\u81EA\u52A8\u7EED\u5199\u7684\u6BB5\u6570\uFF1B0 \u8868\u793A\u4E0D\u7EED\u5199\u3002").addSlider(
       (slider) => slider.setLimits(0, 6, 1).setValue(ai.continuations).setDynamicTooltip().onChange(async (value) => {
         ai.continuations = value;
         await save();
@@ -7256,7 +9159,7 @@ var VolisSettingTab = class extends import_obsidian15.PluginSettingTab {
     const ai = this.plugin.settings.ai;
     const details = containerEl.createEl("details", { cls: "volis-ai-advanced" });
     details.createEl("summary", { text: "\u9AD8\u7EA7 \xB7 \u5185\u5BB9\u5206\u914D\u89C4\u5219" });
-    new import_obsidian15.Setting(details).setName("\u7B14\u8BB0\u6BCF\u7BC7\u4FDD\u5E95\uFF08\u5B57\u7B26\uFF09").setDesc("\u957F\u7B14\u8BB0\u88AB\u538B\u7F29\u65F6\u81F3\u5C11\u4FDD\u7559\u8FD9\u4E48\u591A\u5B57\uFF0C\u907F\u514D\u53EA\u5269\u5F00\u5934\u4E00\u53E5\u3002").addText((text) => {
+    new import_obsidian18.Setting(details).setName("\u7B14\u8BB0\u6BCF\u7BC7\u4FDD\u5E95\uFF08\u5B57\u7B26\uFF09").setDesc("\u957F\u7B14\u8BB0\u88AB\u538B\u7F29\u65F6\u81F3\u5C11\u4FDD\u7559\u8FD9\u4E48\u591A\u5B57\uFF0C\u907F\u514D\u53EA\u5269\u5F00\u5934\u4E00\u53E5\u3002").addText((text) => {
       text.inputEl.type = "number";
       text.setPlaceholder(String(DEFAULT_CONTEXT_POLICY.noteFloorChars)).setValue(String(ai.policy.noteFloorChars)).onChange(async (value) => {
         const parsed = Number(value);
@@ -7266,7 +9169,7 @@ var VolisSettingTab = class extends import_obsidian15.PluginSettingTab {
         await save();
       });
     });
-    new import_obsidian15.Setting(details).setName("\u7B14\u8BB0\u5355\u7BC7\u4E0A\u9650\uFF08\u5B57\u7B26\uFF09").setDesc("\u5355\u7BC7\u6700\u591A\u53D1\u9001\u591A\u5C11\u5B57\uFF0C\u9632\u6B62\u4E00\u7BC7\u957F\u6587\u5403\u6389\u6574\u4E2A\u9884\u7B97\u3002").addText((text) => {
+    new import_obsidian18.Setting(details).setName("\u7B14\u8BB0\u5355\u7BC7\u4E0A\u9650\uFF08\u5B57\u7B26\uFF09").setDesc("\u5355\u7BC7\u6700\u591A\u53D1\u9001\u591A\u5C11\u5B57\uFF0C\u9632\u6B62\u4E00\u7BC7\u957F\u6587\u5403\u6389\u6574\u4E2A\u9884\u7B97\u3002").addText((text) => {
       text.inputEl.type = "number";
       text.setPlaceholder(String(DEFAULT_CONTEXT_POLICY.noteCapChars)).setValue(String(ai.policy.noteCapChars)).onChange(async (value) => {
         const parsed = Number(value);
@@ -7276,7 +9179,7 @@ var VolisSettingTab = class extends import_obsidian15.PluginSettingTab {
         await save();
       });
     });
-    new import_obsidian15.Setting(details).setName("\u666E\u901A\u8282\u70B9\u538B\u7F29\u9636\u68AF\uFF08\u5B57\u7B26\uFF09").setDesc("\u9884\u7B97\u4E0D\u591F\u65F6\u6309\u8FD9\u4E2A\u987A\u5E8F\u9010\u7EA7\u538B\u7F29\uFF0C\u9017\u53F7\u5206\u9694\uFF0C\u4ECE\u5BBD\u5230\u7A84\u3002").addText((text) => {
+    new import_obsidian18.Setting(details).setName("\u666E\u901A\u8282\u70B9\u538B\u7F29\u9636\u68AF\uFF08\u5B57\u7B26\uFF09").setDesc("\u9884\u7B97\u4E0D\u591F\u65F6\u6309\u8FD9\u4E2A\u987A\u5E8F\u9010\u7EA7\u538B\u7F29\uFF0C\u9017\u53F7\u5206\u9694\uFF0C\u4ECE\u5BBD\u5230\u7A84\u3002").addText((text) => {
       text.setPlaceholder(DEFAULT_CONTEXT_POLICY.ladder.join(", ")).setValue(ai.policy.ladder.join(", ")).onChange(async (value) => {
         const ladder = value.split(/[,，\s]+/).map((part) => Number(part)).filter((part) => Number.isFinite(part) && part >= 0);
         if (ladder.length === 0)
@@ -7285,7 +9188,7 @@ var VolisSettingTab = class extends import_obsidian15.PluginSettingTab {
         await save();
       });
     });
-    new import_obsidian15.Setting(details).setName("\u9884\u7B97\u5B89\u5168\u4F59\u91CF\uFF08token\uFF09").setDesc("\u6BCF\u6B21\u8BF7\u6C42\u9884\u7559\u8FD9\u4E48\u591A\uFF0C\u5438\u6536\u4F30\u7B97\u8BEF\u5DEE\u548C system \u63D0\u793A\u3002").addText((text) => {
+    new import_obsidian18.Setting(details).setName("\u9884\u7B97\u5B89\u5168\u4F59\u91CF\uFF08token\uFF09").setDesc("\u6BCF\u6B21\u8BF7\u6C42\u9884\u7559\u8FD9\u4E48\u591A\uFF0C\u5438\u6536\u4F30\u7B97\u8BEF\u5DEE\u548C system \u63D0\u793A\u3002").addText((text) => {
       text.inputEl.type = "number";
       text.setPlaceholder(String(DEFAULT_CONTEXT_POLICY.safetyTokens)).setValue(String(ai.policy.safetyTokens)).onChange(async (value) => {
         const parsed = Number(value);
@@ -7343,7 +9246,7 @@ var VolisSettingTab = class extends import_obsidian15.PluginSettingTab {
           cls: "volis-ai-icon",
           attr: { "aria-label": "\u7F16\u8F91" }
         });
-        (0, import_obsidian15.setIcon)(editBtn, "pencil");
+        (0, import_obsidian18.setIcon)(editBtn, "pencil");
         editBtn.addEventListener("click", () => {
           new AIProfileModal(this.app, profile, async (next) => {
             const index = ai.profiles.findIndex((item) => item.id === profile.id);
@@ -7358,7 +9261,7 @@ var VolisSettingTab = class extends import_obsidian15.PluginSettingTab {
           cls: "volis-ai-icon is-danger",
           attr: { "aria-label": "\u5220\u9664" }
         });
-        (0, import_obsidian15.setIcon)(delBtn, "trash-2");
+        (0, import_obsidian18.setIcon)(delBtn, "trash-2");
         delBtn.addEventListener("click", async () => {
           var _a2, _b;
           ai.profiles = ai.profiles.filter((item) => item.id !== profile.id);
@@ -7371,7 +9274,7 @@ var VolisSettingTab = class extends import_obsidian15.PluginSettingTab {
       }
     };
     renderCards();
-    new import_obsidian15.Setting(containerEl).setName("\u6DFB\u52A0\u914D\u7F6E").setDesc("\u6BCF\u4E2A\u914D\u7F6E\u53EF\u4EE5\u586B\u81EA\u5DF1\u7684\u7A97\u53E3\u548C\u8F93\u51FA\u4E0A\u9650\uFF0C\u4E92\u4E0D\u5F71\u54CD\u3002").addButton(
+    new import_obsidian18.Setting(containerEl).setName("\u6DFB\u52A0\u914D\u7F6E").setDesc("\u6BCF\u4E2A\u914D\u7F6E\u53EF\u4EE5\u586B\u81EA\u5DF1\u7684\u7A97\u53E3\u548C\u8F93\u51FA\u4E0A\u9650\uFF0C\u4E92\u4E0D\u5F71\u54CD\u3002").addButton(
       (button) => button.setButtonText("\u6DFB\u52A0\u914D\u7F6E").setCta().onClick(() => {
         new AIProfileModal(this.app, null, async (profile) => {
           ai.profiles.push(profile);
@@ -7389,7 +9292,7 @@ var VolisSettingTab = class extends import_obsidian15.PluginSettingTab {
     const stat = containerEl.createEl("p", {
       text: "\u5728\u753B\u5E03\u89C6\u56FE\u4E2D\u6253\u5F00\u672C\u9875\uFF0C\u53EF\u770B\u5230\u5F53\u524D\u8BC6\u522B\u5230\u7684\u5361\u7247\u6570\u91CF\u3002"
     });
-    new import_obsidian15.Setting(containerEl).setName("\u5F53\u524D\u753B\u5E03").addButton(
+    new import_obsidian18.Setting(containerEl).setName("\u5F53\u524D\u753B\u5E03").addButton(
       (button) => button.setButtonText("\u5237\u65B0\u8BC6\u522B").onClick(() => {
         this.plugin.scheduleRefresh(0);
         window.setTimeout(() => {
@@ -7401,7 +9304,7 @@ var VolisSettingTab = class extends import_obsidian15.PluginSettingTab {
       (profile) => profile.id === this.plugin.settings.ai.activeId
     );
     const capability = (_b = active == null ? void 0 : active.capability) != null ? _b : inferCapability((_a = active == null ? void 0 : active.model) != null ? _a : "");
-    new import_obsidian15.Setting(containerEl).setName("\u5F53\u524D\u6A21\u578B\u53EF\u7528\u8F93\u5165").setDesc(
+    new import_obsidian18.Setting(containerEl).setName("\u5F53\u524D\u6A21\u578B\u53EF\u7528\u8F93\u5165").setDesc(
       `\u7A97\u53E3 ${formatTokens(capability.contextWindow)} \u2212 \u8F93\u51FA ${formatTokens(capability.maxOutput)} \u2212 \u4F59\u91CF ${formatTokens(
         this.plugin.settings.ai.policy.safetyTokens
       )}`
@@ -7418,7 +9321,7 @@ var RIBBON_ICON = `
   <path d="M6 15.5C8.2 10.5 11 10.2 11.8 12.4C12.6 14.6 15.4 14.8 17.6 10.2"/>
   <circle cx="18.6" cy="6.6" r="1.5" fill="currentColor" stroke="none"/>
 </svg>`;
-var VolisPlugin = class extends import_obsidian16.Plugin {
+var VolisPlugin = class extends import_obsidian19.Plugin {
   constructor() {
     super(...arguments);
     this.observer = null;
@@ -7473,20 +9376,16 @@ var VolisPlugin = class extends import_obsidian16.Plugin {
     var _a;
     const folder = (_a = this.settings.boardFolder) != null ? _a : "";
     const path = await nextBoardPath(this.app, folder);
-    let initial = JSON.stringify({ version: 1, nodes: [] }, null, 2);
-    if (listBoards(this.app).length === 0) {
-      const legacy = await loadBoardFile(this.app, LEGACY_BOARD_PATH);
-      if (legacy && legacy.nodes.length > 0) {
-        initial = JSON.stringify(legacy, null, 2);
-      }
-    }
-    const file = await this.app.vault.create(path, initial);
+    const file = await this.app.vault.create(
+      path,
+      JSON.stringify(blankBoardData(), null, 2)
+    );
     await this.openBoardFile(file.path);
   }
   async openBoardFile(path) {
     var _a;
     const file = this.app.vault.getAbstractFileByPath(path);
-    if (!(file instanceof import_obsidian16.TFile))
+    if (!(file instanceof import_obsidian19.TFile))
       return;
     for (const leaf2 of this.app.workspace.getLeavesOfType(VIEW_TYPE_VOLIS_BOARD)) {
       const view = leaf2.view;
@@ -7626,7 +9525,7 @@ var VolisPlugin = class extends import_obsidian16.Plugin {
       };
     }
     console.log("[Volis] self-check", info);
-    new import_obsidian16.Notice(
+    new import_obsidian19.Notice(
       `Volis \u81EA\u68C0 \xB7 \u753B\u5E03:${info.hasCanvasView ? "\u6709" : "\u65E0"} \xB7 \u8282\u70B9:${info.nodeCount} \xB7 \u8BC6\u522B:${info.recognized}`,
       1e4
     );
@@ -7759,7 +9658,7 @@ var VolisPlugin = class extends import_obsidian16.Plugin {
       meta.editable,
       async (value) => {
         if (!value.trim()) {
-          new import_obsidian16.Notice("\u5185\u5BB9\u4E3A\u7A7A\uFF0C\u672A\u4FDD\u5B58");
+          new import_obsidian19.Notice("\u5185\u5BB9\u4E3A\u7A7A\uFF0C\u672A\u4FDD\u5B58");
           this.scheduleRefresh(0);
           return;
         }
@@ -7768,7 +9667,7 @@ var VolisPlugin = class extends import_obsidian16.Plugin {
           return;
         const ok = await writeCard(this.app, meta.ref, next);
         if (!ok) {
-          new import_obsidian16.Notice("\u4FDD\u5B58\u5931\u8D25\uFF1A\u5361\u7247\u53EF\u80FD\u5DF2\u79FB\u52A8\u6216\u5220\u9664");
+          new import_obsidian19.Notice("\u4FDD\u5B58\u5931\u8D25\uFF1A\u5361\u7247\u53EF\u80FD\u5DF2\u79FB\u52A8\u6216\u5220\u9664");
           return;
         }
         this.index.clear();
@@ -7791,7 +9690,7 @@ var VolisPlugin = class extends import_obsidian16.Plugin {
     this.registerEvent(this.app.workspace.on("file-open", () => this.scheduleRefresh(150)));
     this.registerEvent(
       this.app.metadataCache.on("changed", (file) => {
-        if (file instanceof import_obsidian16.TFile)
+        if (file instanceof import_obsidian19.TFile)
           this.sync.handleModify(file);
       })
     );
@@ -7804,6 +9703,39 @@ var VolisPlugin = class extends import_obsidian16.Plugin {
         const view = this.getCanvasView();
         if (view)
           view.openAIPanel();
+      }
+    });
+    this.addCommand({
+      id: "board-doctor",
+      name: "\u767D\u677F\u4F53\u68C0",
+      callback: () => {
+        const view = this.getCanvasView();
+        if (view)
+          view.openBoardDoctor();
+      }
+    });
+    this.addCommand({
+      id: "board-outline",
+      name: "\u6253\u5F00\u767D\u677F\u5927\u7EB2",
+      checkCallback: (checking) => {
+        const view = this.app.workspace.getActiveViewOfType(BoardView);
+        if (!view)
+          return false;
+        if (!checking)
+          view.openOutlinePanel();
+        return true;
+      }
+    });
+    this.addCommand({
+      id: "board-export-markdown",
+      name: "\u5BFC\u51FA\u767D\u677F\u4E3A Markdown",
+      checkCallback: (checking) => {
+        const view = this.app.workspace.getActiveViewOfType(BoardView);
+        if (!view)
+          return false;
+        if (!checking)
+          view.openExportModal();
+        return true;
       }
     });
     this.addCommand({
@@ -7897,7 +9829,7 @@ var VolisPlugin = class extends import_obsidian16.Plugin {
           return false;
         if (!checking) {
           void navigator.clipboard.writeText(makeBlockLink(meta.ref)).then(() => {
-            new import_obsidian16.Notice("\u5DF2\u590D\u5236\u5757\u94FE\u63A5");
+            new import_obsidian19.Notice("\u5DF2\u590D\u5236\u5757\u94FE\u63A5");
           });
         }
         return true;
@@ -7937,7 +9869,7 @@ var VolisPlugin = class extends import_obsidian16.Plugin {
         if (!ctx.entry.meta)
           return;
         await navigator.clipboard.writeText(makeBlockLink(ctx.entry.meta.ref));
-        new import_obsidian16.Notice("\u5DF2\u590D\u5236\u5757\u94FE\u63A5");
+        new import_obsidian19.Notice("\u5DF2\u590D\u5236\u5757\u94FE\u63A5");
       }
     });
     this.registry.register({
@@ -7989,8 +9921,8 @@ var VolisPlugin = class extends import_obsidian16.Plugin {
   async locateCard(meta) {
     var _a, _b, _c, _d, _e;
     const file = this.app.vault.getAbstractFileByPath(meta.ref.file);
-    if (!(file instanceof import_obsidian16.TFile)) {
-      new import_obsidian16.Notice("\u627E\u4E0D\u5230\u6E90\u6587\u4EF6");
+    if (!(file instanceof import_obsidian19.TFile)) {
+      new import_obsidian19.Notice("\u627E\u4E0D\u5230\u6E90\u6587\u4EF6");
       return;
     }
     const cache = this.app.metadataCache.getFileCache(file);
@@ -8012,7 +9944,7 @@ var VolisPlugin = class extends import_obsidian16.Plugin {
       }
       this.scheduleRefresh(150);
     } catch (error) {
-      new import_obsidian16.Notice("\u65E0\u6CD5\u79FB\u9664\u8BE5\u8282\u70B9");
+      new import_obsidian19.Notice("\u65E0\u6CD5\u79FB\u9664\u8BE5\u8282\u70B9");
     }
   }
 };

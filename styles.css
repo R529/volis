@@ -805,6 +805,93 @@
   pointer-events: none;
 }
 
+/* Label chip on the line's midpoint. A plate in the card colour with a hairline
+   border, so the stroke reads as interrupted behind the text instead of cutting
+   through it, and the chip reads as a chip on the canvas in either theme. Size
+   and radius are set as attributes from the text metrics in BoardView.ts. */
+.volis-edge-label-bg {
+  fill: var(--background-primary);
+  stroke: var(--background-modifier-border);
+  stroke-width: 1px;
+  vector-effect: non-scaling-stroke;
+  pointer-events: all;
+  cursor: pointer;
+  transition: stroke 120ms ease;
+}
+
+/* Font comes from BoardView.ts (inline `font`), because the chip width is
+   measured from that exact spec; only paint lives here. */
+.volis-edge-label {
+  fill: var(--text-muted);
+  pointer-events: all;
+  cursor: pointer;
+  user-select: none;
+  transition: fill 120ms ease;
+}
+
+.volis-edge-label.is-relation {
+  fill: var(--text-faint);
+}
+
+.volis-edge-group:hover .volis-edge-label-bg,
+.volis-edge-group.is-selected .volis-edge-label-bg {
+  stroke: var(--interactive-accent);
+}
+
+.volis-edge-group:hover .volis-edge-label,
+.volis-edge-group.is-selected .volis-edge-label {
+  fill: var(--text-normal);
+}
+
+/* Inline label input, anchored in world space on the line itself. BoardView
+   owns the transform (it cancels the board zoom so the field stays readable). */
+.volis-edge-label-editor {
+  position: absolute;
+  z-index: 45;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  transform: translate(-50%, -50%);
+}
+
+.volis-edge-relation-select {
+  box-sizing: border-box;
+  width: 220px;
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 9px;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-family: var(--font-interface);
+  font-size: 13px;
+  outline: none;
+}
+
+.volis-edge-relation-select:focus {
+  border-color: var(--interactive-accent);
+}
+
+.volis-edge-label-input {
+  box-sizing: border-box;
+  width: 220px;
+  height: 36px;
+  padding: 0 12px;
+  border: 1px solid var(--interactive-accent);
+  border-radius: 10px;
+  background: var(--background-primary);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.16);
+  color: var(--text-normal);
+  font-family: var(--font-interface);
+  font-size: 14px;
+  text-align: center;
+  outline: none;
+}
+
+.volis-edge-label-input::placeholder {
+  color: var(--text-faint);
+}
+
 .volis-port {
   position: absolute;
   z-index: 5;
@@ -2494,4 +2581,655 @@
   border-color: transparent;
   background: var(--interactive-accent);
   color: var(--text-on-accent);
+}
+
+/* Temporary node numbers, top-left, mirrored from the type badge. */
+.volis-ai-node-number {
+  position: absolute;
+  top: -9px;
+  left: 10px;
+  z-index: 11;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 19px;
+  padding: 0 5px;
+  border-radius: 5px;
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  font-size: 10.5px;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+  pointer-events: none;
+  user-select: none;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.22);
+}
+
+/* Clickable N1 references inside an answer.
+   A translucent tint reads as a chip on either theme; the dark value only
+   lifts a little so it stays quiet next to running text. */
+.volis-ai-reply {
+  --volis-nref-bg: rgba(0, 0, 0, 0.045);
+  --volis-nref-bg-hover: rgba(0, 0, 0, 0.09);
+}
+
+.theme-dark .volis-ai-reply {
+  --volis-nref-bg: rgba(255, 255, 255, 0.065);
+  --volis-nref-bg-hover: rgba(255, 255, 255, 0.12);
+}
+
+/* The app's own button defaults outrank a plain class selector, so the
+   background is forced here — everything else stays inherited. */
+.volis-ai-reply .volis-ai-nref {
+  display: inline;
+  padding: 0 3px;
+  border: none;
+  border-radius: 4px;
+  background: var(--volis-nref-bg) !important;
+  box-shadow: none;
+  color: inherit;
+  font: inherit;
+  line-height: inherit;
+  cursor: pointer;
+  transition: background-color 0.12s ease;
+}
+
+.volis-ai-reply .volis-ai-nref:hover {
+  background: var(--volis-nref-bg-hover) !important;
+  text-decoration: underline;
+}
+
+/* ── Board doctor ──────────────────────────────────────── */
+
+/* Width is also set inline on .modal-el so it beats the theme's own rule. */
+.volis-doctor-modal {
+  overflow: hidden;
+}
+
+.volis-doctor-content {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.volis-doctor-drag {
+  cursor: move;
+  user-select: none;
+}
+
+.volis-doctor-summary {
+  flex: none;
+  margin: 4px 0 10px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+/* Only the findings scroll; summary and footer stay in view. */
+.volis-doctor-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: 46vh;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding-right: 6px;
+}
+
+.volis-doctor-empty {
+  padding: 28px 0 12px;
+  color: var(--text-faint);
+  font-size: 13px;
+  text-align: center;
+}
+
+.volis-doctor-group {
+  margin-top: 14px;
+}
+
+.volis-doctor-group-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  color: var(--text-normal);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.volis-doctor-group-note {
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.volis-doctor-count {
+  margin-left: auto;
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.volis-doctor-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  min-width: 0;
+  overflow: hidden;
+  padding: 9px 2px;
+  border-bottom: 1px solid var(--background-modifier-hover);
+}
+
+.volis-doctor-row:last-child {
+  border-bottom: none;
+}
+
+.volis-doctor-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  margin-top: 5px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+
+.volis-doctor-dot.is-error { background: var(--text-error); }
+.volis-doctor-dot.is-warning { background: var(--text-warning); }
+.volis-doctor-dot.is-hint { background: var(--interactive-accent); }
+
+.volis-doctor-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.volis-doctor-title {
+  color: var(--text-normal);
+  font-size: 13px;
+}
+
+.volis-doctor-detail {
+  margin-top: 3px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.volis-doctor-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.volis-doctor-btn {
+  padding: 3px 9px;
+  font-size: 12px;
+}
+
+.volis-doctor-btn.is-danger {
+  color: var(--text-error);
+}
+
+.volis-doctor-foot {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text-faint);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.volis-doctor-footer {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 10px;
+}
+
+/* ── In-board shortcut help ────────────────────────────── */
+
+.volis-help-modal {
+  overflow: hidden;
+}
+
+.volis-help-content {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.volis-help-scope {
+  flex: none;
+  margin: 2px 0 10px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.volis-help-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: 54vh;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding-right: 6px;
+}
+
+.volis-help-group {
+  margin-top: 12px;
+}
+
+.volis-help-group-title {
+  padding-bottom: 5px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  color: var(--text-normal);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.volis-help-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  padding: 7px 2px;
+  border-bottom: 1px solid var(--background-modifier-hover);
+}
+
+.volis-help-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text-normal);
+  font-size: 13px;
+}
+
+.volis-help-keys {
+  display: flex;
+  flex: 0 0 auto;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.volis-help-key {
+  padding: 2px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  background: var(--background-modifier-hover);
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.volis-help-foot {
+  flex: none;
+  margin-top: 12px;
+  color: var(--text-faint);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/* ── Outline panel ───────────────────────────────────── */
+
+.volis-outline-panel {
+  position: absolute;
+  z-index: 58;
+  display: flex;
+  flex-direction: column;
+  width: 400px;
+  max-width: calc(100% - 32px);
+  max-height: min(80%, 760px);
+  overflow: hidden;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 14px;
+  background: var(--background-primary);
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.16);
+}
+
+.volis-outline-head {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 10px 9px 13px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+  cursor: grab;
+  user-select: none;
+}
+
+.volis-outline-panel.is-dragging .volis-outline-head {
+  cursor: grabbing;
+}
+
+.volis-outline-head-icon {
+  display: flex;
+  align-items: center;
+  color: var(--interactive-accent);
+}
+
+.volis-outline-head-icon svg {
+  width: 15px;
+  height: 15px;
+}
+
+.volis-outline-head-title {
+  color: var(--text-normal);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.volis-outline-head-meta {
+  overflow: hidden;
+  color: var(--text-faint);
+  font-size: 11px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.volis-outline-head-spacer {
+  flex: 1 1 auto;
+}
+
+.volis-outline-head .volis-outline-head-btn {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  background-color: transparent;
+  box-shadow: none;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.volis-outline-head .volis-outline-head-btn:hover {
+  background: var(--background-modifier-hover);
+  background-color: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.volis-outline-head-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+.volis-outline-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 4px 0 8px;
+}
+
+.volis-outline-body > .volis-outline-row {
+  margin-top: 6px;
+}
+
+.volis-outline-body > .volis-outline-row:first-child {
+  margin-top: 0;
+}
+
+.volis-outline-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 3px;
+  padding: 6px 8px;
+  cursor: pointer;
+}
+
+.volis-outline-children {
+  margin: 2px 0 0 15px;
+  padding-left: 4px;
+  border-left: 1px solid var(--background-modifier-border);
+}
+
+.volis-outline-row:hover {
+  background: var(--background-modifier-hover);
+}
+
+.volis-outline-row.is-active {
+  background: var(--background-modifier-active-hover, var(--background-modifier-hover));
+}
+
+.volis-outline-toggle {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 18px;
+  margin-top: 1px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+
+.volis-outline-toggle:hover {
+  color: var(--text-normal);
+  background: transparent;
+}
+
+.volis-outline-toggle svg {
+  width: 13px;
+  height: 13px;
+}
+
+.volis-outline-toggle.is-empty {
+  visibility: hidden;
+}
+
+.volis-outline-main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.volis-outline-title-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.volis-outline-title {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-normal);
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.volis-outline-row.is-root .volis-outline-title {
+  font-weight: 600;
+}
+
+.volis-outline-row.is-group .volis-outline-title {
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.volis-outline-relation {
+  flex: 0 0 auto;
+  padding: 0 5px;
+  border-radius: 999px;
+  font-size: 10px;
+  line-height: 16px;
+}
+
+.volis-outline-relation.is-derives {
+  background: rgba(59, 130, 246, 0.14);
+  color: #3b82f6;
+}
+
+.volis-outline-relation.is-causes {
+  background: rgba(249, 115, 22, 0.14);
+  color: #f97316;
+}
+
+.volis-outline-badges {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.volis-outline-badge {
+  flex: 0 0 auto;
+  padding: 0 5px;
+  border-radius: 999px;
+  font-size: 10px;
+  line-height: 16px;
+  white-space: nowrap;
+}
+
+.volis-outline-badge.is-supports {
+  background: rgba(34, 197, 94, 0.14);
+  color: #22c55e;
+}
+
+.volis-outline-badge.is-refutes {
+  background: rgba(239, 68, 68, 0.14);
+  color: #ef4444;
+}
+
+.volis-outline-badge.is-source {
+  background: rgba(168, 85, 247, 0.14);
+  color: #a855f7;
+}
+
+.volis-outline-snippet {
+  margin-top: 1px;
+  overflow: hidden;
+  color: var(--text-faint);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.volis-outline-empty {
+  padding: 22px 18px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.6;
+  text-align: center;
+}
+
+.volis-outline-note {
+  margin: 8px 10px 2px;
+  padding: 7px 9px;
+  border-radius: 8px;
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+/* ── Markdown export ───────────────────────────────────── */
+
+.volis-export-modal {
+  overflow: hidden;
+}
+
+.volis-export-content {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.volis-export-sub {
+  flex: none;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.volis-export-tabs {
+  display: flex;
+  flex: none;
+  gap: 6px;
+}
+
+.volis-export-tab {
+  padding: 4px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 999px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.volis-export-tab.is-active {
+  border-color: var(--interactive-accent);
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+
+.volis-export-preview {
+  flex: 1 1 auto;
+  width: 100%;
+  height: 46vh;
+  min-height: 260px;
+  padding: 12px 14px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-size: 12.5px;
+  line-height: 1.6;
+  white-space: pre;
+  resize: none;
+}
+
+.volis-export-footer {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.volis-export-foot {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text-faint);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.volis-export-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
+}
+
+.volis-export-btn {
+  padding: 5px 14px;
+  font-size: 12.5px;
+}
+
+.volis-export-drag {
+  cursor: move;
+  user-select: none;
 }

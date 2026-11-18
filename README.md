@@ -16,11 +16,16 @@ Everything stays local except the requests you explicitly send to your own AI pr
 **Board manipulation**
 - Multi-select, drag, resize, align and distribute. Smart guides appear while dragging.
 - Group nodes into labelled frames with their own background colour; moving a frame moves its members.
-- Connection tool with colour, three arrow states and edge labels.
+- Connection tool with colour, three arrow states and edge labels — add or edit a label from the line's toolbar or by double-clicking the line itself.
+- Connections can carry a semantic relation (supports, refutes, causes, derives, source, sequence). The relation lives on the edge, shows on the line, and is sent to the AI as context.
 - Per-node colours with a custom colour picker.
 - Type badges for card / note / text / media nodes.
 - In-board search that zooms to and highlights the matching node.
+- Read-only board health check that reports broken references, dangling lines, unlabelled connections and duplicates — fixes are manual and undoable.
 - Minimap for navigating large boards.
+- Read-only help panel listing the shortcuts that work inside the board.
+- Floating outline generated from the connections: derives and causes build the hierarchy, sequence orders siblings, and supports / refutes / source show up as badges.
+- Markdown export with a preview: copy it or save it as a note next to the board, as headings or as a nested list.
 
 **AI on the board**
 - Select nodes (or a whole group) and ask questions about them in a chat-style panel.
@@ -31,8 +36,8 @@ Everything stays local except the requests you explicitly send to your own AI pr
 - Automatic handling of output caps: continuation, token-budget accounting and cache-aware prompts.
 
 **Safety**
-- The board file stays valid JSON Canvas. Uninstalling leaves it readable by Obsidian.
-- No block format changes, no custom fields, no new card files.
+- The board file stays JSON Canvas-compatible; Volis-specific edge metadata (labels, relations) lives only in the board file. Uninstalling leaves your notes untouched.
+- No block format changes and no new card files.
 - API keys are stored only in the local plugin settings.
 
 ## Installation
@@ -90,4 +95,15 @@ src/
 
 ## License
 
-GPL-3.0. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
+
+Releases up to and including 0.4.0 were published under GPL-3.0. Starting with
+the next release, the plugin is licensed under MIT.
+
+## Network use and privacy
+
+- Volis makes no background requests and collects no telemetry.
+- AI requests are sent only when you explicitly send a message, directly to the
+  provider you configured (OpenAI-compatible or Anthropic).
+- API keys and model settings are stored only in this plugin's local settings.
+- Board and note content is sent only as part of a request you initiate.

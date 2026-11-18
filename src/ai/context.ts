@@ -30,6 +30,8 @@ export interface ContextEdgeInput {
   from: string;
   to: string;
   label?: string;
+  /** Human-readable relation, e.g. "支持" or "反驳". */
+  relation?: string;
 }
 
 export interface ContextInput {
@@ -184,7 +186,8 @@ export function buildBoardContext(
     .filter((edge) => tagOf.has(edge.from) && tagOf.has(edge.to))
     .map((edge) => {
       const label = edge.label ? `（${edge.label}）` : "";
-      return `${tagOf.get(edge.from)} → ${tagOf.get(edge.to)}${label}`;
+      const relation = edge.relation ? ` -[${edge.relation}]-> ` : " → ";
+      return `${tagOf.get(edge.from)}${relation}${tagOf.get(edge.to)}${label}`;
     });
 
   const overheadChars =

@@ -84,6 +84,8 @@ export interface AISendSnapshot {
   usedTokens: number;
   stage: "full" | "trimmed" | "partial";
   nodes: Array<{
+    /** Node id from the canvas, so a restored turn can still resolve N1. */
+    id: string;
     tag: string;
     label: string;
     charsSent: number;

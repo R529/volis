@@ -5,12 +5,7 @@ import { ActionContext, ActionRegistry } from "./canvas/actions";
 import { SyncEngine } from "./canvas/syncEngine";
 import { applyBadges, clearBadges } from "./canvas/badge";
 import { BoardView, VIEW_TYPE_VOLIS_BOARD } from "./board/BoardView";
-import {
-  LEGACY_BOARD_PATH,
-  listBoards,
-  loadBoardFile,
-  nextBoardPath,
-} from "./board/boardStore";
+import { blankBoardData, listBoards, nextBoardPath } from "./board/boardStore";
 import { BoardPickerModal } from "./board/boardPicker";
 import { ContextMenuInjector } from "./canvas/contextMenu";
 import { CardEditorModal } from "./ui/cardEditor";
@@ -106,16 +101,12 @@ export default class VolisPlugin extends Plugin {
     const folder = this.settings.boardFolder ?? "";
     const path = await nextBoardPath(this.app, folder);
 
-    // Carry the previous single-board data over once, so nothing is lost.
-    let initial = JSON.stringify({ version: 1, nodes: [] }, null, 2);
-    if (listBoards(this.app).length === 0) {
-      const legacy = await loadBoardFile(this.app, LEGACY_BOARD_PATH);
-      if (legacy && legacy.nodes.length > 0) {
-        initial = JSON.stringify(legacy, null, 2);
-      }
-    }
-
-    const file = await this.app.vault.create(path, initial);
+    // A new board is always blank, including the very first one. An old
+    // hidden board file, if any, is left alone rather than silently imported.
+    const file = await this.app.vault.create(
+      path,
+      JSON.stringify(blankBoardData(), null, 2)
+    );
     await this.openBoardFile(file.path);
   }
 
@@ -440,6 +431,37 @@ export default class VolisPlugin extends Plugin {
       callback: () => {
         const view = this.getCanvasView();
         if (view) view.openAIPanel();
+      },
+    });
+
+    this.addCommand({
+      id: "board-doctor",
+      name: "白板体检",
+      callback: () => {
+        const view = this.getCanvasView();
+        if (view) view.openBoardDoctor();
+      },
+    });
+
+    this.addCommand({
+      id: "board-outline",
+      name: "打开白板大纲",
+      checkCallback: (checking) => {
+        const view = this.app.workspace.getActiveViewOfType(BoardView);
+        if (!view) return false;
+        if (!checking) view.openOutlinePanel();
+        return true;
+      },
+    });
+
+    this.addCommand({
+      id: "board-export-markdown",
+      name: "导出白板为 Markdown",
+      checkCallback: (checking) => {
+        const view = this.app.workspace.getActiveViewOfType(BoardView);
+        if (!view) return false;
+        if (!checking) view.openExportModal();
+        return true;
       },
     });
 

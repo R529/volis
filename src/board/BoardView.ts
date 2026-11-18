@@ -34,10 +34,20 @@ import {
 } from "../ai/context";
 import { formatTokens } from "../ai/capability";
 import { InsertFilter, InsertItem, searchInsertItems } from "./insertSearch";
+import { clampLabelT, Curve, curvePath, curvePoint, nearestCurveT, Point } from "./curve";
+import {
+  doctorNodeName,
+  DoctorInput,
+  DoctorIssue,
+  scanBoard,
+} from "./doctor";
+import { BoardDoctorModal, DoctorActions } from "../ui/doctorModal";
+import { ShortcutHelpModal } from "../ui/shortcutHelpModal";
 import {
   BoardData,
   BoardEdge,
   BoardNode,
+  EdgeRelation,
   PortSide,
   CardNode,
   DEFAULT_CARD_WIDTH,
@@ -46,11 +56,30 @@ import {
   GroupNode,
   TextNode,
 } from "./types";
+import { EDGE_RELATIONS, EDGE_RELATION_BY_ID } from "./relations";
+import { buildOutline } from "./outline";
+import type { OutlineInfo, OutlineItem, OutlineNodeInput, OutlineResult } from "./outline";
+import { buildExportMarkdown } from "./markdownExport";
+import type { ExportNodeInfo } from "./markdownExport";
+import { MarkdownExportModal } from "../ui/exportModal";
 
 export const VIEW_TYPE_VOLIS_BOARD = "volis-board";
 
 const GRID = 24;
 const MIN_GRID = 10;
+/** Connection labels are a glanceable hint, not a paragraph: cap them so a
+ *  pasted sentence cannot stretch across the board. */
+const EDGE_LABEL_MAX = 40;
+
+/** Label chip metrics, in board units: the chip scales with the board just
+ *  like the stroke does, so these are world-space numbers, not screen pixels. */
+const EDGE_LABEL_FONT_SIZE = 17;
+const EDGE_LABEL_PAD_X = 12;
+const EDGE_LABEL_HEIGHT = 32;
+const EDGE_LABEL_RADIUS = 10;
+
+/** An edge's curve plus the path text drawn for it. */
+type EdgeCurve = Curve & { d: string };
 const MIN_SCALE = 0.05;
 const MAX_SCALE = 3;
 const IMAGE_EXT = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"];
@@ -169,6 +198,15 @@ export class BoardView extends TextFileView {
   /** Cached note bodies, keyed by path and validated by mtime. */
   private noteTextCache = new Map<string, { mtime: number; text: string }>();
   private aiPanel: HTMLElement | null = null;
+  /** Floating outline. It lives in `root`, not `world`, so panning and
+   *  zooming never move it. */
+  private outlinePanel: HTMLElement | null = null;
+  private outlineBodyEl: HTMLElement | null = null;
+  private outlineMetaEl: HTMLElement | null = null;
+  private outlineCollapsed = new Set<string>();
+  private outlineTimer: number | null = null;
+  private outlineSignatureCache = "";
+  private outlinePos = { left: 16, top: 58 };
   private aiOutside: ((evt: MouseEvent) => void) | null = null;
   private aiProvider: AIProvider | null = null;
   private aiTargets: BoardNode[] = [];
@@ -180,6 +218,10 @@ export class BoardView extends TextFileView {
   private aiManifest: SendManifest | null = null;
   /** One snapshot per answer, aligned with `aiAnswers`. */
   private aiSnapshots: Array<AISendSnapshot | null> = [];
+  /** N1 → node id, built from the exact snapshot the model was given. */
+  private aiNumberMap = new Map<string, string>();
+  /** Number badges currently attached to nodes, for fast teardown. */
+  private aiBadges = new Map<string, HTMLElement>();
   /** Guards the lazy note-loading pass so it cannot loop. */
   private aiNotesLoading = false;
   private aiAnswers: string[] = [];
@@ -200,6 +242,29 @@ export class BoardView extends TextFileView {
   private lastPointerWorld: { x: number; y: number } | null = null;
   private insertPanel: HTMLElement | null = null;
   private edgeBar: HTMLElement | null = null;
+  private edgeLabelBtn: HTMLButtonElement | null = null;
+  private edgeRelationBtn: HTMLButtonElement | null = null;
+  /** Report panel for the read-only board health check. */
+  private doctorModal: BoardDoctorModal | null = null;
+  /** Read-only in-board shortcut reference. */
+  private helpModal: ShortcutHelpModal | null = null;
+  /** Kept across rescans so a panel parked beside the board stays put. */
+  private doctorOffset = { x: 0, y: 0 };
+  /** Inline editor for a connection's relation and label; lives in world space
+   *  so panning and zooming keep it glued to the line. `t` is where on the line
+   *  it sits, and becomes the label's stored position on commit. */
+  private edgeLabelEditor: {
+    el: HTMLElement;
+    input: HTMLInputElement;
+    select: HTMLSelectElement;
+    edgeId: string;
+    t: number;
+  } | null = null;
+  /** Shared 2D context used to measure label text. Measuring with a canvas
+   *  keeps the chip sized correctly even while the board is hidden, where
+   *  layout-based APIs (getBBox, getComputedTextLength) report zero. */
+  private labelMetrics: CanvasRenderingContext2D | null = null;
+  private labelFontCache = "";
   private alignPop: HTMLElement | null = null;
   private alignOutside: ((evt: MouseEvent) => void) | null = null;
   private colorPop: HTMLElement | null = null;
@@ -323,6 +388,7 @@ export class BoardView extends TextFileView {
       if (el && el.hasClass("volis-editing")) continue;
       await this.renderNode(node);
     }
+    this.scheduleOutlineRefresh();
   }
 
   private handleFileRename(newPath: string, oldPath: string): void {
@@ -342,10 +408,20 @@ export class BoardView extends TextFileView {
       window.clearTimeout(this.saveTimer);
       this.saveTimer = null;
     }
+    if (this.outlineTimer !== null) {
+      window.clearTimeout(this.outlineTimer);
+      this.outlineTimer = null;
+    }
     if (this.resizeObserver) {
       this.resizeObserver.disconnect();
       this.resizeObserver = null;
     }
+    // Detach without committing: the DOM is going away underneath it.
+    this.closeEdgeLabelEditor(false);
+    this.doctorModal?.close();
+    this.doctorModal = null;
+    this.helpModal?.close();
+    this.helpModal = null;
   }
 
   private handleResize(): void {
@@ -415,14 +491,18 @@ export class BoardView extends TextFileView {
     toolbar.createDiv({ cls: "volis-board-sep" });
 
     addButton("plus", "放大", () => this.zoomBy(1.2));
-    addButton("minus", "缩小", () => this.zoomBy(1 / 1.2));
     addButton("maximize", "总览", () => {
       this.fitToContent();
       this.scheduleSave();
     });
+    addButton("minus", "缩小", () => this.zoomBy(1 / 1.2));
     toolbar.createDiv({ cls: "volis-board-sep" });
     this.undoBtn = addButton("undo-2", "撤销", () => void this.undo());
     this.redoBtn = addButton("redo-2", "重做", () => void this.redo());
+    addButton("list-tree", "大纲", () => this.toggleOutlinePanel());
+    addButton("download", "导出 Markdown", () => this.openExportModal());
+    toolbar.createDiv({ cls: "volis-board-sep" });
+    addButton("help-circle", "帮助", () => this.openBoardHelp());
     this.updateHistoryButtons();
 
     this.toolbarEl = this.root.createDiv({ cls: "volis-node-toolbar is-hidden" });
@@ -470,6 +550,9 @@ export class BoardView extends TextFileView {
       const edgeId = group?.dataset.edgeId ?? null;
       if (!edgeId) return;
       evt.stopPropagation();
+      // A press on a line is not a press on a node: without this the
+      // double-click handler would still see whichever node was clicked last.
+      this.lastDownNodeId = null;
       this.selectEdge(edgeId);
     });
 
@@ -521,6 +604,9 @@ export class BoardView extends TextFileView {
     // same span, otherwise it flashes over the incoming board.
     this.hintEl.addClass("is-hidden");
 
+    // The editor lives inside the world layer, which is about to be wiped.
+    this.closeEdgeLabelEditor(false);
+
     try {
       this.world.empty();
       this.edgesEl = null;
@@ -548,6 +634,8 @@ export class BoardView extends TextFileView {
 
     this.updateHint();
     this.resetHistory();
+    this.outlineSignatureCache = "";
+    if (this.outlinePanel) this.renderOutlinePanel();
   }
 
   private selectedNodes(): BoardNode[] {
@@ -1648,6 +1736,8 @@ export class BoardView extends TextFileView {
     }
 
     const previousMap = this.nodeMap;
+    // The editor points at an edge object that is about to be replaced.
+    this.closeEdgeLabelEditor(false);
     this.nodes = next;
     this.edges = nextEdges;
     this.nodeMap = new Map(next.map((node) => [node.id, node]));
@@ -1823,13 +1913,18 @@ export class BoardView extends TextFileView {
     }
   }
 
-  /** Curve that leaves along the side's normal, like the native canvas does. */
+  /**
+   * Curve that leaves along the side's normal, like the native canvas does.
+   * Returns the control points as well as the path: the label, its editor and
+   * the style bar all need a point along the same curve, so they resolve it
+   * from here instead of each keeping their own idea of "the middle".
+   */
   private orientedPath(
     p1: { x: number; y: number },
     side1: PortSide,
     p2: { x: number; y: number },
     side2: PortSide
-  ): string {
+  ): EdgeCurve {
     const dist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
     const offset = Math.max(28, Math.min(150, dist * 0.35));
 
@@ -1839,7 +1934,43 @@ export class BoardView extends TextFileView {
     const c1 = { x: p1.x + n1.x * offset, y: p1.y + n1.y * offset };
     const c2 = { x: p2.x + n2.x * offset, y: p2.y + n2.y * offset };
 
-    return `M ${p1.x} ${p1.y} C ${c1.x} ${c1.y}, ${c2.x} ${c2.y}, ${p2.x} ${p2.y}`;
+    const curve: Curve = { p1, c1, c2, p2 };
+    return { ...curve, d: curvePath(curve) };
+  }
+
+  /** One edge's geometry, shared by the renderer and the label editor. */
+  private edgeGeometry(edge: BoardEdge): EdgeCurve | null {
+    const from = this.nodeMap.get(edge.from);
+    const to = this.nodeMap.get(edge.to);
+    if (!from || !to) return null;
+
+    const fromSide = edge.fromSide ?? this.nearestSide(from, to.x + to.width / 2, to.y);
+    const toSide = edge.toSide ?? this.nearestSide(to, from.x + from.width / 2, from.y);
+
+    const start = this.portPoint(from, fromSide);
+    const end = this.portPoint(to, toSide);
+
+    return this.orientedPath(start, fromSide, end, toSide);
+  }
+
+  /** Stored label, trimmed and capped. Hand-edited files must not throw. */
+  private edgeLabelOf(edge: BoardEdge): string {
+    const raw = typeof edge.label === "string" ? edge.label.trim() : "";
+    return raw.slice(0, EDGE_LABEL_MAX);
+  }
+
+  /** What the chip shows: the user's label if present, otherwise the relation
+   *  name, so a semantic edge stays readable without opening the editor. */
+  private edgeDisplayLabel(edge: BoardEdge): string {
+    const label = this.edgeLabelOf(edge);
+    if (label) return label;
+    return edge.relation ? EDGE_RELATION_BY_ID.get(edge.relation)?.label ?? "" : "";
+  }
+
+  /** Where the label sits on the line. Missing or out-of-range values in a
+   *  hand-edited file fall back to the middle rather than throwing. */
+  private edgeLabelT(edge: BoardEdge): number {
+    return typeof edge.labelAt === "number" ? clampLabelT(edge.labelAt) : 0.5;
   }
 
   private nearestSide(node: BoardNode, x: number, y: number): PortSide {
@@ -1924,13 +2055,10 @@ export class BoardView extends TextFileView {
       const to = this.nodeMap.get(edge.to);
       if (!from || !to) continue;
 
-      const fromSide = edge.fromSide ?? this.nearestSide(from, to.x + to.width / 2, to.y);
-      const toSide = edge.toSide ?? this.nearestSide(to, from.x + from.width / 2, from.y);
+      const geometry = this.edgeGeometry(edge);
+      if (!geometry) continue;
 
-      const start = this.portPoint(from, fromSide);
-      const end = this.portPoint(to, toSide);
-
-      const d = this.orientedPath(start, fromSide, end, toSide);
+      const d = geometry.d;
 
       const group = this.svgNode("g");
       group.setAttribute("class", "volis-edge-group");
@@ -1945,13 +2073,15 @@ export class BoardView extends TextFileView {
       const path = this.svgNode("path");
       path.setAttribute("d", d);
       path.setAttribute("class", "volis-edge");
+      const relation = edge.relation ? EDGE_RELATION_BY_ID.get(edge.relation) : undefined;
+      const style = edge.style ?? relation?.style;
       path.setAttribute("marker-end", "url(#volis-arrow)");
-      if (edge.style === "dashed") path.setAttribute("stroke-dasharray", "6 4");
+      if (style === "dashed") path.setAttribute("stroke-dasharray", "6 4");
 
-      const stroke = this.lineColorOf(edge.color);
+      const stroke = this.lineColorOf(edge.color) ?? this.lineColorOf(relation?.color);
       if (stroke) path.style.stroke = stroke;
 
-      const arrow = edge.arrow ?? "target";
+      const arrow = edge.arrow ?? relation?.arrow ?? "target";
       if (arrow === "none") {
         path.removeAttribute("marker-end");
       } else {
@@ -1963,9 +2093,84 @@ export class BoardView extends TextFileView {
 
       group.appendChild(hit);
       group.appendChild(path);
+      this.attachEdgeLabel(group, edge, geometry);
       svg.appendChild(group);
     }
 
+  }
+
+  /**
+   * Label chip drawn above the stroke at the label's own point on the line: a
+   * rounded plate in the card colour plus a hairline border, so the stroke
+   * reads as interrupted behind the text instead of cutting through it. Both
+   * shapes live in the edge group, so they scale, pan and get selected along
+   * with the line and need no repositioning of their own.
+   */
+  private attachEdgeLabel(group: SVGGElement, edge: BoardEdge, curve: EdgeCurve): void {
+    const stored = this.edgeLabelOf(edge);
+    const label = stored || this.edgeDisplayLabel(edge);
+    if (!label) return;
+
+    const anchor = curvePoint(curve, this.edgeLabelT(edge));
+
+    const text = this.svgNode("text");
+    text.setAttribute("class", stored ? "volis-edge-label" : "volis-edge-label is-relation");
+    text.setAttribute("x", String(anchor.x));
+    text.setAttribute("y", String(anchor.y));
+    text.setAttribute("text-anchor", "middle");
+    text.setAttribute("dominant-baseline", "central");
+    // One font spec drives both the glyphs and the measurement below, so the
+    // chip can never be sized for a font the text is not rendered in.
+    text.style.font = this.labelFont();
+    text.textContent = label;
+
+    const width = this.edgeLabelWidth(label) + EDGE_LABEL_PAD_X * 2;
+
+    const chip = this.svgNode("rect");
+    chip.setAttribute("class", "volis-edge-label-bg");
+    chip.setAttribute("x", String(anchor.x - width / 2));
+    chip.setAttribute("y", String(anchor.y - EDGE_LABEL_HEIGHT / 2));
+    chip.setAttribute("width", String(width));
+    chip.setAttribute("height", String(EDGE_LABEL_HEIGHT));
+    chip.setAttribute("rx", String(EDGE_LABEL_RADIUS));
+
+    group.appendChild(chip);
+    group.appendChild(text);
+  }
+
+  /**
+   * Font spec for a label. The interface font comes from the theme, the rest
+   * from the constants above, and the result is applied inline — reading it
+   * back off the `<text>` element is not an option, because these labels are
+   * measured while the group is still detached (and the board is hidden), where
+   * `getComputedStyle` returns empty values and any measurement built on it
+   * silently falls back to the canvas default.
+   */
+  private labelFont(): string {
+    if (this.labelFontCache) return this.labelFontCache;
+
+    const family =
+      window.getComputedStyle(this.root).getPropertyValue("--font-interface").trim() ||
+      "sans-serif";
+
+    this.labelFontCache = `500 ${EDGE_LABEL_FONT_SIZE}px ${family}`;
+    return this.labelFontCache;
+  }
+
+  /**
+   * Rendered width of the label, in board units, from canvas metrics.
+   * `getBBox()`/`getComputedTextLength()` would be exact but report zero
+   * whenever the board is not laid out, so a chip sized from them would
+   * collapse to a dot on load and in a background tab.
+   */
+  private edgeLabelWidth(value: string): number {
+    if (!this.labelMetrics) {
+      this.labelMetrics = document.createElement("canvas").getContext("2d");
+      if (this.labelMetrics) this.labelMetrics.font = this.labelFont();
+    }
+    if (!this.labelMetrics) return value.length * EDGE_LABEL_FONT_SIZE;
+
+    return this.labelMetrics.measureText(value).width;
   }
 
   /** Small icon sitting on the top border, so the node type stays readable
@@ -2031,6 +2236,8 @@ export class BoardView extends TextFileView {
     input.addEventListener("blur", commit);
     input.addEventListener("keydown", (evt) => {
       evt.stopPropagation();
+      // Enter while an IME is composing confirms the candidate, not the field.
+      if (evt.isComposing) return;
 
       if (evt.key === "Enter") {
         evt.preventDefault();
@@ -2164,6 +2371,16 @@ export class BoardView extends TextFileView {
 
     this.nodeEls.set(node.id, el);
     if (previous && previous !== el) previous.remove();
+
+    // A file edit can rebuild a node mid-conversation; restore its number.
+    if (this.aiPanel && this.aiNumberMap.size >= 2 && this.aiNumberMap.has(node.id)) {
+      const badge = el.createDiv({
+        cls: "volis-ai-node-number",
+        text: this.aiNumberMap.get(node.id),
+      });
+      badge.setAttribute("aria-hidden", "true");
+      this.aiBadges.set(node.id, badge);
+    }
 
     this.updateToolbar();
     return el;
@@ -2386,6 +2603,7 @@ export class BoardView extends TextFileView {
     this.zoomEl.setText(`${Math.round(this.scale * 100)}%`);
     this.updateToolbar();
     this.updateEdgeBar();
+    this.syncEdgeLabelEditor();
     this.updateMinimap();
   }
 
@@ -2416,7 +2634,8 @@ export class BoardView extends TextFileView {
 
   private showBoardMenu(evt: MouseEvent): void {
     const menu = new Menu();
-    const stale = this.staleIds.size;
+    // Counting is a plain scan: opening the menu must never modify the board.
+    const issueCount = scanBoard(this.doctorInput()).length;
 
     menu.addItem((item) =>
       item
@@ -2429,10 +2648,9 @@ export class BoardView extends TextFileView {
 
     menu.addItem((item) =>
       item
-        .setTitle(stale > 0 ? `清理失效节点（${stale}）` : "没有失效节点")
-        .setIcon("eraser")
-        .setDisabled(stale === 0)
-        .onClick(() => this.cleanupStaleNodes())
+        .setTitle(issueCount > 0 ? `白板体检（${issueCount}）` : "白板体检")
+        .setIcon("stethoscope")
+        .onClick(() => this.openBoardDoctor())
     );
 
     const rect = this.moreBtn?.getBoundingClientRect();
@@ -2449,6 +2667,140 @@ export class BoardView extends TextFileView {
       dom.style.left = `${Math.max(8, Math.round(rect.right - dom.offsetWidth + 16))}px`;
       dom.style.top = `${Math.round(rect.bottom + 6)}px`;
     }
+  }
+
+  /** Snapshot for the read-only scan. Reuses the view's own maps and caches. */
+  private doctorInput(): DoctorInput {
+    return {
+      nodes: this.nodes,
+      edges: this.edges,
+      staleIds: this.staleIds,
+      textOf: (node) =>
+        this.nodeText.get(node.id) ?? (node.type === "text" ? node.text : ""),
+      heightOf: (node) => this.nodeHeight(node),
+      memberIdsOf: (group) => this.groupMembers(group).map((member) => member.id),
+    };
+  }
+
+  /** Opens the health report. Scanning is read-only; nothing is applied here. */
+  public openBoardDoctor(): void {
+    const issues = scanBoard(this.doctorInput());
+    const actions: DoctorActions = {
+      locate: (issue) => this.locateDoctorIssue(issue),
+      removeNode: (id) => this.confirmDoctorRemoveNode(id),
+      removeEdge: (id) => this.confirmDoctorRemoveEdge(id),
+      addLabel: (id) => {
+        // Same as "定位": bring the line to the centre first. Otherwise the
+        // field opens somewhere the user cannot see while the report is up.
+        if (!this.centerOnEdge(id)) return;
+        // The report sits above the canvas; close it so the inline field can
+        // actually receive focus, then open the field on the next tick.
+        this.doctorModal?.close();
+        this.doctorModal = null;
+        window.setTimeout(() => this.openEdgeLabelEditor(id), 0);
+      },
+      rescan: () => this.openBoardDoctor(),
+      offset: () => ({ ...this.doctorOffset }),
+      moved: (offset) => {
+        this.doctorOffset = { ...offset };
+      },
+    };
+
+    this.doctorModal?.close();
+    this.doctorModal = new BoardDoctorModal(this.app, issues, actions);
+    this.doctorModal.open();
+  }
+
+  /** Read-only reference for the gestures available inside this board. */
+  private openBoardHelp(): void {
+    this.helpModal?.close();
+    this.helpModal = new ShortcutHelpModal(this.app);
+    this.helpModal.open();
+  }
+
+  /** Jump to the subject of a finding without changing any board data. */
+  private locateDoctorIssue(issue: DoctorIssue): void {
+    const firstId = issue.nodeIds[0];
+    if (firstId) {
+      const node = this.nodeMap.get(firstId);
+      if (node) {
+        // Locate means locate: centre and select only this one node. Adding
+        // the other node to the selection would draw the multi-select frame
+        // around unrelated cards and change the toolbar state.
+        this.centerOnNode(node);
+        return;
+      }
+    }
+
+    if (!issue.edgeId) return;
+    this.centerOnEdge(issue.edgeId);
+  }
+
+  /**
+   * Centre and select a connection. Shared by the report's "定位" and by
+   * "添加标签", so the inline editor always opens where the user can see it.
+   */
+  private centerOnEdge(edgeId: string): boolean {
+    const edge = this.edges.find((item) => item.id === edgeId);
+    if (!edge) return false;
+
+    this.selectedEdgeId = edge.id;
+    this.selection.clear();
+    this.paintSelection();
+    this.paintEdgeSelection();
+    this.updateEdgeBar();
+
+    const curve = this.edgeGeometry(edge);
+    if (curve) {
+      const anchor = curvePoint(curve, this.edgeLabelT(edge));
+      const rect = this.root.getBoundingClientRect();
+      this.tx = rect.width / 2 - anchor.x * this.scale;
+      this.ty = rect.height / 2 - anchor.y * this.scale;
+      this.applyTransform();
+      this.scheduleSave();
+    }
+    return true;
+  }
+
+  private confirmDoctorRemoveNode(nodeId: string): void {
+    const node = this.nodeMap.get(nodeId);
+    if (!node) return;
+    if (this.nodeEls.get(nodeId)?.hasClass("volis-editing")) {
+      new Notice("请先结束这张卡片的编辑再移除");
+      return;
+    }
+
+    new ConfirmModal(
+      this.app,
+      "移除这个节点？",
+      `将从白板移除「${doctorNodeName(node)}」，相关连线一并清除。源笔记不会被修改，可按 Ctrl+Z 撤销。`,
+      "移除节点",
+      () => {
+        this.selection.clear();
+        this.selection.add(nodeId);
+        this.deleteSelection();
+        new Notice("已移除节点，可按 Ctrl+Z 撤销");
+        this.openBoardDoctor();
+      }
+    ).open();
+  }
+
+  private confirmDoctorRemoveEdge(edgeId: string): void {
+    const edge = this.edges.find((item) => item.id === edgeId);
+    if (!edge) return;
+
+    new ConfirmModal(
+      this.app,
+      "删除这条连线？",
+      "只删除这条连线，节点不受影响，可按 Ctrl+Z 撤销。",
+      "删除连线",
+      () => {
+        this.selectedEdgeId = edgeId;
+        this.deleteSelectedEdge();
+        new Notice("已删除连线，可按 Ctrl+Z 撤销");
+        this.openBoardDoctor();
+      }
+    ).open();
   }
 
   /**
@@ -2468,34 +2820,11 @@ export class BoardView extends TextFileView {
       this.selectedEdgeId = null;
       this.updateEdgeBar();
     }
-  }
 
-  private cleanupStaleNodes(): void {
-    if (this.hasEditingNode()) {
-      new Notice("请先结束编辑再清理");
-      return;
+    const editor = this.edgeLabelEditor;
+    if (editor && !this.edges.some((edge) => edge.id === editor.edgeId)) {
+      this.closeEdgeLabelEditor(false);
     }
-    if (this.staleIds.size === 0) return;
-
-    const ids = new Set(this.staleIds);
-    this.nodes = this.nodes.filter((node) => !ids.has(node.id));
-
-    for (const id of ids) {
-      const el = this.nodeEls.get(id);
-      if (el) el.remove();
-      this.nodeEls.delete(id);
-      this.nodeMap.delete(id);
-      this.selection.delete(id);
-    }
-
-    this.staleIds.clear();
-    this.pruneEdges();
-    this.renderEdges();
-    this.updateFrame();
-    this.updateHint();
-    this.pushHistory();
-    this.scheduleSave();
-    new Notice(`已清理 ${ids.size} 个失效节点，可按 Ctrl+Z 撤销`);
   }
 
   private updateHistoryButtons(): void {
@@ -2625,6 +2954,7 @@ export class BoardView extends TextFileView {
     if (target?.closest(".volis-inline")) return;
     if (target?.closest(".volis-insert-panel")) return;
     if (target?.closest(".volis-ai-panel")) return;
+    if (target?.closest(".volis-outline-panel")) return;
     // Only a SELECTED node claims the wheel for its own content. Hovering an
     // unselected node must still zoom the board.
     const hoveredBody = target?.closest(".volis-bnode-body") as HTMLElement | null;
@@ -2664,6 +2994,7 @@ export class BoardView extends TextFileView {
     const target = evt.target as HTMLElement | null;
     if (!target) return;
     if (target.closest(".volis-board-toolbar")) return;
+    if (target.closest(".volis-outline-panel")) return;
 
     const nodeEl = target.closest(".volis-bnode") as HTMLElement | null;
     const nodeId = nodeEl?.dataset?.nodeId ?? null;
@@ -2810,6 +3141,7 @@ export class BoardView extends TextFileView {
       document.removeEventListener("mousedown", this.aiOutside, true);
       this.aiOutside = null;
     }
+    this.clearNodeNumbers();
     this.aiPanel?.remove();
     this.aiPanel = null;
   }
@@ -2873,7 +3205,14 @@ export class BoardView extends TextFileView {
 
     const edges = this.edges
       .filter((edge) => present.has(edge.from) && present.has(edge.to))
-      .map((edge) => ({ from: edge.from, to: edge.to, label: edge.label }));
+      .map((edge) => ({
+        from: edge.from,
+        to: edge.to,
+        label: edge.label,
+        relation: edge.relation
+          ? EDGE_RELATION_BY_ID.get(edge.relation)?.label
+          : undefined,
+      }));
 
     return { nodes: inputs, groups, edges };
   }
@@ -2892,12 +3231,22 @@ export class BoardView extends TextFileView {
    * turns. `force` is used after an edit or when the model profile changes.
    */
   private ensureSystem(profile: AIProfile | null, force = false): void {
-    const key = this.aiTargets
+    const nodeKey = this.aiTargets
       .map((node) => {
         const text = this.nodeText.get(node.id) ?? "";
         return `${node.id}:${node.type}:${text.length}:${"label" in node ? node.label : ""}`;
       })
       .join("|");
+
+    // Relations are part of the prefix too: a renamed or newly added
+    // connection label must not be answered against a stale snapshot.
+    const targetIds = new Set(this.aiTargets.map((node) => node.id));
+    const edgeKey = this.edges
+      .filter((edge) => targetIds.has(edge.from) && targetIds.has(edge.to))
+      .map((edge) => `${edge.from}>${edge.to}:${edge.label ?? ""}`)
+      .join("|");
+
+    const key = `${nodeKey}#${edgeKey}`;
 
     if (!force && key === this.aiSystemKey && this.aiSystem.length > 0) return;
 
@@ -2909,6 +3258,9 @@ export class BoardView extends TextFileView {
     );
 
     this.aiManifest = result.manifest;
+    this.aiNumberMap = new Map(
+      result.manifest.nodes.map((node) => [node.tag, node.id] as const)
+    );
     this.aiSystemKey = key;
     this.aiSystem = [
       { text: AI_ROLE_PROMPT },
@@ -2936,8 +3288,33 @@ export class BoardView extends TextFileView {
       ).then(() => {
         this.aiNotesLoading = false;
         this.ensureSystem(profile, true);
+        this.applyNodeNumbers();
       });
     }
+  }
+
+  /**
+   * Number badges are decoration only: they live on the node element, never in
+   * the board JSON, and disappear when the AI panel closes.
+   */
+  private applyNodeNumbers(): void {
+    this.clearNodeNumbers();
+    // One node needs no numbering: the model will talk about "this card".
+    if (this.aiNumberMap.size < 2) return;
+
+    for (const [tag, nodeId] of this.aiNumberMap) {
+      const el = this.nodeEls.get(nodeId);
+      if (!el || el.querySelector(":scope > .volis-ai-node-number")) continue;
+
+      const badge = el.createDiv({ cls: "volis-ai-node-number", text: tag });
+      badge.setAttribute("aria-hidden", "true");
+      this.aiBadges.set(nodeId, badge);
+    }
+  }
+
+  private clearNodeNumbers(): void {
+    for (const badge of this.aiBadges.values()) badge.remove();
+    this.aiBadges.clear();
   }
 
   private historyTokens(): number {
@@ -3051,6 +3428,7 @@ export class BoardView extends TextFileView {
 
     // Build the board snapshot once per opening; each answer carries its copy.
     this.ensureSystem(profile, true);
+    this.applyNodeNumbers();
 
     const rect = this.root.getBoundingClientRect();
     const box = this.selectionBox(targets);
@@ -3319,8 +3697,15 @@ export class BoardView extends TextFileView {
 
       appendContext(row, snapshot);
 
+      // A restored turn must resolve N1 from its own snapshot, not from the
+      // live targets — node order can differ from when it was asked.
+      const refMap = snapshot
+        ? new Map(snapshot.nodes.map((node) => [node.tag, node.id] as const))
+        : this.aiNumberMap;
+
       const body = row.createDiv({ cls: "volis-ai-reply" });
-      await MarkdownRenderer.render(this.app, this.decorateAnswer(text), body, "", this);
+      await MarkdownRenderer.render(this.app, this.decorateAnswer(text, refMap), body, "", this);
+      this.linkAnswerRefs(body, refMap);
 
       const bar = row.createDiv({ cls: "volis-ai-reply-bar" });
       appendCopy(bar, text);
@@ -3451,6 +3836,7 @@ export class BoardView extends TextFileView {
             usedTokens: this.aiManifest.usedTokens,
             stage: this.aiManifest.stage,
             nodes: this.aiManifest.nodes.map((node) => ({
+              id: node.id,
               tag: node.tag,
               label: node.label,
               charsSent: node.charsSent,
@@ -3642,6 +4028,18 @@ export class BoardView extends TextFileView {
       this.aiSnapshots = [];
       this.aiPicked = new Set<number>();
 
+      // Show the numbers this conversation actually used, so the badges line up
+      // with references in its answers even if the board order has changed.
+      const firstSnapshot = conv.messages.find(
+        (message) => message.role === "assistant" && message.send
+      )?.send;
+      if (firstSnapshot) {
+        this.aiNumberMap = new Map(
+          firstSnapshot.nodes.map((node) => [node.tag, node.id] as const)
+        );
+        this.applyNodeNumbers();
+      }
+
       for (const message of conv.messages) {
         if (message.role === "user") {
           addUserBubble(message.content);
@@ -3792,6 +4190,7 @@ export class BoardView extends TextFileView {
 
     // The restored targets may differ from the ones the panel opened with.
     this.ensureSystem(activeProfile(this.plugin.settings.ai), true);
+    this.applyNodeNumbers();
 
     this.aiRestore?.(conversation);
 
@@ -3918,19 +4317,86 @@ export class BoardView extends TextFileView {
     document.addEventListener("mousedown", this.historyOutside, true);
   }
 
-  /** Turns bare references like N3 into N3「content preview」 so the reader can
-   *  tell which card is meant without looking at the board. */
-  private decorateAnswer(text: string): string {
+  /**
+   * Turns bare references like N3 into N3「content preview」. The lookup uses
+   * the explicit N→id map, never the targets array: a selected group occupies
+   * a slot there and would shift every number by one.
+   */
+  private decorateAnswer(text: string, map: Map<string, string>): string {
     return text.replace(/\bN(\d+)\b/g, (match, digits: string) => {
-      const node = this.aiTargets[Number(digits) - 1];
-      if (!node) return match;
+      const nodeId = map.get(`N${digits}`);
+      if (!nodeId) return match;
 
-      const preview = (this.nodeText.get(node.id) ?? "").replace(/\s+/g, " ").trim();
+      const preview = (this.nodeText.get(nodeId) ?? "").replace(/\s+/g, " ").trim();
       if (!preview) return match;
 
       const short = preview.length > 12 ? `${preview.slice(0, 12)}…` : preview;
       return `${match}「${short}」`;
     });
+  }
+
+  /**
+   * After Markdown is rendered, turn N1「…」 into a clickable reference. Doing
+   * this on the DOM keeps the copied answer as plain Markdown.
+   */
+  private linkAnswerRefs(host: HTMLElement, map: Map<string, string>): void {
+    if (map.size === 0) return;
+
+    const walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT);
+    const texts: Text[] = [];
+    while (walker.nextNode()) texts.push(walker.currentNode as Text);
+
+    const pattern = /\b(N\d+)「[^」]*」/g;
+
+    for (const textNode of texts) {
+      const value = textNode.textContent ?? "";
+      const matches = Array.from(value.matchAll(pattern));
+      if (matches.length === 0) continue;
+
+      const fragment = document.createDocumentFragment();
+      let cursor = 0;
+
+      for (const match of matches) {
+        const index = match.index ?? 0;
+        if (index > cursor) {
+          fragment.appendChild(document.createTextNode(value.slice(cursor, index)));
+        }
+
+        const tag = match[1];
+        const nodeId = map.get(tag);
+        if (!nodeId) {
+          fragment.appendChild(document.createTextNode(match[0]));
+        } else {
+          const button = document.createElement("button");
+          button.className = "volis-ai-nref";
+          button.type = "button";
+          button.textContent = match[0];
+          button.addEventListener("click", (evt) => {
+            evt.stopPropagation();
+            evt.preventDefault();
+            this.jumpToNumberedNode(nodeId);
+          });
+          fragment.appendChild(button);
+        }
+
+        cursor = index + match[0].length;
+      }
+
+      if (cursor < value.length) {
+        fragment.appendChild(document.createTextNode(value.slice(cursor)));
+      }
+      textNode.parentNode?.replaceChild(fragment, textNode);
+    }
+  }
+
+  /** Centre and briefly highlight the node an answer referred to. */
+  private jumpToNumberedNode(nodeId: string): void {
+    const node = this.nodeMap.get(nodeId);
+    if (!node || !this.nodeEls.has(nodeId)) {
+      new Notice("这个节点已经不在当前白板上了");
+      return;
+    }
+    this.centerOnNode(node);
   }
 
   /** Selected text inside the panel, otherwise the latest full answer. */
@@ -4797,6 +5263,26 @@ export class BoardView extends TextFileView {
 
     bar.createDiv({ cls: "volis-edge-sep" });
 
+    this.edgeRelationBtn = bar.createEl("button", {
+      cls: "volis-tool-btn",
+      attr: { "aria-label": "设置关系" },
+    });
+    setIcon(this.edgeRelationBtn, "git-branch");
+    this.edgeRelationBtn.addEventListener("click", () => {
+      if (this.selectedEdgeId) this.openEdgeLabelEditor(this.selectedEdgeId, undefined, "relation");
+    });
+
+    this.edgeLabelBtn = bar.createEl("button", {
+      cls: "volis-tool-btn",
+      attr: { "aria-label": "添加标签" },
+    });
+    setIcon(this.edgeLabelBtn, "tag");
+    this.edgeLabelBtn.addEventListener("click", () => {
+      if (this.selectedEdgeId) this.openEdgeLabelEditor(this.selectedEdgeId);
+    });
+
+    bar.createDiv({ cls: "volis-edge-sep" });
+
     const remove = bar.createEl("button", {
       cls: "volis-tool-btn is-danger",
       attr: { "aria-label": "删除连线" },
@@ -4822,7 +5308,9 @@ export class BoardView extends TextFileView {
     const bar = this.edgeBar;
     if (!bar) return;
 
-    if (!this.selectedEdgeId) {
+    // The label editor sits on the very same midpoint, so the bar steps aside
+    // while it is open instead of crowding it.
+    if (!this.selectedEdgeId || this.edgeLabelEditor) {
       bar.addClass("is-hidden");
       return;
     }
@@ -4836,40 +5324,243 @@ export class BoardView extends TextFileView {
     if (!bar.hasChildNodes()) this.buildEdgeBar();
     bar.removeClass("is-hidden");
 
-    const rect = this.root.getBoundingClientRect();
-    const path = this.edgesEl?.querySelector(
-      `[data-edge-id="${edge.id}"] .volis-edge`
-    ) as SVGPathElement | null;
-
-    let mid = { x: 0, y: 0 };
-    if (path) {
-      const point = path.getPointAtLength(path.getTotalLength() / 2);
-      mid = { x: point.x, y: point.y };
+    if (this.edgeLabelBtn) {
+      this.edgeLabelBtn.setAttribute(
+        "aria-label",
+        this.edgeLabelOf(edge) ? "修改标签" : "添加标签"
+      );
     }
 
-    const screenX = mid.x * this.scale + this.tx;
-    const screenY = mid.y * this.scale + this.ty;
+    if (this.edgeRelationBtn) {
+      const meta = edge.relation ? EDGE_RELATION_BY_ID.get(edge.relation) : undefined;
+      this.edgeRelationBtn.setAttribute("aria-label", meta ? `关系：${meta.label}` : "设置关系");
+      const color = this.lineColorOf(edge.color) ?? this.lineColorOf(meta?.color);
+      this.edgeRelationBtn.style.color = color ?? "";
+    }
+
+    const rect = this.root.getBoundingClientRect();
+
+    // Same anchor as the label: one geometry source for both.
+    // Same anchor as the chip: one geometry source for both.
+    const curve = this.edgeGeometry(edge);
+    const anchor = curve ? curvePoint(curve, this.edgeLabelT(edge)) : { x: 0, y: 0 };
+
+    const screenX = anchor.x * this.scale + this.tx;
+    const screenY = anchor.y * this.scale + this.ty;
 
     const width = bar.offsetWidth || 240;
     const height = bar.offsetHeight || 36;
 
     const left = Math.max(8, Math.min(screenX - width / 2, rect.width - width - 8));
-    const top = Math.max(8, screenY - height - 12);
+    // Sit above the chip rather than on top of it when the line is labelled.
+    const chipLift = this.edgeDisplayLabel(edge) ? (EDGE_LABEL_HEIGHT / 2) * this.scale : 0;
+    const top = Math.max(8, screenY - height - 12 - chipLift);
 
     bar.style.left = `${Math.round(left)}px`;
     bar.style.top = `${Math.round(top)}px`;
   }
 
+  /**
+   * Inline editor for a connection's relation and label, anchored in world
+   * space on the label's point on the line. Enter commits, Escape cancels,
+   * clicking away commits.
+   *
+   * `at` is the board point the user aimed at (a double-click on the line); it
+   * is projected onto the curve and becomes the label's position. Without it
+   * the label keeps the position it already has, or lands in the middle.
+   * `focus` decides which control receives focus when the popup opens.
+   */
+  private openEdgeLabelEditor(
+    edgeId: string,
+    at?: Point,
+    focus: "label" | "relation" = "label"
+  ): void {
+    const edge = this.edges.find((item) => item.id === edgeId);
+    if (!edge) return;
+
+    const curve = this.edgeGeometry(edge);
+    if (!curve) return;
+
+    const t = at ? clampLabelT(nearestCurveT(curve, at)) : this.edgeLabelT(edge);
+
+    this.closeEdgeLabelEditor(true);
+
+    const wrap = this.world.createDiv({ cls: "volis-edge-label-editor" });
+    wrap.addEventListener("pointerdown", (evt) => evt.stopPropagation());
+    wrap.addEventListener("dblclick", (evt) => evt.stopPropagation());
+
+    const select = wrap.createEl("select", {
+      cls: "volis-edge-relation-select",
+      attr: { "aria-label": "连线关系" },
+    });
+    select.createEl("option", { text: "无关系", value: "" });
+    for (const meta of EDGE_RELATIONS) {
+      select.createEl("option", { text: meta.label, value: meta.id });
+    }
+    select.value = edge.relation ?? "";
+
+    const input = wrap.createEl("input", {
+      cls: "volis-edge-label-input",
+      attr: {
+        type: "text",
+        placeholder: "输入标签",
+        maxlength: String(EDGE_LABEL_MAX),
+        spellcheck: "false",
+      },
+    });
+    input.value = this.edgeLabelOf(edge);
+
+    const onKeydown = (evt: KeyboardEvent) => {
+      evt.stopPropagation();
+      // Enter while an IME is composing confirms the candidate, not the field.
+      if (evt.isComposing) return;
+
+      if (evt.key === "Enter") {
+        evt.preventDefault();
+        this.closeEdgeLabelEditor(true);
+      } else if (evt.key === "Escape") {
+        evt.preventDefault();
+        this.closeEdgeLabelEditor(false);
+      }
+    };
+    input.addEventListener("keydown", onKeydown);
+    select.addEventListener("keydown", onKeydown);
+
+    // Commit only when focus leaves the whole editor. An input-only blur closed
+    // the popup as soon as the relation select was clicked.
+    wrap.addEventListener("focusout", (evt) => {
+      const next = evt.relatedTarget as Node | null;
+      if (next && wrap.contains(next)) return;
+      this.closeEdgeLabelEditor(true);
+    });
+
+    this.edgeLabelEditor = { el: wrap, input, select, edgeId, t };
+    this.syncEdgeLabelEditor();
+    if (focus === "relation") {
+      select.focus();
+    } else {
+      input.focus();
+      input.select();
+    }
+    this.updateEdgeBar();
+  }
+
+  /**
+   * Pins the field to the label's point on the line and cancels the board zoom,
+   * so the input stays a normal, readable size however far the board is scaled.
+   * The chip under it scales with the board, but a text field that shrinks to a
+   * few pixels would be unusable.
+   */
+  private syncEdgeLabelEditor(): void {
+    const editor = this.edgeLabelEditor;
+    if (!editor) return;
+
+    const edge = this.edges.find((item) => item.id === editor.edgeId);
+    const curve = edge ? this.edgeGeometry(edge) : null;
+    if (curve) {
+      const anchor = curvePoint(curve, editor.t);
+      editor.el.style.left = `${Math.round(anchor.x)}px`;
+      editor.el.style.top = `${Math.round(anchor.y)}px`;
+    }
+
+    editor.el.style.transform = `translate(-50%, -50%) scale(${1 / this.scale})`;
+  }
+
+  private closeEdgeLabelEditor(commit: boolean): void {
+    const editor = this.edgeLabelEditor;
+    if (!editor) return;
+
+    // Cleared first: removing the element can fire focusout, which would loop
+    // back into this method and commit twice.
+    this.edgeLabelEditor = null;
+    const value = editor.input.value;
+    const relation = editor.select.value
+      ? (editor.select.value as EdgeRelation)
+      : undefined;
+    editor.el.remove();
+
+    if (commit) this.commitEdgeEdit(editor.edgeId, value, editor.t, relation);
+    // Bring the style bar back now that it no longer has to make room.
+    this.updateEdgeBar();
+  }
+
+  private commitEdgeEdit(
+    edgeId: string,
+    raw: string,
+    t: number,
+    relation?: EdgeRelation
+  ): void {
+    const edge = this.edges.find((item) => item.id === edgeId);
+    if (!edge) return;
+
+    const value = raw.trim().slice(0, EDGE_LABEL_MAX);
+    const position = clampLabelT(t);
+    // Reopening a label without typing must not count as an edit, but dragging
+    // it to a new spot on the line must.
+    const moved = Math.abs(position - this.edgeLabelT(edge)) > 0.001;
+    const relationChanged = edge.relation !== relation;
+    if (value === this.edgeLabelOf(edge) && !moved && !relationChanged) return;
+
+    if (value) {
+      edge.label = value;
+      edge.labelAt = position;
+    } else {
+      delete edge.label;
+      // A relation on its own still draws a chip, so it keeps the spot the
+      // user picked. Only a connection with neither text nor relation loses
+      // its position.
+      if (relation) edge.labelAt = position;
+      else delete edge.labelAt;
+    }
+
+    if (relationChanged) {
+      if (relation) {
+        edge.relation = relation;
+        // Switching relation applies that relation's visual language. Colour
+        // and arrow remain individually overridable from the edge bar.
+        delete edge.color;
+        delete edge.style;
+        delete edge.arrow;
+      } else {
+        delete edge.relation;
+      }
+    }
+
+    this.renderEdges();
+    this.updateEdgeBar();
+    this.pushHistory();
+    this.scheduleSave();
+  }
+
+  /**
+   * Selecting is a class toggle, never a re-render. Rebuilding the SVG here
+   * would replace the very path the user just pressed, and the browser drops
+   * the second click of a double-click when the two clicks land on different
+   * elements — which is why double-clicking a line did nothing at all.
+   */
   private selectEdge(edgeId: string): void {
     this.selectedEdgeId = edgeId;
     this.selection.clear();
     this.paintSelection();
-    this.renderEdges();
+    this.paintEdgeSelection();
     this.updateEdgeBar();
+  }
+
+  private paintEdgeSelection(): void {
+    const groups = this.edgesEl?.querySelectorAll<SVGGElement>(".volis-edge-group");
+    if (!groups) return;
+
+    for (const group of Array.from(groups)) {
+      group.classList.toggle("is-selected", group.dataset.edgeId === this.selectedEdgeId);
+    }
   }
 
   private deleteSelectedEdge(): boolean {
     if (!this.selectedEdgeId) return false;
+
+    if (this.edgeLabelEditor?.edgeId === this.selectedEdgeId) {
+      this.closeEdgeLabelEditor(false);
+    }
 
     this.edges = this.edges.filter((edge) => edge.id !== this.selectedEdgeId);
     this.selectedEdgeId = null;
@@ -4975,7 +5666,7 @@ export class BoardView extends TextFileView {
 
     if (this.selectedEdgeId) {
       this.selectedEdgeId = null;
-      this.renderEdges();
+      this.paintEdgeSelection();
       this.updateEdgeBar();
     }
     if (!evt.ctrlKey && !evt.metaKey && !evt.shiftKey) {
@@ -5194,6 +5885,7 @@ export class BoardView extends TextFileView {
       el.toggleClass("is-selected", this.selection.has(id));
     }
     this.updateFrame();
+    this.updateOutlineActive();
   }
 
   private updateFrame(): void {
@@ -5251,6 +5943,21 @@ export class BoardView extends TextFileView {
     const target = evt.target as HTMLElement | null;
     if (!target) return;
     if (target.closest(".volis-board-toolbar")) return;
+
+    // Connection first: without this a double-click on a line would fall
+    // through to the canvas and spawn a text node at that spot.
+    const group = target.closest(".volis-edge-group");
+    const edgeId = group?.getAttribute("data-edge-id") ?? null;
+    if (edgeId) {
+      // Double-clicking the label itself edits it where it stands; anywhere
+      // else on the line puts the label under the pointer.
+      const onChip = target.closest(".volis-edge-label-bg, .volis-edge-label") !== null;
+      this.openEdgeLabelEditor(
+        edgeId,
+        onChip ? undefined : this.toWorld(evt.clientX, evt.clientY)
+      );
+      return;
+    }
 
     // Pointer capture rewrites the target of click/dblclick to the capture
     // element, so trust the node recorded on pointerdown instead.
@@ -5570,8 +6277,456 @@ export class BoardView extends TextFileView {
     return node;
   }
 
+  private toggleOutlinePanel(): void {
+    if (this.outlinePanel) {
+      this.closeOutlinePanel();
+      return;
+    }
+    this.openOutlinePanel();
+  }
+
+  /** Opens the floating outline. Public so a command can reach it directly. */
+  openOutlinePanel(): void {
+    if (this.outlinePanel) {
+      this.renderOutlinePanel();
+      return;
+    }
+
+    const panel = this.root.createDiv({ cls: "volis-outline-panel" });
+    panel.style.left = `${this.outlinePos.left}px`;
+    panel.style.top = `${this.outlinePos.top}px`;
+    panel.addEventListener("pointerdown", (evt) => evt.stopPropagation());
+    panel.addEventListener("dblclick", (evt) => evt.stopPropagation());
+    // The list scrolls itself; without this the board would zoom instead.
+    panel.addEventListener("wheel", (evt) => evt.stopPropagation(), { passive: true });
+
+    const head = panel.createDiv({ cls: "volis-outline-head" });
+    const headIcon = head.createDiv({ cls: "volis-outline-head-icon" });
+    setIcon(headIcon, "list-tree");
+    head.createDiv({ cls: "volis-outline-head-title", text: "大纲" });
+    this.outlineMetaEl = head.createDiv({ cls: "volis-outline-head-meta" });
+    head.createDiv({ cls: "volis-outline-head-spacer" });
+
+    const closeBtn = head.createEl("button", {
+      cls: "volis-outline-head-btn",
+      attr: { "aria-label": "关闭" },
+    });
+    setIcon(closeBtn, "x");
+    closeBtn.addEventListener("click", () => this.closeOutlinePanel());
+
+    this.outlineBodyEl = panel.createDiv({ cls: "volis-outline-body" });
+    this.outlinePanel = panel;
+    this.installOutlineDrag(panel, head);
+
+    this.outlineSignatureCache = "";
+    this.renderOutlinePanel();
+    this.outlineSignatureCache = this.outlineSignature();
+  }
+
+  private closeOutlinePanel(): void {
+    if (this.outlineTimer !== null) {
+      window.clearTimeout(this.outlineTimer);
+      this.outlineTimer = null;
+    }
+    if (this.outlinePanel) {
+      this.outlinePos = {
+        left: this.outlinePanel.offsetLeft,
+        top: this.outlinePanel.offsetTop,
+      };
+      this.outlinePanel.remove();
+    }
+    this.outlinePanel = null;
+    this.outlineBodyEl = null;
+    this.outlineMetaEl = null;
+  }
+
+  private installOutlineDrag(panel: HTMLElement, head: HTMLElement): void {
+    let start: { x: number; y: number; left: number; top: number } | null = null;
+
+    head.addEventListener("pointerdown", (evt) => {
+      if ((evt.target as HTMLElement).closest("button")) return;
+      start = {
+        x: evt.clientX,
+        y: evt.clientY,
+        left: panel.offsetLeft,
+        top: panel.offsetTop,
+      };
+      head.setPointerCapture(evt.pointerId);
+      panel.addClass("is-dragging");
+    });
+
+    head.addEventListener("pointermove", (evt) => {
+      if (!start) return;
+      panel.style.left = `${Math.round(start.left + evt.clientX - start.x)}px`;
+      panel.style.top = `${Math.round(start.top + evt.clientY - start.y)}px`;
+    });
+
+    const end = (evt: PointerEvent) => {
+      if (!start) return;
+      start = null;
+      panel.removeClass("is-dragging");
+      try {
+        head.releasePointerCapture(evt.pointerId);
+      } catch (error) {
+        // pointer already released
+      }
+    };
+
+    head.addEventListener("pointerup", end);
+    head.addEventListener("pointercancel", end);
+  }
+
+  private renderOutlinePanel(): void {
+    const body = this.outlineBodyEl;
+    if (!body) return;
+
+    const scrollTop = body.scrollTop;
+    body.empty();
+
+    const inputs: OutlineNodeInput[] = this.nodes.map((node) => ({
+      id: node.id,
+      x: node.x,
+      y: node.y,
+      kind: node.type,
+    }));
+
+    const result = buildOutline(inputs, this.edges, (input) => this.outlineInfoOf(input));
+
+    if (result.nodeCount === 0) {
+      body.createDiv({
+        cls: "volis-outline-empty",
+        text: "白板上还没有节点。新建卡片或便签后，这里会按结构列出它们。",
+      });
+      this.updateOutlineMeta(result);
+      return;
+    }
+
+    for (const item of result.roots) {
+      this.renderOutlineItem(body, item, 0);
+    }
+
+    if (result.cycle) {
+      body.createDiv({
+        cls: "volis-outline-note",
+        text: "检测到循环的推导/因果关系，环上的一条连线已在大纲中跳过。",
+      });
+    } else if (!result.hasHierarchy) {
+      body.createDiv({
+        cls: "volis-outline-note",
+        text: "还没有推导或因果连线，节点按位置平铺。给连线设置「推导」或「因果」即可生成层级。",
+      });
+    }
+
+    this.updateOutlineMeta(result);
+    body.scrollTop = scrollTop;
+  }
+
+  private updateOutlineMeta(result: OutlineResult): void {
+    if (!this.outlineMetaEl) return;
+    const parts = [`${result.nodeCount} 个节点`];
+    if (result.hasHierarchy) parts.push(result.hasSequence ? "分层 + 顺序" : "分层");
+    else parts.push("平铺");
+    this.outlineMetaEl.setText(parts.join(" · "));
+  }
+
+  private renderOutlineItem(host: HTMLElement, item: OutlineItem, depth: number): void {
+    const collapsed = this.outlineCollapsed.has(item.id);
+    const row = host.createDiv({ cls: "volis-outline-row" });
+    row.dataset.nodeId = item.id;
+    row.toggleClass("is-root", depth === 0);
+    row.toggleClass("is-active", this.selection.has(item.id));
+    row.toggleClass("is-group", item.kind === "group");
+
+    if (item.children.length > 0) {
+      const toggle = row.createEl("button", {
+        cls: "volis-outline-toggle",
+        attr: { "aria-label": collapsed ? "展开" : "折叠" },
+      });
+      setIcon(toggle, collapsed ? "chevron-right" : "chevron-down");
+      toggle.addEventListener("click", (evt) => {
+        evt.stopPropagation();
+        if (collapsed) this.outlineCollapsed.delete(item.id);
+        else this.outlineCollapsed.add(item.id);
+        this.renderOutlinePanel();
+      });
+    } else {
+      row.createDiv({ cls: "volis-outline-toggle is-empty" });
+    }
+
+    const main = row.createDiv({ cls: "volis-outline-main" });
+    const titleRow = main.createDiv({ cls: "volis-outline-title-row" });
+    const title = titleRow.createDiv({ cls: "volis-outline-title", text: item.title });
+    title.setAttribute("title", item.title);
+
+    if (item.relation) {
+      titleRow.createSpan({
+        cls: `volis-outline-relation is-${item.relation}`,
+        text: item.relation === "derives" ? "推导" : "因果",
+      });
+    }
+
+    const badges = titleRow.createDiv({ cls: "volis-outline-badges" });
+    if (item.badges.supports > 0) {
+      badges.createSpan({
+        cls: "volis-outline-badge is-supports",
+        text: `支持 ${item.badges.supports}`,
+      });
+    }
+    if (item.badges.refutes > 0) {
+      badges.createSpan({
+        cls: "volis-outline-badge is-refutes",
+        text: `反驳 ${item.badges.refutes}`,
+      });
+    }
+    if (item.badges.source > 0) {
+      badges.createSpan({
+        cls: "volis-outline-badge is-source",
+        text: `来源 ${item.badges.source}`,
+      });
+    }
+
+    if (item.snippet) {
+      main.createDiv({ cls: "volis-outline-snippet", text: item.snippet });
+    }
+
+    row.addEventListener("click", () => this.focusNodeInBoard(item.id));
+
+    if (collapsed || item.children.length === 0) return;
+    // A real container per level keeps the guide line continuous and
+    // makes the hierarchy readable without absolute pixel offsets.
+    const kids = host.createDiv({ cls: "volis-outline-children" });
+    for (const child of item.children) {
+      this.renderOutlineItem(kids, child, depth + 1);
+    }
+  }
+
+  private focusNodeInBoard(nodeId: string): void {
+    const node = this.nodeMap.get(nodeId);
+    if (!node) return;
+
+    const el = this.nodeEls.get(nodeId);
+    const height = el?.offsetHeight ?? node.height ?? 100;
+    const rect = this.root.getBoundingClientRect();
+
+    const centerX = node.x + node.width / 2;
+    const centerY = node.y + height / 2;
+    this.tx = rect.width / 2 - centerX * this.scale;
+    this.ty = rect.height / 2 - centerY * this.scale;
+
+    this.selectedEdgeId = null;
+    this.selection.clear();
+    this.selection.add(nodeId);
+
+    this.paintSelection();
+    this.paintEdgeSelection();
+    this.applyTransform();
+    this.updateHint();
+    this.scheduleSave();
+  }
+
+  private updateOutlineActive(): void {
+    if (!this.outlinePanel) return;
+    const rows = this.outlinePanel.querySelectorAll<HTMLElement>(".volis-outline-row");
+    rows.forEach((row) => {
+      row.toggleClass(
+        "is-active",
+        !!row.dataset.nodeId && this.selection.has(row.dataset.nodeId)
+      );
+    });
+  }
+
+  private scheduleOutlineRefresh(): void {
+    if (!this.outlinePanel) return;
+    if (this.outlineTimer !== null) window.clearTimeout(this.outlineTimer);
+    this.outlineTimer = window.setTimeout(() => {
+      this.outlineTimer = null;
+      if (!this.outlinePanel) return;
+      const signature = this.outlineSignature();
+      if (signature === this.outlineSignatureCache) return;
+      this.outlineSignatureCache = signature;
+      this.renderOutlinePanel();
+    }, 220);
+  }
+
+  private outlineSignature(): string {
+    const nodes = this.nodes
+      .map((node) => {
+        const label = node.type === "group" ? node.label ?? "" : "";
+        return `${node.id}@${Math.round(node.x)},${Math.round(node.y)}:${node.type}:${label}`;
+      })
+      .join("|");
+
+    const edges = this.edges
+      .map((edge) => `${edge.from}>${edge.to}:${edge.relation ?? ""}`)
+      .join("|");
+
+    const text = this.nodes
+      .map((node) => (this.nodeText.get(node.id) ?? "").slice(0, 120))
+      .join("|");
+
+    return `${nodes}##${edges}##${text}`;
+  }
+
+  /** Opens the Markdown export dialog. Public so a command can reach it. */
+  openExportModal(): void {
+    const inputs: OutlineNodeInput[] = this.nodes.map((node) => ({
+      id: node.id,
+      x: node.x,
+      y: node.y,
+      kind: node.type,
+    }));
+    const result = buildOutline(inputs, this.edges, (input) => this.outlineInfoOf(input));
+
+    const infoById = new Map<string, ExportNodeInfo>();
+    const collect = (items: OutlineItem[]): void => {
+      for (const item of items) {
+        infoById.set(item.id, this.exportInfoOf(item));
+        collect(item.children);
+      }
+    };
+    collect(result.roots);
+
+    new MarkdownExportModal(this.app, {
+      boardTitle: this.file?.basename ?? "白板",
+      nodeCount: result.nodeCount,
+      build: (format) =>
+        buildExportMarkdown(
+          {
+            boardTitle: this.file?.basename ?? "白板",
+            outline: result,
+            infoOf: (id) => infoById.get(id) ?? { title: "未命名", body: "" },
+            edges: this.edges,
+            titleOf: (id) => infoById.get(id)?.title ?? this.exportTitleOf(id),
+          },
+          format
+        ),
+      save: (markdown) => this.saveExportNote(markdown),
+    }).open();
+  }
+
+  private exportTitleOf(id: string): string {
+    const node = this.nodeMap.get(id);
+    if (!node) return "未命名";
+    return this.outlineInfoOf({ id, x: node.x, y: node.y, kind: node.type }).title;
+  }
+
+  private exportInfoOf(item: OutlineItem): ExportNodeInfo {
+    const node = this.nodeMap.get(item.id);
+    if (!node || node.type === "group") return { title: item.title, body: "" };
+
+    // A file node stands for a note that already exists. Exporting the link
+    // keeps one copy of the text instead of pasting a whole note into a note.
+    if (node.type === "file") {
+      return { title: item.title, body: `[[${node.file}|${item.title}]]` };
+    }
+
+    const full = this.nodeText.get(node.id) ?? (node.type === "text" ? node.text : "");
+    return { title: item.title, body: this.exportBody(full) };
+  }
+
+  /** The first line already became the heading; the rest is the body. */
+  private exportBody(text: string): string {
+    const lines = text.split(/\r?\n/);
+    const first = lines.findIndex((line) => line.trim() !== "");
+    if (first === -1) return "";
+    return lines.slice(first + 1).join("\n").trim();
+  }
+
+  private async saveExportNote(markdown: string): Promise<string> {
+    const boardPath = this.file?.path ?? "";
+    const folder = boardPath.includes("/") ? boardPath.slice(0, boardPath.lastIndexOf("/")) : "";
+    const base = (this.file?.basename ?? "白板").replace(/[\\/:*?"<>|]/g, " ").trim() || "白板";
+    const adapter = this.app.vault.adapter;
+
+    let name = `${base}.md`;
+    let path = folder ? `${folder}/${name}` : name;
+    let index = 1;
+    while (await adapter.exists(path)) {
+      name = `${base} ${index}.md`;
+      path = folder ? `${folder}/${name}` : name;
+      index += 1;
+    }
+
+    const file = await this.app.vault.create(path, markdown);
+    return file.path;
+  }
+
+  private outlineInfoOf(node: OutlineNodeInput): OutlineInfo {
+    const source = this.nodeMap.get(node.id);
+    if (!source) return { title: "未命名" };
+
+    if (source.type === "group") {
+      return { title: source.label?.trim() || "未命名分组" };
+    }
+
+    if (source.type === "file") {
+      const file = this.app.vault.getAbstractFileByPath(source.file);
+      const name =
+        file instanceof TFile ? file.basename : source.file.split("/").pop() ?? "文件";
+      const body = this.nodeText.get(source.id);
+      const snippet = body ? this.outlineSnippet(body) : "";
+      return { title: name, snippet: snippet || undefined };
+    }
+
+    const text =
+      this.nodeText.get(source.id) ?? (source.type === "text" ? source.text : "");
+    return this.outlineTextInfo(text);
+  }
+
+  private outlineTextInfo(text: string): OutlineInfo {
+    const lines = text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (lines.length === 0) return { title: "未命名" };
+
+    const cleaned = lines.map((line) => this.outlineClean(line)).filter(Boolean);
+    if (cleaned.length === 0) return { title: "未命名" };
+
+    const title = cleaned[0];
+    const snippet = cleaned.slice(1).join(" ");
+    return {
+      title: this.outlineTruncate(title, 40),
+      snippet: snippet ? this.outlineTruncate(snippet, 70) : undefined,
+    };
+  }
+
+  private outlineSnippet(text: string): string {
+    const lines = text
+      .split(/\r?\n/)
+      .map((line) => this.outlineClean(line))
+      .filter(Boolean);
+    return lines.length > 1 ? this.outlineTruncate(lines.slice(1).join(" "), 70) : "";
+  }
+
+  /** Strips the Markdown that would only add noise in a one-line outline. */
+  private outlineClean(raw: string): string {
+    return raw
+      .replace(/^\s{0,3}#{1,6}\s+/, "")
+      .replace(/^\s*>\s?/, "")
+      .replace(/^\s*[-*+]\s+\[[ xX]\]\s+/, "")
+      .replace(/^\s*[-*+]\s+/, "")
+      .replace(/!?\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_match, target: string, alias?: string) => {
+        if (alias) return alias;
+        const clean = target.split("#")[0];
+        return clean.split("/").pop() || target;
+      })
+      .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+      .replace(/`([^`]*)`/g, "$1")
+      .replace(/\*\*|__|~~/g, "")
+      .replace(/(^|\s)#[\p{L}\p{N}_/-]+/gu, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  private outlineTruncate(text: string, max: number): string {
+    const chars = Array.from(text);
+    return chars.length > max ? `${chars.slice(0, max).join("")}…` : text;
+  }
+
   private scheduleSave(): void {
     if (!this.loaded) return;
+    this.scheduleOutlineRefresh();
     if (this.saveTimer !== null) window.clearTimeout(this.saveTimer);
     this.saveTimer = window.setTimeout(() => {
       this.saveTimer = null;

@@ -1,6 +1,6 @@
 {
   "name": "volis",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Canvas card enhancement for block-reference cards",
   "main": "main.js",
   "scripts": {
@@ -9,7 +9,7 @@
   },
   "keywords": [],
   "author": "Lak",
-  "license": "GPL-3.0",
+  "license": "MIT",
   "devDependencies": {
     "@types/node": "^20.11.0",
     "builtin-modules": "^3.3.0",

@@ -2,27 +2,11 @@ import { App, TFile } from "obsidian";
 import { BoardData } from "./types";
 
 export const BOARD_EXTENSION = "volis";
-export const LEGACY_BOARD_PATH = ".volis/board.json";
 
-export async function loadBoardFile(app: App, path: string): Promise<BoardData | null> {
-  try {
-    const adapter = app.vault.adapter;
-    if (!(await adapter.exists(path))) return null;
-
-    const raw = await adapter.read(path);
-    const parsed = JSON.parse(raw) as BoardData;
-    if (!parsed || !Array.isArray(parsed.nodes)) return null;
-
-    return {
-      version: 1,
-      nodes: parsed.nodes,
-      edges: Array.isArray(parsed.edges) ? parsed.edges : [],
-      viewport: parsed.viewport,
-    };
-  } catch (error) {
-    console.error("[Volis] load board failed", error);
-    return null;
-  }
+/** Content for a brand-new board. Never carry old nodes over implicitly:
+ *  "new board" must mean blank, and any legacy file stays untouched on disk. */
+export function blankBoardData(): BoardData {
+  return { version: 1, nodes: [], edges: [] };
 }
 
 export async function saveBoardFile(app: App, path: string, data: BoardData): Promise<void> {
