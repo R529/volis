@@ -1,7 +1,7 @@
 import { App } from "obsidian";
 import { CardRef } from "../types";
 
-const BLOCK_LINK_RE = /\[\[([^\[\]|#]+?)#\^([^\[\]|\n]+)(?:\|([^\]\n]+))?\]\]/g;
+const BLOCK_LINK_RE = /\[\[([^[\]|#]+?)#\^([^[\]|\n]+)(?:\|([^\]\n]+))?\]\]/g;
 
 export interface ParsedLink {
   linkpath: string;

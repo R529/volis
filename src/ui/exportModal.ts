@@ -32,9 +32,6 @@ export class MarkdownExportModal extends Modal {
   onOpen(): void {
     this.modalEl.addClass("volis-export-modal");
     this.contentEl.addClass("volis-export-content");
-    this.modalEl.style.width = "680px";
-    this.modalEl.style.maxWidth = "94vw";
-    this.modalEl.style.maxHeight = "84vh";
 
     this.titleEl.setText("导出 Markdown");
     // The board behind the preview is often the thing being checked, so the

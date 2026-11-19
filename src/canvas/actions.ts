@@ -1,10 +1,11 @@
 import { App } from "obsidian";
 import { NodeEntry } from "./nodeIndex";
+import { CanvasViewLike } from "./canvasTypes";
 
 export interface ActionContext {
   app: App;
   entry: NodeEntry;
-  canvasView: any;
+  canvasView: CanvasViewLike;
   nodeId: string;
 }
 

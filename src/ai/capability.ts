@@ -149,9 +149,12 @@ async function probeOpenAI(profile: AIProfile, notes: string[]): Promise<AICapab
   }
 
   const entries = parsed.data ?? [];
+  const modelId = (entry: Record<string, unknown>): string =>
+    typeof entry.id === "string" ? entry.id : "";
+
   const target =
-    entries.find((entry) => String(entry.id ?? "") === profile.model) ??
-    entries.find((entry) => String(entry.id ?? "").includes(profile.model));
+    entries.find((entry) => modelId(entry) === profile.model) ??
+    entries.find((entry) => modelId(entry).includes(profile.model));
 
   if (!target) {
     notes.push("模型列表里没有这个模型，改用手动值。");

@@ -1,4 +1,5 @@
-import { App, Debouncer, TFile, debounce } from "obsidian";
+import { App, Debouncer, TFile, WorkspaceLeaf, debounce } from "obsidian";
+import { CanvasLike, CanvasViewLike } from "./canvasTypes";
 
 interface Viewport {
   [key: string]: number;
@@ -26,8 +27,8 @@ export class SyncEngine {
 
     const leaves = this.app.workspace.getLeavesOfType("canvas");
     for (const leaf of leaves) {
-      const view: any = leaf.view;
-      if (typeof view?.getViewData !== "function") continue;
+      const view = leaf.view as unknown as CanvasViewLike;
+      if (typeof view.getViewData !== "function") continue;
 
       let raw = "";
       try {
@@ -38,7 +39,7 @@ export class SyncEngine {
       if (!raw) continue;
 
       if (raw.includes(file.basename) || raw.includes(file.path)) {
-        this.pending.add((leaf as any).id ?? view.id ?? "");
+        this.pending.add(leafKey(leaf, view));
       }
     }
 
@@ -54,8 +55,8 @@ export class SyncEngine {
     try {
       const leaves = this.app.workspace.getLeavesOfType("canvas");
       for (const leaf of leaves) {
-        const view: any = leaf.view;
-        const key = (leaf as any).id ?? view?.id ?? "";
+        const view = leaf.view as unknown as CanvasViewLike;
+        const key = leafKey(leaf, view);
         if (!this.pending.has(key)) continue;
         this.refreshView(view);
       }
@@ -66,12 +67,12 @@ export class SyncEngine {
     }
   }
 
-  refreshView(view: any): void {
-    if (!view || typeof view.getViewData !== "function" || typeof view.setViewData !== "function") {
+  refreshView(view: CanvasViewLike): void {
+    if (typeof view.getViewData !== "function" || typeof view.setViewData !== "function") {
       return;
     }
 
-    const canvas = view?.canvas;
+    const canvas = view.canvas;
     const viewport = captureViewport(canvas);
 
     try {
@@ -80,7 +81,7 @@ export class SyncEngine {
 
       // clear=true forces the view to drop its nodes and rebuild them, which is
       // the only reliable way to make embedded content re-read the source file.
-      view.setViewData(json, true);
+      void view.setViewData(json, true);
 
       restoreViewport(view.canvas, viewport);
     } catch (error) {
@@ -89,21 +90,29 @@ export class SyncEngine {
   }
 }
 
-function captureViewport(canvas: any): Viewport {
+function leafKey(leaf: WorkspaceLeaf, view: CanvasViewLike): string {
+  return (leaf as unknown as { id?: string }).id ?? view.id ?? "";
+}
+
+function captureViewport(canvas: CanvasLike | undefined): Viewport {
   const out: Viewport = {};
-  ["tx", "ty", "tz", "zoom", "scale"].forEach((key) => {
-    if (typeof canvas[key] === "number") out[key] = canvas[key];
-  });
+  if (!canvas) return out;
+  const values = canvas as unknown as Record<string, unknown>;
+  for (const key of ["tx", "ty", "tz", "zoom", "scale"]) {
+    const value = values[key];
+    if (typeof value === "number") out[key] = value;
+  }
   return out;
 }
 
-function restoreViewport(canvas: any, viewport: Viewport): void {
+function restoreViewport(canvas: CanvasLike | undefined, viewport: Viewport): void {
   if (!canvas) return;
-  Object.keys(viewport).forEach((key) => {
+  const values = canvas as unknown as Record<string, number>;
+  for (const key of Object.keys(viewport)) {
     try {
-      canvas[key] = viewport[key];
+      values[key] = viewport[key];
     } catch (error) {
       // ignore
     }
-  });
+  }
 }

@@ -49,9 +49,6 @@ export class BoardDoctorModal extends Modal {
     this.contentEl.addClass("volis-doctor-content");
     // Inline width wins over the theme's own modal sizing; the cap keeps a
     // narrow window from producing a horizontal scrollbar.
-    this.modalEl.style.width = "620px";
-    this.modalEl.style.maxWidth = "92vw";
-    this.modalEl.style.maxHeight = "74vh";
 
     this.titleEl.setText("白板体检");
     this.installDrag();

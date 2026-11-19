@@ -144,6 +144,10 @@
   pointer-events: none;
 }
 
+.volis-world.is-loading {
+  visibility: hidden;
+}
+
 .volis-world {
   position: absolute;
   top: 0;
@@ -2645,6 +2649,9 @@
 
 /* Width is also set inline on .modal-el so it beats the theme's own rule. */
 .volis-doctor-modal {
+  width: 620px;
+  max-width: 92vw;
+  max-height: 74vh;
   overflow: hidden;
 }
 
@@ -2794,6 +2801,9 @@
 /* ── In-board shortcut help ────────────────────────────── */
 
 .volis-help-modal {
+  width: 580px;
+  max-width: 92vw;
+  max-height: 76vh;
   overflow: hidden;
 }
 
@@ -3145,6 +3155,9 @@
 /* ── Markdown export ───────────────────────────────────── */
 
 .volis-export-modal {
+  width: 680px;
+  max-width: 94vw;
+  max-height: 84vh;
   overflow: hidden;
 }
 

@@ -13,9 +13,6 @@ export class ShortcutHelpModal extends Modal {
 
   onOpen(): void {
     this.modalEl.addClass("volis-help-modal");
-    this.modalEl.style.width = "580px";
-    this.modalEl.style.maxWidth = "92vw";
-    this.modalEl.style.maxHeight = "76vh";
 
     this.titleEl.setText("白板快捷键");
 

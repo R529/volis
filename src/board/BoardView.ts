@@ -480,8 +480,8 @@ export class BoardView extends TextFileView {
     toolbar.createDiv({ cls: "volis-board-sep" });
 
     // Create group: these two make a node directly, no picker.
-    addButton("sticky-note", "新建便签", () => this.createStickyAtCenter());
-    addButton("type", "新建文本", () => this.createTextAtCenter());
+    addButton("sticky-note", "新建便签", () => { void this.createStickyAtCenter(); });
+    addButton("type", "新建文本", () => { void this.createTextAtCenter(); });
     toolbar.createDiv({ cls: "volis-board-sep" });
 
     // Insert group: each opens the picker filtered to one kind.
@@ -541,12 +541,12 @@ export class BoardView extends TextFileView {
     this.root.addEventListener("dblclick", this.onDoubleClick);
     this.root.addEventListener("dragover", this.onDragOver);
     this.root.addEventListener("dragleave", this.onDragLeave);
-    this.root.addEventListener("drop", this.onDrop);
+    this.root.addEventListener("drop", (evt) => { void this.onDrop(evt); });
 
     this.world.addEventListener("pointerdown", (evt) => {
       const target = evt.target as Element | null;
       if (!(target instanceof SVGElement)) return;
-      const group = target.closest(".volis-edge-group") as SVGGElement | null;
+      const group = target.closest<SVGGElement>(".volis-edge-group");
       const edgeId = group?.dataset.edgeId ?? null;
       if (!edgeId) return;
       evt.stopPropagation();
@@ -599,7 +599,7 @@ export class BoardView extends TextFileView {
       this.scale = 1;
     }
 
-    this.world.style.visibility = "hidden";
+    this.world.addClass("is-loading");
     // The hint sits outside the world layer, so it has to be hidden for the
     // same span, otherwise it flashes over the incoming board.
     this.hintEl.addClass("is-hidden");
@@ -629,7 +629,7 @@ export class BoardView extends TextFileView {
 
       this.renderEdges();
     } finally {
-      this.world.style.visibility = "";
+      this.world.removeClass("is-loading");
     }
 
     this.updateHint();
@@ -1649,7 +1649,7 @@ export class BoardView extends TextFileView {
         id,
         x: Math.round(node.x + dx),
         y: Math.round(node.y + dy),
-      } as BoardNode;
+      };
     });
 
     const edges = this.clipboardEdges
@@ -2957,9 +2957,9 @@ export class BoardView extends TextFileView {
     if (target?.closest(".volis-outline-panel")) return;
     // Only a SELECTED node claims the wheel for its own content. Hovering an
     // unselected node must still zoom the board.
-    const hoveredBody = target?.closest(".volis-bnode-body") as HTMLElement | null;
+    const hoveredBody = target?.closest<HTMLElement>(".volis-bnode-body");
     if (hoveredBody) {
-      const nodeEl = hoveredBody.closest(".volis-bnode") as HTMLElement | null;
+      const nodeEl = hoveredBody.closest<HTMLElement>(".volis-bnode");
       const nodeId = nodeEl?.dataset?.nodeId;
       if (nodeId && this.selection.has(nodeId)) return;
     }
@@ -2996,17 +2996,17 @@ export class BoardView extends TextFileView {
     if (target.closest(".volis-board-toolbar")) return;
     if (target.closest(".volis-outline-panel")) return;
 
-    const nodeEl = target.closest(".volis-bnode") as HTMLElement | null;
+    const nodeEl = target.closest<HTMLElement>(".volis-bnode");
     const nodeId = nodeEl?.dataset?.nodeId ?? null;
     this.lastDownNodeId = nodeId;
 
-    const portEl = target.closest(".volis-port") as HTMLElement | null;
+    const portEl = target.closest<HTMLElement>(".volis-port");
     if (portEl && nodeId) {
       this.startLinkDrag(evt, nodeId, portEl.dataset.port ?? "right");
       return;
     }
 
-    const handleEl = target.closest(".volis-resize-handle") as HTMLElement | null;
+    const handleEl = target.closest<HTMLElement>(".volis-resize-handle");
     if (handleEl && nodeId) {
       this.startResize(evt, nodeId, (handleEl.dataset.dir as ResizeDir) ?? "se");
       return;
@@ -3017,7 +3017,7 @@ export class BoardView extends TextFileView {
     // A press on the native scrollbar belongs to the browser. If we start a
     // node drag here, pointer capture steals the events and the thumb cannot
     // be dragged at all.
-    const bodyEl = target.closest(".volis-bnode-body") as HTMLElement | null;
+    const bodyEl = target.closest<HTMLElement>(".volis-bnode-body");
     if (bodyEl && this.isOnScrollbar(bodyEl, evt.clientX)) return;
 
     if (evt.button === 1 || (evt.button === 0 && this.spaceDown)) {
@@ -3876,7 +3876,7 @@ export class BoardView extends TextFileView {
       try {
         for (;;) {
           try {
-            result = await this.aiProvider!.complete(this.aiHistory, {
+            result = await this.aiProvider.complete(this.aiHistory, {
               system: this.aiSystem,
               maxTokens: outCap,
               thinking,
@@ -4297,7 +4297,7 @@ export class BoardView extends TextFileView {
     }
 
     const anchorRect = anchor.getBoundingClientRect();
-    const panelEl = anchor.closest(".volis-ai-panel") as HTMLElement | null;
+    const panelEl = anchor.closest<HTMLElement>(".volis-ai-panel");
     const panelRect = panelEl?.getBoundingClientRect() ?? anchorRect;
     const rootRect = this.root.getBoundingClientRect();
     const width = 300;
@@ -4512,7 +4512,7 @@ export class BoardView extends TextFileView {
     this.updateHint();
     this.pushHistory();
     this.scheduleSave();
-    this.openEditor(node, el);
+    void this.openEditor(node, el);
   }
 
   private async createStickyAtCenter(): Promise<void> {
@@ -5647,7 +5647,7 @@ export class BoardView extends TextFileView {
         video.pause();
         video.controls = false;
       }
-      const play = el.querySelector(".volis-bnode-play") as HTMLElement | null;
+      const play = el.querySelector<HTMLElement>(".volis-bnode-play");
       if (play) play.removeClass("is-hidden");
     });
   }
@@ -6006,7 +6006,7 @@ export class BoardView extends TextFileView {
     this.paintSelection();
     this.updateHint();
     this.pushHistory();
-    this.openEditor(node, el);
+    void this.openEditor(node, el);
     return node;
   }
 
@@ -6115,7 +6115,7 @@ export class BoardView extends TextFileView {
     const plain = dt.getData("text/plain") ?? "";
     const uri = (dt.getData("text/uri-list") ?? "").split(/\r?\n/)[0] ?? "";
 
-    const block = plain.match(/!?\[\[([^\[\]|#]+)#\^([^\]|\n]+)(?:\|[^\]\n]+)?\]\]/);
+    const block = plain.match(/!?\[\[([^[\]|#]+)#\^([^\]|\n]+)(?:\|[^\]\n]+)?\]\]/);
     if (block) {
       const dest = this.app.metadataCache.getFirstLinkpathDest(block[1].trim(), "");
       if (dest) {
@@ -6145,7 +6145,7 @@ export class BoardView extends TextFileView {
 
     const dropped = Array.from(dt.files ?? []);
     if (dropped.length > 0) {
-      const basePath = String((this.app.vault.adapter as any).basePath ?? "").replace(/\\/g, "/");
+      const basePath = String((this.app.vault.adapter as unknown as { basePath?: string }).basePath ?? "").replace(/\\/g, "/");
       let handled = false;
 
       for (const item of dropped) {
@@ -6180,7 +6180,7 @@ export class BoardView extends TextFileView {
     try {
       const buffer = await file.arrayBuffer();
 
-      const config = (this.app.vault as any).getConfig?.("attachmentFolderPath");
+      const config = (this.app.vault as unknown as { getConfig?: (key: string) => unknown }).getConfig?.("attachmentFolderPath");
       let dir = typeof config === "string" ? config : "Attachments";
       if (dir === "/" || dir === "./") dir = "";
       dir = dir.replace(/^\.\//, "").replace(/\/$/, "");

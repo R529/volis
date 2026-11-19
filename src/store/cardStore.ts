@@ -2,7 +2,7 @@ import { App, TFile } from "obsidian";
 import { CardMeta, CardRef } from "../types";
 import { buildBlockLines, locateBlock, readBlockContent } from "../parse/blockLocator";
 
-const TAG_RE = /(^|\s)#([^\s#\[\]()]+)/g;
+const TAG_RE = /(^|\s)#([^\s#[\]()]+)/g;
 const TIME_RE = /^\s*(\d{1,2}:\d{2})\s/;
 const DATE_RE = /^##\s+(\d{4}-\d{2}-\d{2})\s*$/;
 

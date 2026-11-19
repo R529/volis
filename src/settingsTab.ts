@@ -9,6 +9,10 @@ import {
   inferCapability,
 } from "./ai/capability";
 
+function voidAsync(fn: () => Promise<void>): () => void {
+  return () => { void fn(); };
+}
+
 export class VolisSettingTab extends PluginSettingTab {
   constructor(app: App, private plugin: VolisPlugin) {
     super(app, plugin);
@@ -19,10 +23,10 @@ export class VolisSettingTab extends PluginSettingTab {
     containerEl.empty();
     containerEl.addClass("volis-settings");
 
-    containerEl.createEl("h2", { text: "Volis" });
+    new Setting(containerEl).setName("常规").setHeading();
 
     this.divider(containerEl);
-    containerEl.createEl("h3", { text: "角标" });
+    new Setting(containerEl).setName("角标").setHeading();
 
     new Setting(containerEl)
       .setName("显示角标")
@@ -49,7 +53,7 @@ export class VolisSettingTab extends PluginSettingTab {
       );
 
     this.divider(containerEl);
-    containerEl.createEl("h3", { text: "白板" });
+    new Setting(containerEl).setName("白板").setHeading();
 
     new Setting(containerEl)
       .setName("白板保存位置")
@@ -89,7 +93,7 @@ export class VolisSettingTab extends PluginSettingTab {
   }
 
   private renderAI(containerEl: HTMLElement): void {
-    containerEl.createEl("h3", { text: "AI" });
+    new Setting(containerEl).setName("AI").setHeading();
 
     const ai = this.plugin.settings.ai;
     const save = () => this.plugin.saveSettings();
@@ -276,12 +280,12 @@ export class VolisSettingTab extends PluginSettingTab {
 
         if (!active) {
           const useBtn = actions.createEl("button", { cls: "volis-ai-use", text: "启用" });
-          useBtn.addEventListener("click", async () => {
+          useBtn.addEventListener("click", voidAsync(async () => {
             ai.activeId = profile.id;
             ai.enabled = true;
             await save();
             renderCards();
-          });
+          }));
         }
 
         const editBtn = actions.createEl("button", {
@@ -290,14 +294,15 @@ export class VolisSettingTab extends PluginSettingTab {
         });
         setIcon(editBtn, "pencil");
         editBtn.addEventListener("click", () => {
-          new AIProfileModal(this.app, profile, async (next: AIProfile) => {
+          new AIProfileModal(this.app, profile, (next: AIProfile) => { void (async () => {
             const index = ai.profiles.findIndex((item) => item.id === profile.id);
             if (index === -1) return;
 
             ai.profiles[index] = next;
             await save();
             renderCards();
-          }).open();
+          })();
+        }).open();
         });
 
         const delBtn = actions.createEl("button", {
@@ -305,14 +310,14 @@ export class VolisSettingTab extends PluginSettingTab {
           attr: { "aria-label": "删除" },
         });
         setIcon(delBtn, "trash-2");
-        delBtn.addEventListener("click", async () => {
+        delBtn.addEventListener("click", voidAsync(async () => {
           ai.profiles = ai.profiles.filter((item) => item.id !== profile.id);
           if (ai.activeId === profile.id) {
             ai.activeId = ai.profiles[0]?.id ?? "";
           }
           await save();
           renderCards();
-        });
+        }));
       }
     };
 
@@ -326,18 +331,19 @@ export class VolisSettingTab extends PluginSettingTab {
           .setButtonText("添加配置")
           .setCta()
           .onClick(() => {
-            new AIProfileModal(this.app, null, async (profile: AIProfile) => {
+            new AIProfileModal(this.app, null, (profile: AIProfile) => { void (async () => {
               ai.profiles.push(profile);
               if (!ai.activeId) ai.activeId = profile.id;
               await save();
               renderCards();
-            }).open();
+            })();
+          }).open();
           })
       );
   }
 
   private renderDiagnostics(containerEl: HTMLElement): void {
-    containerEl.createEl("h3", { text: "诊断" });
+    new Setting(containerEl).setName("诊断").setHeading();
 
     const stat = containerEl.createEl("p", {
       text: "在画布视图中打开本页，可看到当前识别到的卡片数量。",

@@ -1,6 +1,6 @@
-import { Notice, Plugin, TFile } from "obsidian";
-import { DEFAULT_SETTINGS, VolisSettings, normalizeAISettings } from "./settings";
-import { NodeIndex, collectNodes } from "./canvas/nodeIndex";
+import { Notice, Plugin, TFile, WorkspaceLeaf } from "obsidian";
+import { DEFAULT_SETTINGS, StoredConversation, VolisSettings, normalizeAISettings } from "./settings";
+import { NodeIndex } from "./canvas/nodeIndex";
 import { ActionContext, ActionRegistry } from "./canvas/actions";
 import { SyncEngine } from "./canvas/syncEngine";
 import { applyBadges, clearBadges } from "./canvas/badge";
@@ -14,17 +14,48 @@ import { writeCard } from "./store/cardStore";
 import { makeBlockLink } from "./parse/cardRef";
 import { CardMeta } from "./types";
 import { VolisSettingTab } from "./settingsTab";
+import { CanvasNodeData, CanvasNodeLike, CanvasViewLike, collectNodes } from "./canvas/canvasTypes";
 
-/** Dashed canvas, a flowing stroke and a node dot. Colour comes from the theme
- *  so the icon stays visible in dark mode. */
-const RIBBON_ICON = `
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18"
-  fill="none" stroke="currentColor" stroke-width="1.8"
-  stroke-linecap="round" stroke-linejoin="round">
-  <rect x="2.5" y="3.5" width="19" height="17" rx="5" stroke-dasharray="3 2.6"/>
-  <path d="M6 15.5C8.2 10.5 11 10.2 11.8 12.4C12.6 14.6 15.4 14.8 17.6 10.2"/>
-  <circle cx="18.6" cy="6.6" r="1.5" fill="currentColor" stroke="none"/>
-</svg>`;
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+function svgEl<K extends keyof SVGElementTagNameMap>(
+  tag: K,
+  attrs: Record<string, string>
+): SVGElementTagNameMap[K] {
+  const el = document.createElementNS(SVG_NS, tag);
+  for (const [key, value] of Object.entries(attrs)) el.setAttribute(key, value);
+  return el;
+}
+
+/** Dashed canvas, a flowing stroke and a node dot. Built as DOM, not HTML text,
+ *  so the ribbon icon stays safe under the community scanner. */
+function paintRibbonIcon(host: HTMLElement): void {
+  host.empty();
+  const svg = svgEl("svg", {
+    xmlns: SVG_NS,
+    viewBox: "0 0 24 24",
+    width: "18",
+    height: "18",
+    fill: "none",
+    stroke: "currentColor",
+    "stroke-width": "1.8",
+    "stroke-linecap": "round",
+    "stroke-linejoin": "round",
+  });
+  svg.append(
+    svgEl("rect", {
+      x: "2.5", y: "3.5", width: "19", height: "17", rx: "5",
+      "stroke-dasharray": "3 2.6",
+    }),
+    svgEl("path", {
+      d: "M6 15.5C8.2 10.5 11 10.2 11.8 12.4C12.6 14.6 15.4 14.8 17.6 10.2",
+    }),
+    svgEl("circle", {
+      cx: "18.6", cy: "6.6", r: "1.5", fill: "currentColor", stroke: "none",
+    })
+  );
+  host.appendChild(svg);
+}
 
 export default class VolisPlugin extends Plugin {
   settings!: VolisSettings;
@@ -77,8 +108,7 @@ export default class VolisPlugin extends Plugin {
     const ribbon = this.addRibbonIcon("dot", "Volis", () => {
       void this.createBoard();
     });
-    ribbon.empty();
-    ribbon.innerHTML = RIBBON_ICON;
+    paintRibbonIcon(ribbon);
 
     this.app.workspace.onLayoutReady(() => {
       this.scheduleRefresh(300);
@@ -116,16 +146,16 @@ export default class VolisPlugin extends Plugin {
 
     // Same rule as opening any note: jump to the tab that already shows it.
     for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_VOLIS_BOARD)) {
-      const view: any = leaf.view;
-      if (view?.file?.path === file.path) {
-        this.app.workspace.revealLeaf(leaf);
+      const view = leaf.view as unknown as CanvasViewLike;
+      if (view.file?.path === file.path) {
+        void this.app.workspace.revealLeaf(leaf);
         return;
       }
     }
 
     const leaf = this.app.workspace.getLeaf("tab");
     await leaf.openFile(file);
-    this.app.workspace.revealLeaf(leaf);
+    void this.app.workspace.revealLeaf(leaf);
   }
 
   onunload(): void {
@@ -142,13 +172,13 @@ export default class VolisPlugin extends Plugin {
   }
 
   async loadSettings(): Promise<void> {
-    const data = (await this.loadData()) ?? {};
+    const loaded = (await this.loadData()) as Partial<VolisSettings> | null;
     this.settings = {
       ...DEFAULT_SETTINGS,
-      ...data,
-      ai: normalizeAISettings((data as { ai?: unknown }).ai),
-      conversations: Array.isArray((data as { conversations?: unknown }).conversations)
-        ? ((data as { conversations: never[] }).conversations)
+      ...(loaded ?? {}),
+      ai: normalizeAISettings(loaded?.ai),
+      conversations: Array.isArray(loaded?.conversations)
+        ? loaded.conversations
         : [],
     };
   }
@@ -193,8 +223,8 @@ export default class VolisPlugin extends Plugin {
     }
   }
 
-  private ensureObserver(view: any): void {
-    const container: HTMLElement | undefined = view?.containerEl;
+  private ensureObserver(view: CanvasViewLike): void {
+    const container = view.containerEl;
     if (!container) return;
     if (this.observer && this.observedContainer === container) return;
 
@@ -212,18 +242,21 @@ export default class VolisPlugin extends Plugin {
     });
   }
 
-  private getCanvasView(): any | null {
-    const candidates: any[] = [];
-    const active: any = this.app.workspace.activeLeaf;
-    if (active) candidates.push(active);
-    const recent: any = (this.app.workspace as any).getMostRecentLeaf?.();
+  private getCanvasView(): CanvasViewLike | null {
+    const workspace = this.app.workspace as unknown as {
+      activeLeaf: WorkspaceLeaf | null;
+      getMostRecentLeaf?: () => WorkspaceLeaf | null;
+    };
+    const candidates: WorkspaceLeaf[] = [];
+    if (workspace.activeLeaf) candidates.push(workspace.activeLeaf);
+    const recent = workspace.getMostRecentLeaf?.();
     if (recent) candidates.push(recent);
     for (const leaf of this.app.workspace.getLeavesOfType("canvas")) {
       candidates.push(leaf);
     }
 
     for (const leaf of candidates) {
-      const view: any = leaf?.view;
+      const view = leaf?.view as unknown as CanvasViewLike | null;
       if (view && typeof view.getViewType === "function" && view.getViewType() === "canvas") {
         return view;
       }
@@ -234,31 +267,34 @@ export default class VolisPlugin extends Plugin {
   private selfCheck(): void {
     const view = this.getCanvasView();
     const canvas = view?.canvas;
-    const nodes = canvas?.nodes;
-    const info: Record<string, unknown> = {
+    const nodes = canvas?.nodes ? collectNodes(canvas.nodes) : [];
+
+    console.warn("[Volis] self-check", {
       version: this.manifest.version,
       hasCanvasView: !!view,
       hasCanvas: !!canvas,
-      hasNodesMap: !!nodes,
-      nodeCount: nodes?.size ?? 0,
+      hasNodesMap: !!canvas?.nodes,
+      nodeCount: nodes.length,
       recognized: this.index.size,
-    };
+    });
 
-    if (nodes && nodes.size > 0) {
-      const first: any = Array.from(nodes.values())[0];
-      const data = typeof first?.getData === "function" ? first.getData() : null;
-      info.firstNode = {
-        keys: data ? Object.keys(data) : [],
-        type: data?.type,
-        text: data?.text,
-        hasNodeEl: !!first?.nodeEl,
-        nodeElClass: first?.nodeEl?.className ?? null,
-      };
+    const first = nodes[0];
+    if (first) {
+      const data: CanvasNodeData =
+        typeof first.getData === "function"
+          ? (first.getData() ?? {})
+          : (first as unknown as CanvasNodeData);
+      console.warn("[Volis] first node", {
+        keys: Object.keys(data),
+        type: data.type,
+        text: data.text,
+        hasNodeEl: !!first.nodeEl,
+        nodeElClass: first.nodeEl?.className ?? null,
+      });
     }
 
-    console.log("[Volis] self-check", info);
     new Notice(
-      `Volis 自检 · 画布:${info.hasCanvasView ? "有" : "无"} · 节点:${info.nodeCount} · 识别:${info.recognized}`,
+      `Volis 自检 · 画布:${view ? "有" : "无"} · 节点:${nodes.length} · 识别:${this.index.size}`,
       10000
     );
   }
@@ -273,15 +309,14 @@ export default class VolisPlugin extends Plugin {
 
   private getSelectedContext(): ActionContext | null {
     const view = this.getCanvasView();
-    const canvas = view?.canvas;
-    if (!canvas) return null;
+    const selection = view?.canvas?.selection;
+    if (!selection) return null;
 
-    const selection: any[] = Array.from(canvas.selection ?? []);
-    if (selection.length === 0) return null;
+    const items = Array.from(selection);
+    if (items.length === 0) return null;
 
-    const first: any = selection[0];
-    const id: string | undefined =
-      first?.id ?? (typeof first?.getData === "function" ? first.getData?.()?.id : undefined);
+    const first = items[0];
+    const id = first.id ?? first.getData?.()?.id;
     if (!id) return null;
 
     return this.buildContext(id);
@@ -297,7 +332,7 @@ export default class VolisPlugin extends Plugin {
         if (!target) return;
         if (target.closest(".volis-inline")) return;
 
-        const nodeEl = target.closest(".canvas-node") as HTMLElement | null;
+        const nodeEl = target.closest<HTMLElement>(".canvas-node");
         if (!nodeEl) {
           this.pendingClick = null;
           return;
@@ -307,8 +342,8 @@ export default class VolisPlugin extends Plugin {
         if (!view) return;
 
         const node = this.findNodeByElement(view, nodeEl);
-        const nodeId: string | undefined = node?.getData?.()?.id;
-        if (!nodeId) return;
+        const nodeId = node?.getData?.()?.id ?? node?.id;
+        if (!node || !nodeId) return;
 
         const meta = this.index.get(nodeId)?.meta;
         if (!meta || meta.stale) return;
@@ -369,9 +404,12 @@ export default class VolisPlugin extends Plugin {
     );
   }
 
-  private findNodeByElement(view: any, el: HTMLElement): any | null {
-    for (const node of collectNodes(view?.canvas?.nodes)) {
-      const nodeEl: HTMLElement | undefined = node?.nodeEl;
+  private findNodeByElement(
+    view: CanvasViewLike,
+    el: HTMLElement
+  ): CanvasNodeLike | null {
+    for (const node of collectNodes(view.canvas?.nodes)) {
+      const nodeEl = node.nodeEl;
       if (!nodeEl) continue;
       if (nodeEl === el || nodeEl.contains(el)) return node;
     }
@@ -430,7 +468,7 @@ export default class VolisPlugin extends Plugin {
       name: "用 AI 分析白板",
       callback: () => {
         const view = this.getCanvasView();
-        if (view) view.openAIPanel();
+        if (view) view.openAIPanel?.();
       },
     });
 
@@ -439,7 +477,7 @@ export default class VolisPlugin extends Plugin {
       name: "白板体检",
       callback: () => {
         const view = this.getCanvasView();
-        if (view) view.openBoardDoctor();
+        if (view) view.openBoardDoctor?.();
       },
     });
 
@@ -449,7 +487,7 @@ export default class VolisPlugin extends Plugin {
       checkCallback: (checking) => {
         const view = this.app.workspace.getActiveViewOfType(BoardView);
         if (!view) return false;
-        if (!checking) view.openOutlinePanel();
+        if (!checking) view.openOutlinePanel?.();
         return true;
       },
     });
@@ -460,7 +498,7 @@ export default class VolisPlugin extends Plugin {
       checkCallback: (checking) => {
         const view = this.app.workspace.getActiveViewOfType(BoardView);
         if (!view) return false;
-        if (!checking) view.openExportModal();
+        if (!checking) view.openExportModal?.();
         return true;
       },
     });
@@ -470,7 +508,7 @@ export default class VolisPlugin extends Plugin {
       name: "在白板中查找节点",
       callback: () => {
         const view = this.getCanvasView();
-        if (view) view.openNodeSearch();
+        if (view) view.openNodeSearch?.();
       },
     });
 
@@ -479,7 +517,7 @@ export default class VolisPlugin extends Plugin {
       name: "搜索或新建节点",
       callback: () => {
         const view = this.getCanvasView();
-        if (view) view.openInsertPanelAtCenter();
+        if (view) view.openInsertPanelAtCenter?.();
       },
     });
 
@@ -620,11 +658,11 @@ export default class VolisPlugin extends Plugin {
   private editCard(meta: CardMeta, nodeId?: string): void {
     const view = this.getCanvasView();
     const canvas = view?.canvas;
-    let node: any = nodeId ? canvas?.nodes?.get?.(nodeId) : null;
+    let node: CanvasNodeLike | null = nodeId ? (canvas?.get?.(nodeId) ?? null) : null;
 
     if (!node) {
       for (const candidate of collectNodes(canvas?.nodes)) {
-        const entry = this.index.get(candidate?.getData?.()?.id);
+        const entry = this.index.get(candidate.getData?.()?.id ?? candidate.id ?? "");
         const ref = entry?.meta?.ref;
         if (ref && ref.file === meta.ref.file && ref.blockId === meta.ref.blockId) {
           node = candidate;
@@ -633,7 +671,7 @@ export default class VolisPlugin extends Plugin {
       }
     }
 
-    const nodeEl: HTMLElement | undefined = node?.nodeEl;
+    const nodeEl = node?.nodeEl;
     if (nodeEl) {
       this.openInline(nodeEl, meta);
       return;
@@ -659,12 +697,12 @@ export default class VolisPlugin extends Plugin {
   }
 
   private removeNode(ctx: ActionContext): void {
-    const canvas = ctx.canvasView?.canvas;
-    const node = canvas?.nodes?.get?.(ctx.nodeId);
+    const canvas = ctx.canvasView.canvas;
+    const node = canvas?.get?.(ctx.nodeId) ?? null;
     try {
-      if (node && typeof canvas.removeNode === "function") {
+      if (node && canvas?.removeNode) {
         canvas.removeNode(node);
-      } else if (node && typeof node.remove === "function") {
+      } else if (node?.remove) {
         node.remove();
       } else {
         return;
@@ -676,25 +714,19 @@ export default class VolisPlugin extends Plugin {
   }
 }
 
-function isNodeSelected(view: any, node: any, nodeId: string): boolean {
-  const selection: any = view?.canvas?.selection;
+function isNodeSelected(
+  view: CanvasViewLike,
+  node: CanvasNodeLike,
+  nodeId: string
+): boolean {
+  const selection = view.canvas?.selection;
   if (!selection) return false;
 
-  if (typeof selection.has === "function") {
-    try {
-      if (selection.has(node)) return true;
-    } catch (error) {
-      // some builds store ids instead of node objects
-    }
-  }
+  if (selection instanceof Set && selection.has(node)) return true;
 
-  let found = false;
-  if (typeof selection.forEach === "function") {
-    selection.forEach((item: any) => {
-      const id =
-        item?.id ?? (typeof item?.getData === "function" ? item.getData?.()?.id : undefined);
-      if (id === nodeId) found = true;
-    });
+  for (const item of Array.from(selection)) {
+    const id = item.id ?? item.getData?.()?.id;
+    if (id === nodeId) return true;
   }
-  return found;
+  return false;
 }

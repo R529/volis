@@ -2,6 +2,9 @@ import { App } from "obsidian";
 import { CardMeta } from "../types";
 import { resolveCardRef } from "../parse/cardRef";
 import { readCard } from "../store/cardStore";
+import { CanvasNodeData, CanvasViewLike, collectNodes } from "./canvasTypes";
+
+export { collectNodes } from "./canvasTypes";
 
 export interface NodeEntry {
   nodeId: string;
@@ -33,7 +36,7 @@ export class NodeIndex {
     return this.entries.size;
   }
 
-  async scan(canvasView: any): Promise<void> {
+  async scan(canvasView: CanvasViewLike): Promise<void> {
     const canvas = canvasView?.canvas;
     if (!canvas?.nodes) return;
     if (this.inFlight.has(canvas)) return;
@@ -47,11 +50,14 @@ export class NodeIndex {
 
       for (const node of collectNodes(canvas.nodes)) {
         try {
-          const data = typeof node.getData === "function" ? node.getData() : node;
+          const data: CanvasNodeData | null =
+            typeof node.getData === "function"
+              ? (node.getData() ?? null)
+              : (node as unknown as CanvasNodeData);
           if (!data || data.type !== "text") continue;
 
-          const id: string = data.id;
-          const text: string = typeof data.text === "string" ? data.text : "";
+          const id = data.id;
+          const text = typeof data.text === "string" ? data.text : "";
           if (!id) continue;
           seen.add(id);
 
@@ -98,24 +104,3 @@ export class NodeIndex {
   }
 }
 
-/**
- * `canvas.nodes` is a Map in current builds but the internal shape is not
- * guaranteed, so accept plain objects too.
- */
-export function collectNodes(nodes: any): any[] {
-  const out: any[] = [];
-  if (!nodes) return out;
-
-  if (typeof nodes.get === "function" && typeof nodes.forEach === "function") {
-    nodes.forEach((node: any) => out.push(node));
-    return out;
-  }
-
-  if (typeof nodes === "object") {
-    Object.keys(nodes).forEach((key) => {
-      const value = nodes[key];
-      if (value && typeof value === "object") out.push(value);
-    });
-  }
-  return out;
-}

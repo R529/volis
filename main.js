@@ -186,13 +186,8 @@ async function probeOpenAI(profile, notes) {
     return null;
   }
   const entries = (_a = parsed.data) != null ? _a : [];
-  const target = (_b = entries.find((entry) => {
-    var _a2;
-    return String((_a2 = entry.id) != null ? _a2 : "") === profile.model;
-  })) != null ? _b : entries.find((entry) => {
-    var _a2;
-    return String((_a2 = entry.id) != null ? _a2 : "").includes(profile.model);
-  });
+  const modelId = (entry) => typeof entry.id === "string" ? entry.id : "";
+  const target = (_b = entries.find((entry) => modelId(entry) === profile.model)) != null ? _b : entries.find((entry) => modelId(entry).includes(profile.model));
   if (!target) {
     notes.push("\u6A21\u578B\u5217\u8868\u91CC\u6CA1\u6709\u8FD9\u4E2A\u6A21\u578B\uFF0C\u6539\u7528\u624B\u52A8\u503C\u3002");
     return null;
@@ -389,7 +384,7 @@ function thinkingOr(value, fallback) {
 }
 
 // src/parse/cardRef.ts
-var BLOCK_LINK_RE = /\[\[([^\[\]|#]+?)#\^([^\[\]|\n]+)(?:\|([^\]\n]+))?\]\]/g;
+var BLOCK_LINK_RE = /\[\[([^[\]|#]+?)#\^([^[\]|\n]+)(?:\|([^\]\n]+))?\]\]/g;
 function extractBlockLinks(text) {
   const out = [];
   BLOCK_LINK_RE.lastIndex = 0;
@@ -509,7 +504,7 @@ function buildBlockLines(body, firstPrefix, contIndent, blockId) {
 }
 
 // src/store/cardStore.ts
-var TAG_RE = /(^|\s)#([^\s#\[\]()]+)/g;
+var TAG_RE = /(^|\s)#([^\s#[\]()]+)/g;
 var TIME_RE = /^\s*(\d{1,2}:\d{2})\s/;
 var DATE_RE = /^##\s+(\d{4}-\d{2}-\d{2})\s*$/;
 function extractTags(body) {
@@ -594,6 +589,19 @@ async function listCardsInFile(app, filePath) {
   return refs;
 }
 
+// src/canvas/canvasTypes.ts
+function collectNodes(nodes) {
+  if (!nodes)
+    return [];
+  if (Array.isArray(nodes))
+    return nodes.slice();
+  if (nodes instanceof Map)
+    return Array.from(nodes.values());
+  if (nodes instanceof Set)
+    return Array.from(nodes);
+  return Object.values(nodes);
+}
+
 // src/canvas/nodeIndex.ts
 var NodeIndex = class {
   constructor(app) {
@@ -615,7 +623,7 @@ var NodeIndex = class {
     return this.entries.size;
   }
   async scan(canvasView) {
-    var _a, _b;
+    var _a, _b, _c;
     const canvas = canvasView == null ? void 0 : canvasView.canvas;
     if (!(canvas == null ? void 0 : canvas.nodes))
       return;
@@ -628,7 +636,7 @@ var NodeIndex = class {
       const pending = [];
       for (const node of collectNodes(canvas.nodes)) {
         try {
-          const data = typeof node.getData === "function" ? node.getData() : node;
+          const data = typeof node.getData === "function" ? (_c = node.getData()) != null ? _c : null : node;
           if (!data || data.type !== "text")
             continue;
           const id = data.id;
@@ -671,23 +679,6 @@ var NodeIndex = class {
     }
   }
 };
-function collectNodes(nodes) {
-  const out = [];
-  if (!nodes)
-    return out;
-  if (typeof nodes.get === "function" && typeof nodes.forEach === "function") {
-    nodes.forEach((node) => out.push(node));
-    return out;
-  }
-  if (typeof nodes === "object") {
-    Object.keys(nodes).forEach((key) => {
-      const value = nodes[key];
-      if (value && typeof value === "object")
-        out.push(value);
-    });
-  }
-  return out;
-}
 
 // src/canvas/actions.ts
 var ActionRegistry = class {
@@ -730,13 +721,13 @@ var SyncEngine = class {
       this.scheduled();
   }
   handleModify(file) {
-    var _a, _b, _c;
+    var _a;
     if (file.extension !== "md")
       return;
     const leaves = this.app.workspace.getLeavesOfType("canvas");
     for (const leaf of leaves) {
       const view = leaf.view;
-      if (typeof (view == null ? void 0 : view.getViewData) !== "function")
+      if (typeof view.getViewData !== "function")
         continue;
       let raw = "";
       try {
@@ -747,14 +738,13 @@ var SyncEngine = class {
       if (!raw)
         continue;
       if (raw.includes(file.basename) || raw.includes(file.path)) {
-        this.pending.add((_c = (_b = leaf.id) != null ? _b : view.id) != null ? _c : "");
+        this.pending.add(leafKey(leaf, view));
       }
     }
     if (this.pending.size > 0)
       this.scheduled();
   }
   flush() {
-    var _a, _b;
     if (this.refreshing)
       return;
     if (!this.canRefresh())
@@ -764,7 +754,7 @@ var SyncEngine = class {
       const leaves = this.app.workspace.getLeavesOfType("canvas");
       for (const leaf of leaves) {
         const view = leaf.view;
-        const key = (_b = (_a = leaf.id) != null ? _a : view == null ? void 0 : view.id) != null ? _b : "";
+        const key = leafKey(leaf, view);
         if (!this.pending.has(key))
           continue;
         this.refreshView(view);
@@ -776,54 +766,63 @@ var SyncEngine = class {
     }
   }
   refreshView(view) {
-    if (!view || typeof view.getViewData !== "function" || typeof view.setViewData !== "function") {
+    if (typeof view.getViewData !== "function" || typeof view.setViewData !== "function") {
       return;
     }
-    const canvas = view == null ? void 0 : view.canvas;
+    const canvas = view.canvas;
     const viewport = captureViewport(canvas);
     try {
       const json = view.getViewData();
       if (!json)
         return;
-      view.setViewData(json, true);
+      void view.setViewData(json, true);
       restoreViewport(view.canvas, viewport);
     } catch (error) {
       console.error("[Volis] refresh failed", error);
     }
   }
 };
+function leafKey(leaf, view) {
+  var _a, _b;
+  return (_b = (_a = leaf.id) != null ? _a : view.id) != null ? _b : "";
+}
 function captureViewport(canvas) {
   const out = {};
-  ["tx", "ty", "tz", "zoom", "scale"].forEach((key) => {
-    if (typeof canvas[key] === "number")
-      out[key] = canvas[key];
-  });
+  if (!canvas)
+    return out;
+  const values = canvas;
+  for (const key of ["tx", "ty", "tz", "zoom", "scale"]) {
+    const value = values[key];
+    if (typeof value === "number")
+      out[key] = value;
+  }
   return out;
 }
 function restoreViewport(canvas, viewport) {
   if (!canvas)
     return;
-  Object.keys(viewport).forEach((key) => {
+  const values = canvas;
+  for (const key of Object.keys(viewport)) {
     try {
-      canvas[key] = viewport[key];
+      values[key] = viewport[key];
     } catch (error) {
     }
-  });
+  }
 }
 
 // src/canvas/badge.ts
 var BADGE_CLASS = "volis-badge";
 function applyBadges(canvasView, index, settings) {
   var _a, _b, _c, _d;
-  const canvas = canvasView == null ? void 0 : canvasView.canvas;
+  const canvas = canvasView.canvas;
   if (!(canvas == null ? void 0 : canvas.nodes))
     return;
-  const container = canvasView == null ? void 0 : canvasView.containerEl;
+  const container = canvasView.containerEl;
   for (const node of collectNodes(canvas.nodes)) {
-    const nodeId = (_c = node == null ? void 0 : node.id) != null ? _c : typeof (node == null ? void 0 : node.getData) === "function" ? (_b = (_a = node.getData) == null ? void 0 : _a.call(node)) == null ? void 0 : _b.id : void 0;
+    const nodeId = (_c = node.id) != null ? _c : (_b = (_a = node.getData) == null ? void 0 : _a.call(node)) == null ? void 0 : _b.id;
     if (!nodeId)
       continue;
-    const el = (_d = node == null ? void 0 : node.nodeEl) != null ? _d : container == null ? void 0 : container.querySelector(`.canvas-node[data-id="${nodeId}"]`);
+    const el = (_d = node.nodeEl) != null ? _d : container.querySelector(`.canvas-node[data-id="${nodeId}"]`);
     if (!el)
       continue;
     let badge = el.querySelector(`.${BADGE_CLASS}`);
@@ -852,12 +851,12 @@ function applyBadges(canvasView, index, settings) {
   }
 }
 function clearBadges(canvasView) {
-  const canvas = canvasView == null ? void 0 : canvasView.canvas;
+  var _a;
+  const canvas = canvasView.canvas;
   if (!(canvas == null ? void 0 : canvas.nodes))
     return;
   for (const node of collectNodes(canvas.nodes)) {
-    const el = node == null ? void 0 : node.nodeEl;
-    const badge = el == null ? void 0 : el.querySelector(`.${BADGE_CLASS}`);
+    const badge = (_a = node.nodeEl) == null ? void 0 : _a.querySelector(`.${BADGE_CLASS}`);
     if (badge)
       badge.remove();
   }
@@ -2402,9 +2401,6 @@ var BoardDoctorModal = class extends import_obsidian11.Modal {
   onOpen() {
     this.modalEl.addClass("volis-doctor-modal");
     this.contentEl.addClass("volis-doctor-content");
-    this.modalEl.style.width = "620px";
-    this.modalEl.style.maxWidth = "92vw";
-    this.modalEl.style.maxHeight = "74vh";
     this.titleEl.setText("\u767D\u677F\u4F53\u68C0");
     this.installDrag();
     this.applyOffset();
@@ -2572,9 +2568,6 @@ var ShortcutHelpModal = class extends import_obsidian12.Modal {
   }
   onOpen() {
     this.modalEl.addClass("volis-help-modal");
-    this.modalEl.style.width = "580px";
-    this.modalEl.style.maxWidth = "92vw";
-    this.modalEl.style.maxHeight = "76vh";
     this.titleEl.setText("\u767D\u677F\u5FEB\u6377\u952E");
     const host = this.contentEl;
     host.empty();
@@ -2922,9 +2915,6 @@ var MarkdownExportModal = class extends import_obsidian13.Modal {
   onOpen() {
     this.modalEl.addClass("volis-export-modal");
     this.contentEl.addClass("volis-export-content");
-    this.modalEl.style.width = "680px";
-    this.modalEl.style.maxWidth = "94vw";
-    this.modalEl.style.maxHeight = "84vh";
     this.titleEl.setText("\u5BFC\u51FA Markdown");
     this.installDrag();
     this.contentEl.createDiv({
@@ -3554,7 +3544,7 @@ var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
         return;
       const plain = (_a = dt.getData("text/plain")) != null ? _a : "";
       const uri = (_c = ((_b = dt.getData("text/uri-list")) != null ? _b : "").split(/\r?\n/)[0]) != null ? _c : "";
-      const block = plain.match(/!?\[\[([^\[\]|#]+)#\^([^\]|\n]+)(?:\|[^\]\n]+)?\]\]/);
+      const block = plain.match(/!?\[\[([^[\]|#]+)#\^([^\]|\n]+)(?:\|[^\]\n]+)?\]\]/);
       if (block) {
         const dest = this.app.metadataCache.getFirstLinkpathDest(block[1].trim(), "");
         if (dest) {
@@ -3758,8 +3748,12 @@ var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
     };
     this.moreBtn = addButton("more-vertical", "\u66F4\u591A", (evt) => this.showBoardMenu(evt));
     toolbar.createDiv({ cls: "volis-board-sep" });
-    addButton("sticky-note", "\u65B0\u5EFA\u4FBF\u7B7E", () => this.createStickyAtCenter());
-    addButton("type", "\u65B0\u5EFA\u6587\u672C", () => this.createTextAtCenter());
+    addButton("sticky-note", "\u65B0\u5EFA\u4FBF\u7B7E", () => {
+      void this.createStickyAtCenter();
+    });
+    addButton("type", "\u65B0\u5EFA\u6587\u672C", () => {
+      void this.createTextAtCenter();
+    });
     toolbar.createDiv({ cls: "volis-board-sep" });
     addButton("file-text", "\u6DFB\u52A0 md \u7B14\u8BB0", () => this.openInsertPanelAtCenter("note"));
     addButton("list", "\u6DFB\u52A0\u5361\u7247\u7B14\u8BB0", () => this.openInsertPanelAtCenter("card"));
@@ -3807,7 +3801,9 @@ var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
     this.root.addEventListener("dblclick", this.onDoubleClick);
     this.root.addEventListener("dragover", this.onDragOver);
     this.root.addEventListener("dragleave", this.onDragLeave);
-    this.root.addEventListener("drop", this.onDrop);
+    this.root.addEventListener("drop", (evt) => {
+      void this.onDrop(evt);
+    });
     this.world.addEventListener("pointerdown", (evt) => {
       var _a;
       const target = evt.target;
@@ -3863,7 +3859,7 @@ var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
       this.ty = rect.height / 2;
       this.scale = 1;
     }
-    this.world.style.visibility = "hidden";
+    this.world.addClass("is-loading");
     this.hintEl.addClass("is-hidden");
     this.closeEdgeLabelEditor(false);
     try {
@@ -3884,7 +3880,7 @@ var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
       }
       this.renderEdges();
     } finally {
-      this.world.style.visibility = "";
+      this.world.removeClass("is-loading");
     }
     this.updateHint();
     this.resetHistory();
@@ -6998,7 +6994,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     this.updateHint();
     this.pushHistory();
     this.scheduleSave();
-    this.openEditor(node, el);
+    void this.openEditor(node, el);
   }
   async createStickyAtCenter() {
     await this.createTextAtCenter(true);
@@ -8083,7 +8079,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     this.paintSelection();
     this.updateHint();
     this.pushHistory();
-    this.openEditor(node, el);
+    void this.openEditor(node, el);
     return node;
   }
   async openEditor(node, existingEl) {
@@ -8749,8 +8745,9 @@ var ContextMenuInjector = class {
     );
   }
   inject(menu, node) {
-    const data = typeof (node == null ? void 0 : node.getData) === "function" ? node.getData() : node;
-    const nodeId = data == null ? void 0 : data.id;
+    var _a;
+    const data = typeof node.getData === "function" ? (_a = node.getData()) != null ? _a : {} : node;
+    const nodeId = data.id;
     if (!nodeId)
       return;
     const ctx = this.resolveContext(nodeId);
@@ -8762,8 +8759,8 @@ var ContextMenuInjector = class {
     menu.addSeparator();
     for (const action of actions) {
       menu.addItem((item) => {
-        var _a;
-        item.setTitle(action.label).setIcon((_a = action.icon) != null ? _a : "dot").onClick(() => {
+        var _a2;
+        item.setTitle(action.label).setIcon((_a2 = action.icon) != null ? _a2 : "dot").onClick(() => {
           void action.run(ctx);
         });
       });
@@ -9070,6 +9067,11 @@ var AIProfileModal = class extends import_obsidian17.Modal {
 };
 
 // src/settingsTab.ts
+function voidAsync(fn) {
+  return () => {
+    void fn();
+  };
+}
 var VolisSettingTab = class extends import_obsidian18.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
@@ -9079,9 +9081,9 @@ var VolisSettingTab = class extends import_obsidian18.PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.addClass("volis-settings");
-    containerEl.createEl("h2", { text: "Volis" });
+    new import_obsidian18.Setting(containerEl).setName("\u5E38\u89C4").setHeading();
     this.divider(containerEl);
-    containerEl.createEl("h3", { text: "\u89D2\u6807" });
+    new import_obsidian18.Setting(containerEl).setName("\u89D2\u6807").setHeading();
     new import_obsidian18.Setting(containerEl).setName("\u663E\u793A\u89D2\u6807").setDesc("\u5728\u5361\u7247\u8282\u70B9\u53F3\u4E0B\u89D2\u663E\u793A\u65E5\u671F\u3002\u4EC5\u5728\u753B\u5E03\u89C6\u56FE\u4E2D\u751F\u6548\uFF0C\u4E0D\u5F71\u54CD\u5361\u7247\u6B63\u6587\u3002").addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.showBadge).onChange(async (value) => {
         this.plugin.settings.showBadge = value;
@@ -9095,7 +9097,7 @@ var VolisSettingTab = class extends import_obsidian18.PluginSettingTab {
       })
     );
     this.divider(containerEl);
-    containerEl.createEl("h3", { text: "\u767D\u677F" });
+    new import_obsidian18.Setting(containerEl).setName("\u767D\u677F").setHeading();
     new import_obsidian18.Setting(containerEl).setName("\u767D\u677F\u4FDD\u5B58\u4F4D\u7F6E").setDesc("\u65B0\u5EFA\u767D\u677F\u65F6\u628A\u6587\u4EF6\u5B58\u5230\u8FD9\u4E2A\u6587\u4EF6\u5939\uFF1B\u7559\u7A7A\u8868\u793A\u5E93\u6839\u76EE\u5F55\u3002\u6BCF\u6B21\u65B0\u5EFA\u90FD\u4F1A\u751F\u6210\u4E00\u4E2A\u72EC\u7ACB\u6587\u4EF6\u3002").addText(
       (text) => text.setPlaceholder("\u7559\u7A7A = \u5E93\u6839\u76EE\u5F55").setValue(this.plugin.settings.boardFolder).onChange(async (value) => {
         this.plugin.settings.boardFolder = value.trim();
@@ -9118,7 +9120,7 @@ var VolisSettingTab = class extends import_obsidian18.PluginSettingTab {
     host.createDiv({ cls: "volis-settings-divider" });
   }
   renderAI(containerEl) {
-    containerEl.createEl("h3", { text: "AI" });
+    new import_obsidian18.Setting(containerEl).setName("AI").setHeading();
     const ai = this.plugin.settings.ai;
     const save = () => this.plugin.saveSettings();
     new import_obsidian18.Setting(containerEl).setName("\u542F\u7528 AI").setDesc("\u5F00\u542F\u540E\u53EF\u5728\u767D\u677F\u4E2D\u9009\u4E2D\u8282\u70B9\u63D0\u95EE\uFF0C\u5185\u5BB9\u53D1\u9001\u81F3\u5F53\u524D\u542F\u7528\u7684\u6A21\u578B\u3002").addToggle(
@@ -9235,12 +9237,12 @@ var VolisSettingTab = class extends import_obsidian18.PluginSettingTab {
         const actions = card.createDiv({ cls: "volis-ai-card-actions" });
         if (!active) {
           const useBtn = actions.createEl("button", { cls: "volis-ai-use", text: "\u542F\u7528" });
-          useBtn.addEventListener("click", async () => {
+          useBtn.addEventListener("click", voidAsync(async () => {
             ai.activeId = profile.id;
             ai.enabled = true;
             await save();
             renderCards();
-          });
+          }));
         }
         const editBtn = actions.createEl("button", {
           cls: "volis-ai-icon",
@@ -9248,13 +9250,15 @@ var VolisSettingTab = class extends import_obsidian18.PluginSettingTab {
         });
         (0, import_obsidian18.setIcon)(editBtn, "pencil");
         editBtn.addEventListener("click", () => {
-          new AIProfileModal(this.app, profile, async (next) => {
-            const index = ai.profiles.findIndex((item) => item.id === profile.id);
-            if (index === -1)
-              return;
-            ai.profiles[index] = next;
-            await save();
-            renderCards();
+          new AIProfileModal(this.app, profile, (next) => {
+            void (async () => {
+              const index = ai.profiles.findIndex((item) => item.id === profile.id);
+              if (index === -1)
+                return;
+              ai.profiles[index] = next;
+              await save();
+              renderCards();
+            })();
           }).open();
         });
         const delBtn = actions.createEl("button", {
@@ -9262,7 +9266,7 @@ var VolisSettingTab = class extends import_obsidian18.PluginSettingTab {
           attr: { "aria-label": "\u5220\u9664" }
         });
         (0, import_obsidian18.setIcon)(delBtn, "trash-2");
-        delBtn.addEventListener("click", async () => {
+        delBtn.addEventListener("click", voidAsync(async () => {
           var _a2, _b;
           ai.profiles = ai.profiles.filter((item) => item.id !== profile.id);
           if (ai.activeId === profile.id) {
@@ -9270,25 +9274,27 @@ var VolisSettingTab = class extends import_obsidian18.PluginSettingTab {
           }
           await save();
           renderCards();
-        });
+        }));
       }
     };
     renderCards();
     new import_obsidian18.Setting(containerEl).setName("\u6DFB\u52A0\u914D\u7F6E").setDesc("\u6BCF\u4E2A\u914D\u7F6E\u53EF\u4EE5\u586B\u81EA\u5DF1\u7684\u7A97\u53E3\u548C\u8F93\u51FA\u4E0A\u9650\uFF0C\u4E92\u4E0D\u5F71\u54CD\u3002").addButton(
       (button) => button.setButtonText("\u6DFB\u52A0\u914D\u7F6E").setCta().onClick(() => {
-        new AIProfileModal(this.app, null, async (profile) => {
-          ai.profiles.push(profile);
-          if (!ai.activeId)
-            ai.activeId = profile.id;
-          await save();
-          renderCards();
+        new AIProfileModal(this.app, null, (profile) => {
+          void (async () => {
+            ai.profiles.push(profile);
+            if (!ai.activeId)
+              ai.activeId = profile.id;
+            await save();
+            renderCards();
+          })();
         }).open();
       })
     );
   }
   renderDiagnostics(containerEl) {
     var _a, _b;
-    containerEl.createEl("h3", { text: "\u8BCA\u65AD" });
+    new import_obsidian18.Setting(containerEl).setName("\u8BCA\u65AD").setHeading();
     const stat = containerEl.createEl("p", {
       text: "\u5728\u753B\u5E03\u89C6\u56FE\u4E2D\u6253\u5F00\u672C\u9875\uFF0C\u53EF\u770B\u5230\u5F53\u524D\u8BC6\u522B\u5230\u7684\u5361\u7247\u6570\u91CF\u3002"
     });
@@ -9313,14 +9319,48 @@ var VolisSettingTab = class extends import_obsidian18.PluginSettingTab {
 };
 
 // src/main.ts
-var RIBBON_ICON = `
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18"
-  fill="none" stroke="currentColor" stroke-width="1.8"
-  stroke-linecap="round" stroke-linejoin="round">
-  <rect x="2.5" y="3.5" width="19" height="17" rx="5" stroke-dasharray="3 2.6"/>
-  <path d="M6 15.5C8.2 10.5 11 10.2 11.8 12.4C12.6 14.6 15.4 14.8 17.6 10.2"/>
-  <circle cx="18.6" cy="6.6" r="1.5" fill="currentColor" stroke="none"/>
-</svg>`;
+var SVG_NS = "http://www.w3.org/2000/svg";
+function svgEl(tag, attrs) {
+  const el = document.createElementNS(SVG_NS, tag);
+  for (const [key, value] of Object.entries(attrs))
+    el.setAttribute(key, value);
+  return el;
+}
+function paintRibbonIcon(host) {
+  host.empty();
+  const svg = svgEl("svg", {
+    xmlns: SVG_NS,
+    viewBox: "0 0 24 24",
+    width: "18",
+    height: "18",
+    fill: "none",
+    stroke: "currentColor",
+    "stroke-width": "1.8",
+    "stroke-linecap": "round",
+    "stroke-linejoin": "round"
+  });
+  svg.append(
+    svgEl("rect", {
+      x: "2.5",
+      y: "3.5",
+      width: "19",
+      height: "17",
+      rx: "5",
+      "stroke-dasharray": "3 2.6"
+    }),
+    svgEl("path", {
+      d: "M6 15.5C8.2 10.5 11 10.2 11.8 12.4C12.6 14.6 15.4 14.8 17.6 10.2"
+    }),
+    svgEl("circle", {
+      cx: "18.6",
+      cy: "6.6",
+      r: "1.5",
+      fill: "currentColor",
+      stroke: "none"
+    })
+  );
+  host.appendChild(svg);
+}
 var VolisPlugin = class extends import_obsidian19.Plugin {
   constructor() {
     super(...arguments);
@@ -9356,8 +9396,7 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
     const ribbon = this.addRibbonIcon("dot", "Volis", () => {
       void this.createBoard();
     });
-    ribbon.empty();
-    ribbon.innerHTML = RIBBON_ICON;
+    paintRibbonIcon(ribbon);
     this.app.workspace.onLayoutReady(() => {
       this.scheduleRefresh(300);
     });
@@ -9389,14 +9428,14 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
       return;
     for (const leaf2 of this.app.workspace.getLeavesOfType(VIEW_TYPE_VOLIS_BOARD)) {
       const view = leaf2.view;
-      if (((_a = view == null ? void 0 : view.file) == null ? void 0 : _a.path) === file.path) {
-        this.app.workspace.revealLeaf(leaf2);
+      if (((_a = view.file) == null ? void 0 : _a.path) === file.path) {
+        void this.app.workspace.revealLeaf(leaf2);
         return;
       }
     }
     const leaf = this.app.workspace.getLeaf("tab");
     await leaf.openFile(file);
-    this.app.workspace.revealLeaf(leaf);
+    void this.app.workspace.revealLeaf(leaf);
   }
   onunload() {
     if (this.observer) {
@@ -9412,13 +9451,12 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
       clearBadges(view);
   }
   async loadSettings() {
-    var _a;
-    const data = (_a = await this.loadData()) != null ? _a : {};
+    const loaded = await this.loadData();
     this.settings = {
       ...DEFAULT_SETTINGS,
-      ...data,
-      ai: normalizeAISettings(data.ai),
-      conversations: Array.isArray(data.conversations) ? data.conversations : []
+      ...loaded != null ? loaded : {},
+      ai: normalizeAISettings(loaded == null ? void 0 : loaded.ai),
+      conversations: Array.isArray(loaded == null ? void 0 : loaded.conversations) ? loaded.conversations : []
     };
   }
   async saveSettings() {
@@ -9459,7 +9497,7 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
     }
   }
   ensureObserver(view) {
-    const container = view == null ? void 0 : view.containerEl;
+    const container = view.containerEl;
     if (!container)
       return;
     if (this.observer && this.observedContainer === container)
@@ -9481,12 +9519,12 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
     });
   }
   getCanvasView() {
-    var _a, _b;
+    var _a;
+    const workspace = this.app.workspace;
     const candidates = [];
-    const active = this.app.workspace.activeLeaf;
-    if (active)
-      candidates.push(active);
-    const recent = (_b = (_a = this.app.workspace).getMostRecentLeaf) == null ? void 0 : _b.call(_a);
+    if (workspace.activeLeaf)
+      candidates.push(workspace.activeLeaf);
+    const recent = (_a = workspace.getMostRecentLeaf) == null ? void 0 : _a.call(workspace);
     if (recent)
       candidates.push(recent);
     for (const leaf of this.app.workspace.getLeavesOfType("canvas")) {
@@ -9504,29 +9542,28 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
     var _a, _b, _c;
     const view = this.getCanvasView();
     const canvas = view == null ? void 0 : view.canvas;
-    const nodes = canvas == null ? void 0 : canvas.nodes;
-    const info = {
+    const nodes = (canvas == null ? void 0 : canvas.nodes) ? collectNodes(canvas.nodes) : [];
+    console.warn("[Volis] self-check", {
       version: this.manifest.version,
       hasCanvasView: !!view,
       hasCanvas: !!canvas,
-      hasNodesMap: !!nodes,
-      nodeCount: (_a = nodes == null ? void 0 : nodes.size) != null ? _a : 0,
+      hasNodesMap: !!(canvas == null ? void 0 : canvas.nodes),
+      nodeCount: nodes.length,
       recognized: this.index.size
-    };
-    if (nodes && nodes.size > 0) {
-      const first = Array.from(nodes.values())[0];
-      const data = typeof (first == null ? void 0 : first.getData) === "function" ? first.getData() : null;
-      info.firstNode = {
-        keys: data ? Object.keys(data) : [],
-        type: data == null ? void 0 : data.type,
-        text: data == null ? void 0 : data.text,
-        hasNodeEl: !!(first == null ? void 0 : first.nodeEl),
-        nodeElClass: (_c = (_b = first == null ? void 0 : first.nodeEl) == null ? void 0 : _b.className) != null ? _c : null
-      };
+    });
+    const first = nodes[0];
+    if (first) {
+      const data = typeof first.getData === "function" ? (_a = first.getData()) != null ? _a : {} : first;
+      console.warn("[Volis] first node", {
+        keys: Object.keys(data),
+        type: data.type,
+        text: data.text,
+        hasNodeEl: !!first.nodeEl,
+        nodeElClass: (_c = (_b = first.nodeEl) == null ? void 0 : _b.className) != null ? _c : null
+      });
     }
-    console.log("[Volis] self-check", info);
     new import_obsidian19.Notice(
-      `Volis \u81EA\u68C0 \xB7 \u753B\u5E03:${info.hasCanvasView ? "\u6709" : "\u65E0"} \xB7 \u8282\u70B9:${info.nodeCount} \xB7 \u8BC6\u522B:${info.recognized}`,
+      `Volis \u81EA\u68C0 \xB7 \u753B\u5E03:${view ? "\u6709" : "\u65E0"} \xB7 \u8282\u70B9:${nodes.length} \xB7 \u8BC6\u522B:${this.index.size}`,
       1e4
     );
   }
@@ -9542,14 +9579,14 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
   getSelectedContext() {
     var _a, _b, _c, _d;
     const view = this.getCanvasView();
-    const canvas = view == null ? void 0 : view.canvas;
-    if (!canvas)
+    const selection = (_a = view == null ? void 0 : view.canvas) == null ? void 0 : _a.selection;
+    if (!selection)
       return null;
-    const selection = Array.from((_a = canvas.selection) != null ? _a : []);
-    if (selection.length === 0)
+    const items = Array.from(selection);
+    if (items.length === 0)
       return null;
-    const first = selection[0];
-    const id = (_d = first == null ? void 0 : first.id) != null ? _d : typeof (first == null ? void 0 : first.getData) === "function" ? (_c = (_b = first.getData) == null ? void 0 : _b.call(first)) == null ? void 0 : _c.id : void 0;
+    const first = items[0];
+    const id = (_d = first.id) != null ? _d : (_c = (_b = first.getData) == null ? void 0 : _b.call(first)) == null ? void 0 : _c.id;
     if (!id)
       return null;
     return this.buildContext(id);
@@ -9559,7 +9596,7 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
       document,
       "mousedown",
       (evt) => {
-        var _a, _b, _c;
+        var _a, _b, _c, _d;
         if (evt.button !== 0)
           return;
         const target = evt.target;
@@ -9576,10 +9613,10 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
         if (!view)
           return;
         const node = this.findNodeByElement(view, nodeEl);
-        const nodeId = (_b = (_a = node == null ? void 0 : node.getData) == null ? void 0 : _a.call(node)) == null ? void 0 : _b.id;
-        if (!nodeId)
+        const nodeId = (_c = (_b = (_a = node == null ? void 0 : node.getData) == null ? void 0 : _a.call(node)) == null ? void 0 : _b.id) != null ? _c : node == null ? void 0 : node.id;
+        if (!node || !nodeId)
           return;
-        const meta = (_c = this.index.get(nodeId)) == null ? void 0 : _c.meta;
+        const meta = (_d = this.index.get(nodeId)) == null ? void 0 : _d.meta;
         if (!meta || meta.stale)
           return;
         this.pendingClick = {
@@ -9641,8 +9678,8 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
   }
   findNodeByElement(view, el) {
     var _a;
-    for (const node of collectNodes((_a = view == null ? void 0 : view.canvas) == null ? void 0 : _a.nodes)) {
-      const nodeEl = node == null ? void 0 : node.nodeEl;
+    for (const node of collectNodes((_a = view.canvas) == null ? void 0 : _a.nodes)) {
+      const nodeEl = node.nodeEl;
       if (!nodeEl)
         continue;
       if (nodeEl === el || nodeEl.contains(el))
@@ -9700,29 +9737,32 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
       id: "ai-analyze",
       name: "\u7528 AI \u5206\u6790\u767D\u677F",
       callback: () => {
+        var _a;
         const view = this.getCanvasView();
         if (view)
-          view.openAIPanel();
+          (_a = view.openAIPanel) == null ? void 0 : _a.call(view);
       }
     });
     this.addCommand({
       id: "board-doctor",
       name: "\u767D\u677F\u4F53\u68C0",
       callback: () => {
+        var _a;
         const view = this.getCanvasView();
         if (view)
-          view.openBoardDoctor();
+          (_a = view.openBoardDoctor) == null ? void 0 : _a.call(view);
       }
     });
     this.addCommand({
       id: "board-outline",
       name: "\u6253\u5F00\u767D\u677F\u5927\u7EB2",
       checkCallback: (checking) => {
+        var _a;
         const view = this.app.workspace.getActiveViewOfType(BoardView);
         if (!view)
           return false;
         if (!checking)
-          view.openOutlinePanel();
+          (_a = view.openOutlinePanel) == null ? void 0 : _a.call(view);
         return true;
       }
     });
@@ -9730,11 +9770,12 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
       id: "board-export-markdown",
       name: "\u5BFC\u51FA\u767D\u677F\u4E3A Markdown",
       checkCallback: (checking) => {
+        var _a;
         const view = this.app.workspace.getActiveViewOfType(BoardView);
         if (!view)
           return false;
         if (!checking)
-          view.openExportModal();
+          (_a = view.openExportModal) == null ? void 0 : _a.call(view);
         return true;
       }
     });
@@ -9742,18 +9783,20 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
       id: "find-node",
       name: "\u5728\u767D\u677F\u4E2D\u67E5\u627E\u8282\u70B9",
       callback: () => {
+        var _a;
         const view = this.getCanvasView();
         if (view)
-          view.openNodeSearch();
+          (_a = view.openNodeSearch) == null ? void 0 : _a.call(view);
       }
     });
     this.addCommand({
       id: "insert-node",
       name: "\u641C\u7D22\u6216\u65B0\u5EFA\u8282\u70B9",
       callback: () => {
+        var _a;
         const view = this.getCanvasView();
         if (view)
-          view.openInsertPanelAtCenter();
+          (_a = view.openInsertPanelAtCenter) == null ? void 0 : _a.call(view);
       }
     });
     this.addCommand({
@@ -9892,14 +9935,14 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
     });
   }
   editCard(meta, nodeId) {
-    var _a, _b, _c, _d, _e;
+    var _a, _b, _c, _d, _e, _f, _g;
     const view = this.getCanvasView();
     const canvas = view == null ? void 0 : view.canvas;
-    let node = nodeId ? (_b = (_a = canvas == null ? void 0 : canvas.nodes) == null ? void 0 : _a.get) == null ? void 0 : _b.call(_a, nodeId) : null;
+    let node = nodeId ? (_b = (_a = canvas == null ? void 0 : canvas.get) == null ? void 0 : _a.call(canvas, nodeId)) != null ? _b : null : null;
     if (!node) {
       for (const candidate of collectNodes(canvas == null ? void 0 : canvas.nodes)) {
-        const entry = this.index.get((_d = (_c = candidate == null ? void 0 : candidate.getData) == null ? void 0 : _c.call(candidate)) == null ? void 0 : _d.id);
-        const ref = (_e = entry == null ? void 0 : entry.meta) == null ? void 0 : _e.ref;
+        const entry = this.index.get((_f = (_e = (_d = (_c = candidate.getData) == null ? void 0 : _c.call(candidate)) == null ? void 0 : _d.id) != null ? _e : candidate.id) != null ? _f : "");
+        const ref = (_g = entry == null ? void 0 : entry.meta) == null ? void 0 : _g.ref;
         if (ref && ref.file === meta.ref.file && ref.blockId === meta.ref.blockId) {
           node = candidate;
           break;
@@ -9931,13 +9974,13 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
     await leaf.openFile(file, { eState: { line } });
   }
   removeNode(ctx) {
-    var _a, _b, _c;
-    const canvas = (_a = ctx.canvasView) == null ? void 0 : _a.canvas;
-    const node = (_c = (_b = canvas == null ? void 0 : canvas.nodes) == null ? void 0 : _b.get) == null ? void 0 : _c.call(_b, ctx.nodeId);
+    var _a, _b;
+    const canvas = ctx.canvasView.canvas;
+    const node = (_b = (_a = canvas == null ? void 0 : canvas.get) == null ? void 0 : _a.call(canvas, ctx.nodeId)) != null ? _b : null;
     try {
-      if (node && typeof canvas.removeNode === "function") {
+      if (node && (canvas == null ? void 0 : canvas.removeNode)) {
         canvas.removeNode(node);
-      } else if (node && typeof node.remove === "function") {
+      } else if (node == null ? void 0 : node.remove) {
         node.remove();
       } else {
         return;
@@ -9949,25 +9992,16 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
   }
 };
 function isNodeSelected(view, node, nodeId) {
-  var _a;
-  const selection = (_a = view == null ? void 0 : view.canvas) == null ? void 0 : _a.selection;
+  var _a, _b, _c, _d;
+  const selection = (_a = view.canvas) == null ? void 0 : _a.selection;
   if (!selection)
     return false;
-  if (typeof selection.has === "function") {
-    try {
-      if (selection.has(node))
-        return true;
-    } catch (error) {
-    }
+  if (selection instanceof Set && selection.has(node))
+    return true;
+  for (const item of Array.from(selection)) {
+    const id = (_d = item.id) != null ? _d : (_c = (_b = item.getData) == null ? void 0 : _b.call(item)) == null ? void 0 : _c.id;
+    if (id === nodeId)
+      return true;
   }
-  let found = false;
-  if (typeof selection.forEach === "function") {
-    selection.forEach((item) => {
-      var _a2, _b, _c;
-      const id = (_c = item == null ? void 0 : item.id) != null ? _c : typeof (item == null ? void 0 : item.getData) === "function" ? (_b = (_a2 = item.getData) == null ? void 0 : _a2.call(item)) == null ? void 0 : _b.id : void 0;
-      if (id === nodeId)
-        found = true;
-    });
-  }
-  return found;
+  return false;
 }

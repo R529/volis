@@ -1,30 +1,30 @@
 import { CardMeta } from "../types";
 import { VolisSettings } from "../settings";
-import { NodeIndex, collectNodes } from "./nodeIndex";
+import { NodeIndex } from "./nodeIndex";
+import { CanvasViewLike, collectNodes } from "./canvasTypes";
 
 const BADGE_CLASS = "volis-badge";
 
 export function applyBadges(
-  canvasView: any,
+  canvasView: CanvasViewLike,
   index: NodeIndex,
   settings: VolisSettings
 ): void {
-  const canvas = canvasView?.canvas;
+  const canvas = canvasView.canvas;
   if (!canvas?.nodes) return;
 
-  const container: HTMLElement | undefined = canvasView?.containerEl;
+  const container = canvasView.containerEl;
 
   for (const node of collectNodes(canvas.nodes)) {
-    const nodeId: string | undefined =
-      node?.id ?? (typeof node?.getData === "function" ? node.getData?.()?.id : undefined);
+    const nodeId = node.id ?? node.getData?.()?.id;
     if (!nodeId) continue;
 
-    const el: HTMLElement | null =
-      node?.nodeEl ??
-      (container?.querySelector(`.canvas-node[data-id="${nodeId}"]`) as HTMLElement | null);
+    const el =
+      node.nodeEl ??
+      container.querySelector<HTMLElement>(`.canvas-node[data-id="${nodeId}"]`);
     if (!el) continue;
 
-    let badge = el.querySelector(`.${BADGE_CLASS}`) as HTMLElement | null;
+    let badge = el.querySelector<HTMLElement>(`.${BADGE_CLASS}`);
     const entry = index.get(nodeId);
 
     if (!settings.showBadge || !entry) {
@@ -54,13 +54,12 @@ export function applyBadges(
   }
 }
 
-export function clearBadges(canvasView: any): void {
-  const canvas = canvasView?.canvas;
+export function clearBadges(canvasView: CanvasViewLike): void {
+  const canvas = canvasView.canvas;
   if (!canvas?.nodes) return;
 
   for (const node of collectNodes(canvas.nodes)) {
-    const el: HTMLElement | undefined = node?.nodeEl;
-    const badge = el?.querySelector(`.${BADGE_CLASS}`);
+    const badge = node.nodeEl?.querySelector(`.${BADGE_CLASS}`);
     if (badge) badge.remove();
   }
 }

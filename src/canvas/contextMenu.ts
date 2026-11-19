@@ -1,5 +1,6 @@
-import { App, Menu, Plugin } from "obsidian";
+import { App, EventRef, Menu, Plugin } from "obsidian";
 import { ActionContext, ActionRegistry } from "./actions";
+import { CanvasNodeData, CanvasNodeLike } from "./canvasTypes";
 
 export class ContextMenuInjector {
   constructor(
@@ -9,9 +10,12 @@ export class ContextMenuInjector {
   ) {}
 
   install(plugin: Plugin): void {
-    const workspace: any = this.app.workspace;
+    // `canvas:node-menu` is a Canvas-internal event, not in the typed API.
+    const workspace = this.app.workspace as unknown as {
+      on(name: "canvas:node-menu", cb: (menu: Menu, node: CanvasNodeLike) => void): EventRef;
+    };
     plugin.registerEvent(
-      workspace.on("canvas:node-menu", (menu: Menu, node: any) => {
+      workspace.on("canvas:node-menu", (menu: Menu, node: CanvasNodeLike) => {
         try {
           this.inject(menu, node);
         } catch (error) {
@@ -21,9 +25,12 @@ export class ContextMenuInjector {
     );
   }
 
-  private inject(menu: Menu, node: any): void {
-    const data = typeof node?.getData === "function" ? node.getData() : node;
-    const nodeId: string | undefined = data?.id;
+  private inject(menu: Menu, node: CanvasNodeLike): void {
+    const data: CanvasNodeData =
+      typeof node.getData === "function"
+        ? (node.getData() ?? {})
+        : (node as unknown as CanvasNodeData);
+    const nodeId = data.id;
     if (!nodeId) return;
 
     const ctx = this.resolveContext(nodeId);
