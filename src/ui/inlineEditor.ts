@@ -32,6 +32,10 @@ export class InlineEditor {
     nodeEl.classList.add("volis-editing");
     nodeEl.classList.add("is-selected");
 
+    // The canvas starts a node drag on pointerdown, before mousedown reaches
+    // this input. Capturing the pointer there would make text selection
+    // impossible, so stop this event exactly like MarkdownNodeEditor does.
+    this.root.addEventListener("pointerdown", (evt) => evt.stopPropagation());
     this.input.addEventListener("mousedown", (evt) => evt.stopPropagation());
     this.input.addEventListener("dblclick", (evt) => evt.stopPropagation());
     this.input.addEventListener("keydown", (evt: KeyboardEvent) => {

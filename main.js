@@ -945,6 +945,7 @@ var InlineEditor = class {
     nodeEl.appendChild(this.root);
     nodeEl.classList.add("volis-editing");
     nodeEl.classList.add("is-selected");
+    this.root.addEventListener("pointerdown", (evt) => evt.stopPropagation());
     this.input.addEventListener("mousedown", (evt) => evt.stopPropagation());
     this.input.addEventListener("dblclick", (evt) => evt.stopPropagation());
     this.input.addEventListener("keydown", (evt) => {
