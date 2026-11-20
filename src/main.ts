@@ -2,7 +2,6 @@ import { Modal, Notice, Plugin, TFile, TFolder, WorkspaceLeaf } from "obsidian";
 import type { App } from "obsidian";
 import { DEFAULT_SETTINGS, StoredConversation, VolisSettings, normalizeAISettings, normalizeWorkbenchSettings } from "./settings";
 import { VIEW_TYPE_WORKBENCH, BoardGalleryView } from "./workbench/BoardGalleryView";
-import { WORKBENCH_CSS } from "./workbench/styles";
 import { createBoardItem } from "./workbench/boardGalleryData";
 import { NodeIndex } from "./canvas/nodeIndex";
 import { ActionContext, ActionRegistry } from "./canvas/actions";
@@ -113,7 +112,6 @@ export default class VolisPlugin extends Plugin {
   private registry!: ActionRegistry;
   private sync!: SyncEngine;
 
-  private workbenchStyleEl: HTMLStyleElement | null = null;
   private workbenchViewRef: BoardGalleryView | null = null;
 
   private observer: MutationObserver | null = null;
@@ -172,16 +170,6 @@ export default class VolisPlugin extends Plugin {
   /** Installs the board wall. volis's own board view, paths and commands stay
    *  exactly as they were; this only adds one view and one folder entry point. */
   private installWorkbench(): void {
-    const style = document.createElement("style");
-    style.id = "volis-workbench-styles";
-    style.textContent = WORKBENCH_CSS;
-    document.head.appendChild(style);
-    this.workbenchStyleEl = style;
-    this.register(() => {
-      style.remove();
-      this.workbenchStyleEl = null;
-    });
-
     this.registerView(VIEW_TYPE_WORKBENCH, (leaf) => {
       const view = new BoardGalleryView(leaf, this);
       this.workbenchViewRef = view;

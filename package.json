@@ -1,6 +1,6 @@
 {
   "name": "volis",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "A thinking workspace for Canvas: board gallery, semantic connections, outline, Markdown export and AI.",
   "main": "main.js",
   "scripts": {

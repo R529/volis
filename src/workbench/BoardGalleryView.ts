@@ -7,7 +7,7 @@
  *  runtime paths and left the tab blank; this version cannot fail that way and
  *  surfaces any real error on screen instead of swallowing it. */
 
-import { ItemView, Menu, Modal, Notice, WorkspaceLeaf } from "obsidian";
+import { ItemView, Menu, Modal, Notice, WorkspaceLeaf, setIcon } from "obsidian";
 import type { App, TFile } from "obsidian";
 import type VolisPlugin from "../main";
 import { isBoardPath, listBoardItems, listSignature } from "./boardGalleryData";
@@ -16,21 +16,6 @@ import type { BoardItem, MiniEdge, MiniNode } from "./types";
 export const VIEW_TYPE_WORKBENCH = "volis-workbench";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
-
-const ICON = {
-  search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="10.5" cy="10.5" r="6.2"/><path d="m15.2 15.2 4.3 4.3"/></svg>',
-  sort: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 6h9M4 12h6M4 18h4M17 5v13m0 0-3-3m3 3 3-3"/></svg>',
-  chevron: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m7 10 5 5 5-5"/></svg>',
-  plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>',
-  /* Same geometry as the ribbon icon painted in main.ts. */
-  volis: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3.5" width="19" height="17" rx="5" stroke-dasharray="3 2.6"/><path d="M6 15.5C8.2 10.5 11 10.2 11.8 12.4C12.6 14.6 15.4 14.8 17.6 10.2"/><circle cx="18.6" cy="6.6" r="1.5" fill="currentColor" stroke="none"/></svg>',
-  board: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="4" width="8" height="7" rx="1.6"/><rect x="13" y="4" width="8" height="4" rx="1.6"/><rect x="13" y="10" width="8" height="10" rx="1.6"/><rect x="3" y="13" width="8" height="7" rx="1.6"/></svg>',
-  node: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="12" rx="2.4"/></svg>',
-  trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M4 7h16M9 7V4.8h6V7M6.5 7l.8 12.2h9.4L17.5 7"/><path d="M10 10.5v5.5M14 10.5v5.5"/></svg>',
-  more: '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg>',
-  check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 4.5 4.5L19 7"/></svg>',
-  link: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M9.5 14.5 14.5 9.5"/><path d="M8 12 6.6 13.4a3.4 3.4 0 0 0 4.8 4.8L13 16.6"/><path d="M16 12l1.4-1.4a3.4 3.4 0 0 0-4.8-4.8L11 7.4"/></svg>',
-};
 
 export class BoardGalleryView extends ItemView {
   private readonly plugin: VolisPlugin;
@@ -245,7 +230,7 @@ export class BoardGalleryView extends ItemView {
     const art = node("div", "vw-empty-art");
     // Same mark as the ribbon icon and the blank cover, so the empty wall
     // reads as part of this plugin rather than a generic board glyph.
-    art.innerHTML = ICON.volis;
+    art.appendChild(volisMark());
     const title = node("div", "vw-empty-title");
     title.textContent = searching ? "没有匹配的画布" : "还没有画布";
     const hint = document.createElement("p");
@@ -268,7 +253,7 @@ export class BoardGalleryView extends ItemView {
       });
     } else {
       const plus = node("span", "vw-ico");
-      plus.innerHTML = ICON.plus;
+      setIcon(plus, "plus");
       const label = document.createElement("span");
       label.textContent = "新建第一块画布";
       button.appendChild(plus);
@@ -325,7 +310,7 @@ export class BoardGalleryView extends ItemView {
 
     const search = node("div", "vw-search");
     const glass = node("span", "vw-ico");
-    glass.innerHTML = ICON.search;
+    setIcon(glass, "search");
     const input = document.createElement("input");
     input.type = "search";
     input.className = "vw-search-input";
@@ -351,7 +336,7 @@ export class BoardGalleryView extends ItemView {
     const create = document.createElement("button");
     create.className = "vw-primary";
     const plus = node("span", "vw-ico");
-    plus.innerHTML = ICON.plus;
+    setIcon(plus, "plus");
     const createLabel = document.createElement("span");
     createLabel.textContent = "新建画布";
     create.appendChild(plus);
@@ -362,7 +347,7 @@ export class BoardGalleryView extends ItemView {
     const more = node("button", "vw-sort vw-more");
     more.setAttribute("title", "更多操作");
     const moreIcon = node("span", "vw-ico");
-    moreIcon.innerHTML = ICON.more;
+    setIcon(moreIcon, "more-horizontal");
     more.appendChild(moreIcon);
     more.addEventListener("click", (event) => this.showMoreMenu(event));
     actions.appendChild(more);
@@ -417,14 +402,14 @@ export class BoardGalleryView extends ItemView {
 
     if (this.multi) {
       const check = node("span", "vw-check");
-      check.innerHTML = ICON.check;
+      setIcon(check, "check");
       card.appendChild(check);
     }
 
     const del = document.createElement("button");
     del.className = "vw-card-del";
     del.setAttribute("title", "删除画布");
-    del.innerHTML = ICON.trash;
+    setIcon(del, "trash-2");
     del.addEventListener("click", (event) => {
       event.stopPropagation();
       this.confirmDelete([item]);
@@ -434,7 +419,7 @@ export class BoardGalleryView extends ItemView {
     const body = node("div", "vw-card-body");
     const head = node("div", "vw-card-head");
     const icon = node("span", "vw-card-icon");
-    icon.innerHTML = ICON.board;
+    setIcon(icon, "layout-dashboard");
     const title = node("div", "vw-card-title");
     title.textContent = item.title;
     head.appendChild(icon);
@@ -446,8 +431,8 @@ export class BoardGalleryView extends ItemView {
     body.appendChild(date);
 
     const props = node("div", "vw-card-props");
-    props.appendChild(prop(ICON.node, item.nodes ? `${item.nodes} 个节点` : "空白画布"));
-    if (item.edges) props.appendChild(prop(ICON.link, `${item.edges} 条连线`));
+    props.appendChild(prop("square", item.nodes ? `${item.nodes} 个节点` : "空白画布"));
+    if (item.edges) props.appendChild(prop("link", `${item.edges} 条连线`));
     body.appendChild(props);
 
     card.appendChild(body);
@@ -468,7 +453,7 @@ export class BoardGalleryView extends ItemView {
     if (!nodes.length) {
       cover.classList.add("is-blank");
       const ghost = node("span", "vw-cover-ghost");
-      ghost.innerHTML = ICON.volis;
+      ghost.appendChild(volisMark());
       cover.appendChild(ghost);
       return cover;
     }
@@ -564,10 +549,45 @@ export class BoardGalleryView extends ItemView {
   }
 }
 
+/** The Volis mark, built as real SVG nodes. It is the same geometry as the
+ *  ribbon icon, so the gallery reads as part of this plugin. */
+function volisMark(): SVGSVGElement {
+  const svg = document.createElementNS(SVG_NS, "svg") as SVGSVGElement;
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "1.8");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+
+  const frame = document.createElementNS(SVG_NS, "rect");
+  frame.setAttribute("x", "2.5");
+  frame.setAttribute("y", "3.5");
+  frame.setAttribute("width", "19");
+  frame.setAttribute("height", "17");
+  frame.setAttribute("rx", "5");
+  frame.setAttribute("stroke-dasharray", "3 2.6");
+
+  const stroke = document.createElementNS(SVG_NS, "path");
+  stroke.setAttribute("d", "M6 15.5C8.2 10.5 11 10.2 11.8 12.4C12.6 14.6 15.4 14.8 17.6 10.2");
+
+  const dot = document.createElementNS(SVG_NS, "circle");
+  dot.setAttribute("cx", "18.6");
+  dot.setAttribute("cy", "6.6");
+  dot.setAttribute("r", "1.5");
+  dot.setAttribute("fill", "currentColor");
+  dot.setAttribute("stroke", "none");
+
+  svg.appendChild(frame);
+  svg.appendChild(stroke);
+  svg.appendChild(dot);
+  return svg;
+}
+
 function prop(icon: string, label: string): HTMLElement {
   const row = node("span", "vw-prop");
   const glyph = node("span", "vw-ico");
-  glyph.innerHTML = icon;
+  setIcon(glyph, icon);
   const text = document.createElement("span");
   text.textContent = label;
   row.appendChild(glyph);
