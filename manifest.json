@@ -1,9 +1,9 @@
 {
   "id": "volis",
   "name": "Volis",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "minAppVersion": "1.13.0",
-  "description": "Turns canvas cards into first-class objects with inline editing, groups, connections and AI analysis.",
+  "description": "A thinking workspace for Obsidian Canvas: board gallery, semantic connections, outline, Markdown export and AI.",
   "author": "Lak",
   "isDesktopOnly": true
 }

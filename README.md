@@ -1,12 +1,17 @@
 # Volis
 
-An Obsidian plugin that turns a canvas into a working surface for cards, notes and ideas — with AI built in.
+Volis turns Obsidian Canvas into a thinking workspace: collect material from your notes, mark how the ideas relate, read the result back as an outline, and carry it into writing — with an AI that can see the same structure you do.
 
-Volis starts where Obsidian Canvas stops. Canvas nodes hold a link, but they do not know what they point to. Volis identifies block-reference cards, gives every node a type and colour, connects them with labelled edges, and lets an AI read the whole board and write its answer back into it.
+Volis starts where Obsidian Canvas stops. Canvas nodes hold a link, but they do not know what they point to. Volis identifies block-reference cards, gives every node a type and colour, and connects them with edges that carry a meaning. A board gallery keeps every canvas in one place, so the thinking is easy to find again.
 
 Everything stays local except the requests you explicitly send to your own AI provider.
 
 ## Features
+
+**Board gallery**
+- One wall for every board in your folder, with live miniature covers drawn from the real nodes and lines.
+- Search across board titles and text on the board, sort by created / modified / name, multi-select and batch delete.
+- New boards are created inside the folder, so the gallery and the file tree never disagree; opening a board reuses its existing tab.
 
 **Cards that stay cards**
 - Recognise `![[file#^block-id]]` nodes, show their date badge, and edit them in place without leaving the board.
@@ -57,7 +62,7 @@ Requires Obsidian 1.13.0 or newer. Desktop only.
 1. Settings → Volis → AI → **Add profile**.
 2. Pick a service preset or enter an OpenAI-compatible / Anthropic Messages endpoint, model name and API key.
 3. The context window and output cap are inferred from the model name. Use **Probe** to read the real values where the provider allows it, or set them manually.
-4. Select nodes on the board and press the Volis ribbon icon (or run **Volis: Open AI panel**).
+4. Select nodes on the board and run **Volis: Open AI panel**.
 
 For large boards, a model with a 200K+ context window is recommended. The AI panel shows the exact token accounting for every turn.
 
@@ -81,6 +86,7 @@ src/
   store/               card reads and writes
   canvas/              node index, badges, sync, actions, context menu
   board/               board view, storage, insert search, card writer
+  workbench/           board gallery: view, data, config, styles
   ai/                  provider protocols, capability presets, token budgeting
   ui/                  modals and inline editors
 ```

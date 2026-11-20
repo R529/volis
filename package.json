@@ -1,7 +1,7 @@
 {
   "name": "volis",
-  "version": "0.5.2",
-  "description": "Canvas card enhancement for block-reference cards",
+  "version": "0.6.0",
+  "description": "A thinking workspace for Obsidian Canvas: board gallery, semantic connections, outline, Markdown export and AI.",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",

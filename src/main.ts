@@ -1,5 +1,9 @@
-import { Notice, Plugin, TFile, WorkspaceLeaf } from "obsidian";
-import { DEFAULT_SETTINGS, StoredConversation, VolisSettings, normalizeAISettings } from "./settings";
+import { Modal, Notice, Plugin, TFile, TFolder, WorkspaceLeaf } from "obsidian";
+import type { App } from "obsidian";
+import { DEFAULT_SETTINGS, StoredConversation, VolisSettings, normalizeAISettings, normalizeWorkbenchSettings } from "./settings";
+import { VIEW_TYPE_WORKBENCH, BoardGalleryView } from "./workbench/BoardGalleryView";
+import { WORKBENCH_CSS } from "./workbench/styles";
+import { createBoardItem } from "./workbench/boardGalleryData";
 import { NodeIndex } from "./canvas/nodeIndex";
 import { ActionContext, ActionRegistry } from "./canvas/actions";
 import { SyncEngine } from "./canvas/syncEngine";
@@ -17,6 +21,51 @@ import { VolisSettingTab } from "./settingsTab";
 import { CanvasNodeData, CanvasNodeLike, CanvasViewLike, collectNodes } from "./canvas/canvasTypes";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
+
+/** Old name of the gallery folder. Kept only to offer a one-time rename. */
+const LEGACY_WORKBENCH_FOLDER = "白板";
+
+/** Renaming a folder moves every note in it, so the user decides. */
+class RenameBoardFolderModal extends Modal {
+  constructor(
+    app: App,
+    private from: string,
+    private to: string,
+    private count: number,
+    private onResult: (confirmed: boolean) => void,
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    const el = this.contentEl;
+    while (el.firstChild) el.removeChild(el.firstChild);
+    const heading = document.createElement("h2");
+    heading.textContent = `把「${this.from}」改名为「${this.to}」？`;
+    const detail = document.createElement("p");
+    detail.textContent = this.count
+      ? `里面的 ${this.count} 个文件会一起移动，内容不变。也可以保留旧文件夹，稍后自己整理。`
+      : "这个文件夹是空的，改名不会影响任何内容。";
+    const row = document.createElement("div");
+    row.className = "volis-rename-actions";
+    const cancel = document.createElement("button");
+    cancel.textContent = "暂时不改";
+    cancel.addEventListener("click", () => { this.close(); this.onResult(false); });
+    const confirm = document.createElement("button");
+    confirm.className = "mod-cta";
+    confirm.textContent = "改名并继续";
+    confirm.addEventListener("click", () => { this.close(); this.onResult(true); });
+    row.appendChild(cancel);
+    row.appendChild(confirm);
+    el.appendChild(heading);
+    el.appendChild(detail);
+    el.appendChild(row);
+  }
+
+  onClose(): void {
+    while (this.contentEl.firstChild) this.contentEl.removeChild(this.contentEl.firstChild);
+  }
+}
 
 function svgEl<K extends keyof SVGElementTagNameMap>(
   tag: K,
@@ -64,6 +113,9 @@ export default class VolisPlugin extends Plugin {
   private registry!: ActionRegistry;
   private sync!: SyncEngine;
 
+  private workbenchStyleEl: HTMLStyleElement | null = null;
+  private workbenchViewRef: BoardGalleryView | null = null;
+
   private observer: MutationObserver | null = null;
   private observedContainer: HTMLElement | null = null;
   private timer: number | null = null;
@@ -103,16 +155,160 @@ export default class VolisPlugin extends Plugin {
 
     this.registerView(VIEW_TYPE_VOLIS_BOARD, (leaf) => new BoardView(leaf, this));
     this.registerExtensions(["volis"], VIEW_TYPE_VOLIS_BOARD);
+
+    this.installWorkbench();
     // Drawn by hand instead of a library icon, so it cannot collide with the
     // stock shapes every canvas-style plugin reuses.
     const ribbon = this.addRibbonIcon("dot", "Volis", () => {
-      void this.createBoard();
+      void this.openBoardGallery();
     });
     paintRibbonIcon(ribbon);
 
     this.app.workspace.onLayoutReady(() => {
       this.scheduleRefresh(300);
     });
+  }
+
+  /** Installs the board wall. volis's own board view, paths and commands stay
+   *  exactly as they were; this only adds one view and one folder entry point. */
+  private installWorkbench(): void {
+    const style = document.createElement("style");
+    style.id = "volis-workbench-styles";
+    style.textContent = WORKBENCH_CSS;
+    document.head.appendChild(style);
+    this.workbenchStyleEl = style;
+    this.register(() => {
+      style.remove();
+      this.workbenchStyleEl = null;
+    });
+
+    this.registerView(VIEW_TYPE_WORKBENCH, (leaf) => {
+      const view = new BoardGalleryView(leaf, this);
+      this.workbenchViewRef = view;
+      return view;
+    });
+
+    this.addCommand({
+      id: "open-workbench",
+      name: "打开画布集",
+      callback: () => {
+        void this.openBoardGallery();
+      },
+    });
+
+  }
+
+  /** Single folder used by the wall. Users can change it in data.json. */
+  get workbenchFolder(): string {
+    return this.settings.workbench?.boardFolder || "画布";
+  }
+
+  async ensureBoardFolder(): Promise<void> {
+    const path = this.workbenchFolder;
+    const existing = this.app.vault.getAbstractFileByPath(path);
+    if (existing instanceof TFolder) return;
+    if (existing) {
+      new Notice(`「${path}」已是一个文件，不能作为画布文件夹。`);
+      return;
+    }
+
+    // One-time choice: the old folder still holds the boards made before the
+    // rename. Never move notes without asking.
+    const legacy = this.app.vault.getAbstractFileByPath(LEGACY_WORKBENCH_FOLDER);
+    if (legacy instanceof TFolder && path !== LEGACY_WORKBENCH_FOLDER) {
+      const confirmed = await new Promise<boolean>((resolve) => {
+        new RenameBoardFolderModal(
+          this.app,
+          LEGACY_WORKBENCH_FOLDER,
+          path,
+          legacy.children.length,
+          resolve,
+        ).open();
+      });
+      if (confirmed) {
+        try {
+          await this.app.vault.rename(legacy, path);
+          return;
+        } catch (error) {
+          new Notice(error instanceof Error ? error.message : "文件夹改名失败");
+        }
+      }
+    }
+
+    try {
+      await this.app.vault.createFolder(path);
+    } catch (error) {
+      new Notice(error instanceof Error ? error.message : "创建画布文件夹失败");
+    }
+  }
+
+  /** Ribbon / command entry: make the folder exist, then open or focus the
+   *  one board wall on the right. Never creates a second one. */
+  async openBoardGallery(): Promise<void> {
+    this.debugLog("openBoardGallery: start");
+    await this.ensureBoardFolder();
+    this.debugLog(`openBoardGallery: folder="${this.workbenchFolder}"`);
+
+    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_WORKBENCH);
+    this.debugLog(`openBoardGallery: existing leaves=${leaves.length}`);
+    const existing = leaves[0];
+    if (existing) {
+      await this.app.workspace.revealLeaf(existing);
+      this.app.workspace.setActiveLeaf(existing, { focus: true });
+      // A restored tab can hold a placeholder instead of a live view; in that
+      // case reload it, otherwise just repaint.
+      if (existing.view instanceof BoardGalleryView) {
+        existing.view.refreshWall();
+        this.debugLog("openBoardGallery: repainted existing view");
+      } else {
+        this.debugLog(
+          `openBoardGallery: existing view is ${existing.view?.getViewType?.() ?? "unknown"}`,
+        );
+        await existing.setViewState({ type: VIEW_TYPE_WORKBENCH, active: true });
+      }
+      return;
+    }
+
+    const leaf = this.app.workspace.getLeaf("tab");
+    try {
+      await leaf.setViewState({ type: VIEW_TYPE_WORKBENCH, active: true });
+      await this.app.workspace.revealLeaf(leaf);
+      this.app.workspace.setActiveLeaf(leaf, { focus: true });
+      this.debugLog("openBoardGallery: new tab created");
+    } catch (error) {
+      this.debugLog(`openBoardGallery: setViewState failed ${String(error)}`);
+      new Notice(
+        `无法打开画布集：${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  /** Temporary runtime trace for the board wall. Writes inside the plugin
+   *  folder, never into notes, and never throws. */
+  debugLog(message: string): void {
+    const line = `${new Date().toISOString()} ${message}\n`;
+    const path = ".obsidian/plugins/volis/volis-debug.log";
+    const adapter = this.app.vault.adapter;
+    void (async () => {
+      try {
+        if (await adapter.exists(path)) await adapter.append(path, line);
+        else await adapter.write(path, line);
+      } catch {
+        // Diagnostics must never break the plugin.
+      }
+    })();
+  }
+
+  /** Create from inside the wall, so the file always lands in its folder. */
+  async createGalleryBoard(): Promise<void> {
+    await this.ensureBoardFolder();
+    const file = await createBoardItem(this.app, this.workbenchFolder);
+    await this.openBoardFile(file.path);
+    this.refreshWorkbench();
+  }
+
+  refreshWorkbench(): void {
+    this.workbenchViewRef?.refreshWall();
   }
 
   async openBoard(): Promise<void> {
@@ -180,6 +376,7 @@ export default class VolisPlugin extends Plugin {
       conversations: Array.isArray(loaded?.conversations)
         ? loaded.conversations
         : [],
+      workbench: normalizeWorkbenchSettings(loaded?.workbench),
     };
   }
 

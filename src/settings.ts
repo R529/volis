@@ -1,4 +1,5 @@
 import { inferCapability, isCapabilitySane } from "./ai/capability";
+import { DEFAULT_WORKBENCH_SETTINGS, type WorkbenchSettings } from "./workbench/config";
 
 export type AIProtocol = "anthropic" | "openai";
 
@@ -120,6 +121,7 @@ export interface VolisSettings {
   cardFolder: string;
   ai: VolisAISettings;
   conversations: StoredConversation[];
+  workbench: WorkbenchSettings;
 }
 
 export const DEFAULT_SETTINGS: VolisSettings = {
@@ -137,6 +139,7 @@ export const DEFAULT_SETTINGS: VolisSettings = {
     policy: { ...DEFAULT_CONTEXT_POLICY },
   },
   conversations: [],
+  workbench: { ...DEFAULT_WORKBENCH_SETTINGS },
 };
 
 /** Reads the active profile, or null when nothing is configured. */
@@ -148,6 +151,15 @@ export function activeProfile(ai: VolisAISettings): AIProfile | null {
  * Accepts both the old single-configuration shape and the new profile list, so
  * existing installs keep working without manual migration.
  */
+/** Fill in workbench defaults for installs whose data.json predates it. */
+export function normalizeWorkbenchSettings(raw: unknown): WorkbenchSettings {
+  const value = (raw ?? {}) as Partial<WorkbenchSettings>;
+  const folder = typeof value.boardFolder === "string" ? value.boardFolder.trim() : "";
+  return {
+    boardFolder: folder || DEFAULT_WORKBENCH_SETTINGS.boardFolder,
+  };
+}
+
 export function normalizeAISettings(raw: unknown): VolisAISettings {
   const value = (raw ?? {}) as Record<string, unknown>;
 

@@ -27,7 +27,7 @@ __export(main_exports, {
   default: () => VolisPlugin
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian19 = require("obsidian");
+var import_obsidian21 = require("obsidian");
 
 // src/ai/capability.ts
 var import_obsidian = require("obsidian");
@@ -270,6 +270,12 @@ function firstNumber(values) {
   return null;
 }
 
+// src/workbench/config.ts
+var WORKBENCH_FOLDER = "\u753B\u5E03";
+var DEFAULT_WORKBENCH_SETTINGS = {
+  boardFolder: WORKBENCH_FOLDER
+};
+
 // src/settings.ts
 var DEFAULT_CONTEXT_POLICY = {
   safetyTokens: 1024,
@@ -292,11 +298,19 @@ var DEFAULT_SETTINGS = {
     continuations: 3,
     policy: { ...DEFAULT_CONTEXT_POLICY }
   },
-  conversations: []
+  conversations: [],
+  workbench: { ...DEFAULT_WORKBENCH_SETTINGS }
 };
 function activeProfile(ai) {
   var _a, _b;
   return (_b = (_a = ai.profiles.find((profile) => profile.id === ai.activeId)) != null ? _a : ai.profiles[0]) != null ? _b : null;
+}
+function normalizeWorkbenchSettings(raw) {
+  const value = raw != null ? raw : {};
+  const folder = typeof value.boardFolder === "string" ? value.boardFolder.trim() : "";
+  return {
+    boardFolder: folder || DEFAULT_WORKBENCH_SETTINGS.boardFolder
+  };
 }
 function normalizeAISettings(raw) {
   var _a, _b, _c, _d, _e, _f;
@@ -383,6 +397,1365 @@ function thinkingOr(value, fallback) {
   return value === "on" || value === "off" ? value : fallback;
 }
 
+// src/workbench/BoardGalleryView.ts
+var import_obsidian3 = require("obsidian");
+
+// src/workbench/boardGalleryData.ts
+var import_obsidian2 = require("obsidian");
+
+// src/board/boardStore.ts
+var BOARD_EXTENSION = "volis";
+function blankBoardData() {
+  return { version: 1, nodes: [], edges: [] };
+}
+async function nextBoardPath(app, folder) {
+  const dir = folder.replace(/^\/+|\/+$/g, "");
+  const adapter = app.vault.adapter;
+  const base = "\u672A\u547D\u540D";
+  let name = `${base}.${BOARD_EXTENSION}`;
+  let index = 1;
+  let path = dir ? `${dir}/${name}` : name;
+  while (await adapter.exists(path)) {
+    name = `${base} ${index}.${BOARD_EXTENSION}`;
+    path = dir ? `${dir}/${name}` : name;
+    index += 1;
+  }
+  return path;
+}
+function listBoards(app) {
+  return app.vault.getFiles().filter((file) => file.extension.toLowerCase() === BOARD_EXTENSION).sort((a, b) => b.stat.mtime - a.stat.mtime);
+}
+
+// src/workbench/boardGalleryData.ts
+var PAD = 7;
+var MAX_NODES = 14;
+var MAX_CARDS = 6;
+var TEXT_CAP = 96;
+var blockCache = /* @__PURE__ */ new Map();
+function clean(text) {
+  return text.replace(/!\[[^\]]*\]\([^)]*\)/g, " ").replace(/\[\[([^\]|]*)\|([^\]]*)\]\]/g, "$2").replace(/\[\[([^\]]*)\]\]/g, "$1").replace(/[*_`>#~]/g, "").replace(/\s+/g, " ").trim();
+}
+function cut(text, max = TEXT_CAP) {
+  const value = clean(text);
+  return value.length > max ? `${value.slice(0, max)}\u2026` : value;
+}
+function baseName(path) {
+  var _a;
+  const name = (_a = path.split("/").pop()) != null ? _a : path;
+  return name.replace(/\.[^.]+$/, "");
+}
+function toneOf(node2) {
+  const color = node2.color;
+  if (!color)
+    return "";
+  return color;
+}
+async function blockText(app, node2) {
+  if (node2.type !== "card")
+    return "";
+  const card = node2;
+  if (!card.file || !card.blockId)
+    return "";
+  const file = app.vault.getAbstractFileByPath(card.file);
+  if (!(file instanceof import_obsidian2.TFile))
+    return "";
+  const key = `${file.path}@${file.stat.mtime}`;
+  const cached = blockCache.get(key);
+  if (cached !== void 0)
+    return cached;
+  let excerpt = "";
+  try {
+    const content = await app.vault.cachedRead(file);
+    const marker = `^${card.blockId}`;
+    const lines = content.split(/\r?\n/);
+    const at = lines.findIndex((line) => line.includes(marker));
+    if (at >= 0) {
+      const parts = [lines[at].replace(marker, "")];
+      for (let i = at - 1; i >= 0 && parts.length < 4; i--) {
+        const line = lines[i];
+        if (!line.trim() || /^#{1,6}\s/.test(line) || /^(---|\*\*\*)/.test(line))
+          break;
+        parts.unshift(line);
+      }
+      excerpt = cut(parts.join(" "), 140);
+    }
+  } catch (e) {
+    excerpt = "";
+  }
+  if (blockCache.size > 300)
+    blockCache.clear();
+  blockCache.set(key, excerpt);
+  return excerpt;
+}
+function labelOf(node2, cardText) {
+  var _a, _b, _c, _d;
+  if (node2.type === "text")
+    return cut((_a = node2.text) != null ? _a : "");
+  if (node2.type === "file")
+    return cut(baseName((_b = node2.file) != null ? _b : ""), 40);
+  if (node2.type === "card")
+    return cardText || cut(baseName((_c = node2.file) != null ? _c : ""), 40);
+  if (node2.type === "group")
+    return cut((_d = node2.label) != null ? _d : "", 28);
+  return "";
+}
+function layout(data, labels) {
+  var _a, _b;
+  const nodes = ((_a = data.nodes) != null ? _a : []).filter(
+    (node2) => node2.type !== "group" && Number.isFinite(node2.x) && Number.isFinite(node2.y) && node2.width > 0
+  );
+  if (!nodes.length)
+    return { nodes: [], edges: [] };
+  const minX = Math.min(...nodes.map((n) => n.x));
+  const minY = Math.min(...nodes.map((n) => n.y));
+  const maxX = Math.max(...nodes.map((n) => n.x + n.width));
+  const maxY = Math.max(...nodes.map((n) => {
+    var _a2;
+    return n.y + ((_a2 = n.height) != null ? _a2 : 120);
+  }));
+  const spanX = Math.max(maxX - minX, 1);
+  const spanY = Math.max(maxY - minY, 1);
+  const area = 100 - PAD * 2;
+  const ratio = spanX / spanY;
+  const boxW = ratio >= 1 ? area : area * ratio;
+  const boxH = ratio >= 1 ? area / ratio : area;
+  const offX = PAD + (area - boxW) / 2;
+  const offY = PAD + (area - boxH) / 2;
+  const pick = [...nodes].sort((a, b) => {
+    var _a2, _b2;
+    return b.width * ((_a2 = b.height) != null ? _a2 : 120) - a.width * ((_b2 = a.height) != null ? _b2 : 120);
+  }).slice(0, MAX_NODES);
+  const kept = new Set(pick.map((n) => n.id));
+  const built = pick.map((n) => {
+    var _a2, _b2;
+    return {
+      id: n.id,
+      box: {
+        x: offX + (n.x - minX) / spanX * boxW,
+        y: offY + (n.y - minY) / spanY * boxH,
+        w: Math.max(n.width / spanX * boxW, 6),
+        h: Math.max(((_a2 = n.height) != null ? _a2 : 120) / spanY * boxH, 5),
+        kind: n.type,
+        tone: toneOf(n),
+        text: (_b2 = labels.get(n.id)) != null ? _b2 : ""
+      }
+    };
+  });
+  const center = new Map(built.map((entry) => [entry.id, entry.box]));
+  const mini = built.map((entry) => entry.box).sort((a, b) => a.w * a.h - b.w * b.h);
+  const edges = [];
+  for (const edge of (_b = data.edges) != null ? _b : []) {
+    if (!kept.has(edge.from) || !kept.has(edge.to))
+      continue;
+    const from = center.get(edge.from);
+    const to = center.get(edge.to);
+    if (!from || !to)
+      continue;
+    edges.push({
+      x1: from.x + from.w / 2,
+      y1: from.y + from.h / 2,
+      x2: to.x + to.w / 2,
+      y2: to.y + to.h / 2
+    });
+    if (edges.length >= 24)
+      break;
+  }
+  return { nodes: mini, edges };
+}
+function stamp(time) {
+  const d = new Date(time);
+  const day = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
+    d.getDate()
+  ).padStart(2, "0")}`;
+  return `${day} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+function isBoardPath(path, folder) {
+  if (!path.toLowerCase().endsWith(`.${BOARD_EXTENSION}`))
+    return false;
+  if (!folder)
+    return true;
+  const prefix = folder.replace(/^\/+|\/+$/g, "");
+  return !prefix || path.startsWith(`${prefix}/`);
+}
+async function listBoardItems(app, folder) {
+  var _a;
+  const files = app.vault.getFiles().filter((file) => isBoardPath(file.path, folder)).sort((a, b) => b.stat.mtime - a.stat.mtime);
+  const items = [];
+  for (const file of files) {
+    let nodes = 0;
+    let edges = 0;
+    let cover = { nodes: [], edges: [] };
+    try {
+      const data = JSON.parse(await app.vault.read(file));
+      nodes = Array.isArray(data.nodes) ? data.nodes.length : 0;
+      edges = Array.isArray(data.edges) ? data.edges.length : 0;
+      const labels = /* @__PURE__ */ new Map();
+      let cards = 0;
+      for (const node2 of (_a = data.nodes) != null ? _a : []) {
+        if (node2.type === "card") {
+          cards += 1;
+          labels.set(node2.id, cards <= MAX_CARDS ? await blockText(app, node2) : "");
+        } else {
+          labels.set(node2.id, labelOf(node2, ""));
+        }
+      }
+      cover = layout(data, labels);
+    } catch (e) {
+      nodes = 0;
+    }
+    items.push({
+      file,
+      title: file.basename,
+      nodes,
+      edges,
+      updated: stamp(file.stat.mtime),
+      mtime: file.stat.mtime,
+      created: file.stat.ctime,
+      cover
+    });
+  }
+  return items;
+}
+async function createBoardItem(app, folder) {
+  const path = await nextBoardPath(app, folder);
+  return app.vault.create(path, JSON.stringify(blankBoardData(), null, 2));
+}
+function listSignature(items, sort) {
+  return [
+    sort,
+    ...items.map((item) => `${item.file.path}:${item.mtime}:${item.nodes}:${item.edges}`)
+  ].join("|");
+}
+
+// src/workbench/BoardGalleryView.ts
+var VIEW_TYPE_WORKBENCH = "volis-workbench";
+var SVG_NS = "http://www.w3.org/2000/svg";
+var ICON = {
+  search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="10.5" cy="10.5" r="6.2"/><path d="m15.2 15.2 4.3 4.3"/></svg>',
+  sort: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 6h9M4 12h6M4 18h4M17 5v13m0 0-3-3m3 3 3-3"/></svg>',
+  chevron: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m7 10 5 5 5-5"/></svg>',
+  plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>',
+  /* Same geometry as the ribbon icon painted in main.ts. */
+  volis: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3.5" width="19" height="17" rx="5" stroke-dasharray="3 2.6"/><path d="M6 15.5C8.2 10.5 11 10.2 11.8 12.4C12.6 14.6 15.4 14.8 17.6 10.2"/><circle cx="18.6" cy="6.6" r="1.5" fill="currentColor" stroke="none"/></svg>',
+  board: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="4" width="8" height="7" rx="1.6"/><rect x="13" y="4" width="8" height="4" rx="1.6"/><rect x="13" y="10" width="8" height="10" rx="1.6"/><rect x="3" y="13" width="8" height="7" rx="1.6"/></svg>',
+  node: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="12" rx="2.4"/></svg>',
+  trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M4 7h16M9 7V4.8h6V7M6.5 7l.8 12.2h9.4L17.5 7"/><path d="M10 10.5v5.5M14 10.5v5.5"/></svg>',
+  more: '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg>',
+  check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 4.5 4.5L19 7"/></svg>',
+  link: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M9.5 14.5 14.5 9.5"/><path d="M8 12 6.6 13.4a3.4 3.4 0 0 0 4.8 4.8L13 16.6"/><path d="M16 12l1.4-1.4a3.4 3.4 0 0 0-4.8-4.8L11 7.4"/></svg>'
+};
+var BoardGalleryView = class extends import_obsidian3.ItemView {
+  constructor(leaf, plugin) {
+    super(leaf);
+    this.items = [];
+    this.sortMode = "created";
+    this.query = "";
+    this.multi = false;
+    this.selected = /* @__PURE__ */ new Set();
+    /** Repaint bookkeeping: the wall listens to the vault, so it redraws while
+     *  hidden. Only a real change is worth touching the DOM. */
+    this.signature = "";
+    this.reloadTimer = null;
+    this.watching = false;
+    this.plugin = plugin;
+  }
+  getViewType() {
+    return VIEW_TYPE_WORKBENCH;
+  }
+  getDisplayText() {
+    return "\u753B\u5E03\u96C6";
+  }
+  getIcon() {
+    return "layout-grid";
+  }
+  async onOpen() {
+    try {
+      this.renderWall();
+    } catch (error) {
+      this.reportError("\u7ED8\u5236\u754C\u9762", error);
+      return;
+    }
+    try {
+      await this.loadItems();
+    } catch (error) {
+      this.reportError("\u8BFB\u53D6\u753B\u5E03", error);
+    }
+    this.watchSources();
+  }
+  async onClose() {
+    if (this.reloadTimer !== null) {
+      window.clearTimeout(this.reloadTimer);
+      this.reloadTimer = null;
+    }
+    const root = this.rootEl();
+    if (root)
+      this.clearRoot(root);
+  }
+  refreshWall() {
+    void this.loadItems();
+  }
+  /** The wall is a live mirror of the folder: a board saved in another tab, a
+   *  file added in the tree or the tab coming back to front all repaint it.
+   *  This is why nothing here needs a refresh button. */
+  watchSources() {
+    if (this.watching)
+      return;
+    this.watching = true;
+    const inFolder = (path) => isBoardPath(path, this.plugin.workbenchFolder);
+    this.registerEvent(
+      this.app.vault.on("modify", (file) => {
+        if (inFolder(file.path))
+          this.schedule(220);
+      })
+    );
+    this.registerEvent(
+      this.app.vault.on("create", (file) => {
+        if (inFolder(file.path))
+          this.schedule(60);
+      })
+    );
+    this.registerEvent(
+      this.app.vault.on("delete", (file) => {
+        if (inFolder(file.path))
+          this.schedule(60);
+      })
+    );
+    this.registerEvent(
+      this.app.vault.on("rename", (file, oldPath) => {
+        if (inFolder(file.path) || inFolder(oldPath))
+          this.schedule(60);
+      })
+    );
+    this.registerEvent(
+      this.app.workspace.on("active-leaf-change", (leaf) => {
+        if (leaf === this.leaf)
+          this.schedule(0);
+      })
+    );
+  }
+  schedule(delay) {
+    if (this.reloadTimer !== null)
+      window.clearTimeout(this.reloadTimer);
+    this.reloadTimer = window.setTimeout(() => {
+      this.reloadTimer = null;
+      void this.loadItems();
+    }, delay);
+  }
+  /** The element the wall is drawn into. `contentEl` is normally present, but
+   *  fall back to the view container rather than touching a null reference. */
+  rootEl() {
+    var _a, _b, _c;
+    const content = this.contentEl;
+    if (content)
+      return content;
+    const child = (_b = (_a = this.containerEl) == null ? void 0 : _a.children) == null ? void 0 : _b[1];
+    if (child)
+      return child;
+    return (_c = this.containerEl) != null ? _c : null;
+  }
+  clearRoot(el) {
+    while (el.firstChild)
+      el.removeChild(el.firstChild);
+  }
+  reportError(stage, error) {
+    const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+    console.error(`[volis] \u753B\u5E03\u96C6${stage}\u5931\u8D25`, error);
+    const root = this.rootEl();
+    if (root) {
+      this.clearRoot(root);
+      const box = document.createElement("div");
+      box.className = "vw-error";
+      const title = document.createElement("strong");
+      title.textContent = `\u753B\u5E03\u96C6${stage}\u5931\u8D25`;
+      const detail = document.createElement("p");
+      detail.textContent = message;
+      box.appendChild(title);
+      box.appendChild(detail);
+      root.appendChild(box);
+    }
+    new import_obsidian3.Notice(`\u753B\u5E03\u96C6${stage}\u5931\u8D25\uFF1A${message}`);
+  }
+  async loadItems() {
+    let items = [];
+    try {
+      items = await listBoardItems(this.app, this.plugin.workbenchFolder);
+    } catch (e) {
+      new import_obsidian3.Notice("\u8BFB\u53D6\u753B\u5E03\u5217\u8868\u5931\u8D25");
+    }
+    items = [...items].sort((a, b) => {
+      if (this.sortMode === "name")
+        return a.title.localeCompare(b.title, "zh-CN");
+      if (this.sortMode === "modified")
+        return b.mtime - a.mtime;
+      return b.created - a.created;
+    });
+    this.items = items;
+    if (listSignature(items, this.sortMode) === this.signature)
+      return;
+    this.renderWall();
+  }
+  renderWall() {
+    const root = this.rootEl();
+    if (!root)
+      return;
+    const scrolled = root.querySelector(".vw-scroll");
+    const scroll = scrolled ? scrolled.scrollTop : 0;
+    this.clearRoot(root);
+    root.classList.add("wb-root");
+    const frame = node("div", "vw-frame");
+    const toolbar = node("div", "vw-toolbar");
+    toolbar.appendChild(this.buildHead());
+    frame.appendChild(toolbar);
+    const body = node("div", "vw-scroll");
+    const results = node("div", "vw-results");
+    results.appendChild(this.buildResults());
+    body.appendChild(results);
+    frame.appendChild(body);
+    root.appendChild(frame);
+    body.scrollTop = scroll;
+    this.signature = listSignature(this.items, this.sortMode);
+  }
+  /** Typing only swaps the results: the input keeps focus and caret. */
+  updateResults() {
+    const root = this.rootEl();
+    if (!root)
+      return;
+    const results = root.querySelector(".vw-results");
+    const count2 = root.querySelector(".vw-count");
+    if (!results)
+      return;
+    this.clearRoot(results);
+    results.appendChild(this.buildResults());
+    const visible = this.visibleItems();
+    if (count2) {
+      count2.textContent = this.query ? `${visible.length} / ${this.items.length} \u5757` : `${this.items.length} \u5757`;
+    }
+  }
+  visibleItems() {
+    const q = this.query.trim().toLocaleLowerCase();
+    if (!q)
+      return this.items;
+    return this.items.filter(
+      (item) => [item.title, ...item.cover.nodes.map((box) => box.text)].some((text) => text.toLocaleLowerCase().includes(q))
+    );
+  }
+  buildResults() {
+    const visible = this.visibleItems();
+    if (!visible.length) {
+      return this.buildEmpty(this.query.trim().length > 0);
+    }
+    const grid = node("div", "vw-grid");
+    for (const item of visible)
+      grid.appendChild(this.buildCard(item));
+    return grid;
+  }
+  buildEmpty(searching) {
+    const empty = node("div", "vw-empty");
+    const art = node("div", "vw-empty-art");
+    art.innerHTML = ICON.volis;
+    const title = node("div", "vw-empty-title");
+    title.textContent = searching ? "\u6CA1\u6709\u5339\u914D\u7684\u753B\u5E03" : "\u8FD8\u6CA1\u6709\u753B\u5E03";
+    const hint = document.createElement("p");
+    hint.className = "vw-empty-hint";
+    hint.textContent = searching ? "\u6362\u4E2A\u5173\u952E\u8BCD\u8BD5\u8BD5\uFF0C\u641C\u7D22\u8303\u56F4\u5305\u62EC\u753B\u5E03\u540D\u79F0\u548C\u753B\u5E03\u4E0A\u7684\u6587\u5B57\u3002" : "\u65B0\u5EFA\u7684\u753B\u5E03\u4F1A\u5B58\u8FDB\u300C\u753B\u5E03\u300D\u6587\u4EF6\u5939\uFF0C\u548C\u6587\u4EF6\u6811\u5B8C\u5168\u540C\u6B65\u3002";
+    const button = document.createElement("button");
+    button.className = "vw-primary is-large";
+    if (searching) {
+      const label = document.createElement("span");
+      label.textContent = "\u6E05\u9664\u641C\u7D22";
+      button.appendChild(label);
+      button.addEventListener("click", () => {
+        var _a;
+        this.query = "";
+        this.renderWall();
+        const input = (_a = this.rootEl()) == null ? void 0 : _a.querySelector(".vw-search-input");
+        if (input)
+          input.focus();
+      });
+    } else {
+      const plus = node("span", "vw-ico");
+      plus.innerHTML = ICON.plus;
+      const label = document.createElement("span");
+      label.textContent = "\u65B0\u5EFA\u7B2C\u4E00\u5757\u753B\u5E03";
+      button.appendChild(plus);
+      button.appendChild(label);
+      button.addEventListener("click", () => {
+        void this.createBoard();
+      });
+    }
+    empty.appendChild(art);
+    empty.appendChild(title);
+    empty.appendChild(hint);
+    empty.appendChild(button);
+    return empty;
+  }
+  buildHead() {
+    const head = node("div", "vw-head");
+    const intro = node("div", "vw-intro");
+    const title = node("div", "vw-title");
+    const h1 = document.createElement("h1");
+    h1.textContent = "\u753B\u5E03\u96C6";
+    const count2 = node("span", "vw-count");
+    const visible = this.visibleItems();
+    count2.textContent = this.query ? `${visible.length} / ${this.items.length} \u5757` : `${this.items.length} \u5757`;
+    title.appendChild(h1);
+    title.appendChild(count2);
+    intro.appendChild(title);
+    head.appendChild(intro);
+    const actions = node("div", "vw-actions");
+    if (this.multi) {
+      const info = node("span", "vw-multi-count");
+      info.textContent = `\u5DF2\u9009 ${this.selected.size} \u5757`;
+      actions.appendChild(info);
+      actions.appendChild(simpleButton("\u5168\u9009", "vw-ghost", () => {
+        for (const item of this.visibleItems())
+          this.selected.add(item.file.path);
+        this.syncSelectionUI();
+      }));
+      const remove = simpleButton("\u5220\u9664\u6240\u9009", "vw-primary vw-danger", () => {
+        const chosen = this.items.filter((item) => this.selected.has(item.file.path));
+        this.confirmDelete(chosen, true);
+      });
+      if (!this.selected.size)
+        remove.disabled = true;
+      actions.appendChild(remove);
+      actions.appendChild(simpleButton("\u9000\u51FA\u591A\u9009", "vw-ghost", () => this.setMulti(false)));
+      head.appendChild(actions);
+      return head;
+    }
+    const search = node("div", "vw-search");
+    const glass = node("span", "vw-ico");
+    glass.innerHTML = ICON.search;
+    const input = document.createElement("input");
+    input.type = "search";
+    input.className = "vw-search-input";
+    input.placeholder = "\u641C\u7D22\u753B\u5E03";
+    input.style.cssText = "all: unset !important; display: block !important; width: 116px !important;padding: 0 !important; border: 0 !important; box-shadow: none !important;outline: none !important; background: transparent !important;font: inherit !important; font-size: 12px !important; line-height: 1.3 !important;color: var(--text-normal) !important; cursor: text !important;";
+    input.value = this.query;
+    input.addEventListener("input", () => {
+      this.query = input.value;
+      this.updateResults();
+    });
+    search.appendChild(glass);
+    search.appendChild(input);
+    actions.appendChild(search);
+    const create = document.createElement("button");
+    create.className = "vw-primary";
+    const plus = node("span", "vw-ico");
+    plus.innerHTML = ICON.plus;
+    const createLabel = document.createElement("span");
+    createLabel.textContent = "\u65B0\u5EFA\u753B\u5E03";
+    create.appendChild(plus);
+    create.appendChild(createLabel);
+    create.addEventListener("click", () => {
+      void this.createBoard();
+    });
+    actions.appendChild(create);
+    const more = node("button", "vw-sort vw-more");
+    more.setAttribute("title", "\u66F4\u591A\u64CD\u4F5C");
+    const moreIcon = node("span", "vw-ico");
+    moreIcon.innerHTML = ICON.more;
+    more.appendChild(moreIcon);
+    more.addEventListener("click", (event) => this.showMoreMenu(event));
+    actions.appendChild(more);
+    head.appendChild(actions);
+    return head;
+  }
+  /** The single "..." control holds sorting and multi-select, like the menu
+   *  at the top of Obsidian's file tree. */
+  showMoreMenu(event) {
+    var _a, _b;
+    const menu = new import_obsidian3.Menu();
+    const options = [
+      ["created", "\u6309\u521B\u5EFA\u65F6\u95F4"],
+      ["modified", "\u6309\u4FEE\u6539\u65F6\u95F4"],
+      ["name", "\u6309\u540D\u79F0"]
+    ];
+    for (const [value, label] of options) {
+      menu.addItem(
+        (item) => item.setTitle(label).setChecked(this.sortMode === value).onClick(() => this.setSort(value))
+      );
+    }
+    menu.addSeparator();
+    menu.addItem(
+      (item) => item.setTitle(this.multi ? "\u9000\u51FA\u591A\u9009" : "\u591A\u9009").setChecked(this.multi).onClick(() => this.setMulti(!this.multi))
+    );
+    const anchor = (_a = event.currentTarget) != null ? _a : event.target;
+    const rect = (_b = anchor == null ? void 0 : anchor.getBoundingClientRect) == null ? void 0 : _b.call(anchor);
+    if (rect)
+      menu.showAtPosition({ x: rect.left, y: rect.bottom + 4 });
+    else
+      menu.showAtMouseEvent(event);
+  }
+  setSort(value) {
+    if (this.sortMode === value)
+      return;
+    this.sortMode = value;
+    void this.loadItems();
+  }
+  buildCard(item) {
+    const card = node("div", "vw-card");
+    card.setAttribute("data-path", item.file.path);
+    if (this.multi && this.selected.has(item.file.path))
+      card.classList.add("is-selected");
+    card.appendChild(this.buildCover(item));
+    if (this.multi) {
+      const check = node("span", "vw-check");
+      check.innerHTML = ICON.check;
+      card.appendChild(check);
+    }
+    const del = document.createElement("button");
+    del.className = "vw-card-del";
+    del.setAttribute("title", "\u5220\u9664\u753B\u5E03");
+    del.innerHTML = ICON.trash;
+    del.addEventListener("click", (event) => {
+      event.stopPropagation();
+      this.confirmDelete([item]);
+    });
+    card.appendChild(del);
+    const body = node("div", "vw-card-body");
+    const head = node("div", "vw-card-head");
+    const icon = node("span", "vw-card-icon");
+    icon.innerHTML = ICON.board;
+    const title = node("div", "vw-card-title");
+    title.textContent = item.title;
+    head.appendChild(icon);
+    head.appendChild(title);
+    body.appendChild(head);
+    const date = node("div", "vw-card-date");
+    date.textContent = item.updated;
+    body.appendChild(date);
+    const props = node("div", "vw-card-props");
+    props.appendChild(prop(ICON.node, item.nodes ? `${item.nodes} \u4E2A\u8282\u70B9` : "\u7A7A\u767D\u753B\u5E03"));
+    if (item.edges)
+      props.appendChild(prop(ICON.link, `${item.edges} \u6761\u8FDE\u7EBF`));
+    body.appendChild(props);
+    card.appendChild(body);
+    card.addEventListener("click", () => {
+      if (this.multi)
+        this.toggleSelected(item.file.path);
+      else
+        this.openBoard(item);
+    });
+    return card;
+  }
+  /** The cover is a true miniature of the board: same layout, same colours,
+   *  and the real text of its nodes, so a card can be recognised without
+   *  opening it. */
+  buildCover(item) {
+    const cover = node("div", "vw-cover");
+    const { nodes, edges } = item.cover;
+    if (!nodes.length) {
+      cover.classList.add("is-blank");
+      const ghost = node("span", "vw-cover-ghost");
+      ghost.innerHTML = ICON.volis;
+      cover.appendChild(ghost);
+      return cover;
+    }
+    if (edges.length)
+      cover.appendChild(edgeLayer(edges));
+    for (const box of nodes) {
+      const chip = node("span", "vw-chip");
+      applyBox(chip, box);
+      applyTone(chip, box.tone);
+      chip.setAttribute("data-kind", box.kind);
+      if (box.text && box.w >= 15 && box.h >= 13) {
+        const text = node("span", "vw-chip-text");
+        text.textContent = box.text;
+        chip.appendChild(text);
+      }
+      cover.appendChild(chip);
+    }
+    return cover;
+  }
+  openBoard(item) {
+    void this.plugin.openBoardFile(item.file.path);
+  }
+  setMulti(on) {
+    this.multi = on;
+    if (!on)
+      this.selected.clear();
+    this.renderWall();
+  }
+  toggleSelected(path) {
+    if (this.selected.has(path))
+      this.selected.delete(path);
+    else
+      this.selected.add(path);
+    this.syncSelectionUI();
+  }
+  /** Selecting a card touches only the affected attributes. Rebuilding the
+   *  whole wall here made the card flash and swallowed the next click. */
+  syncSelectionUI() {
+    var _a;
+    const root = this.rootEl();
+    if (!root)
+      return;
+    for (const card of Array.from(root.querySelectorAll("[data-path]"))) {
+      const path = (_a = card.getAttribute("data-path")) != null ? _a : "";
+      card.classList.toggle("is-selected", this.selected.has(path));
+    }
+    const count2 = root.querySelector(".vw-multi-count");
+    if (count2)
+      count2.textContent = `\u5DF2\u9009 ${this.selected.size} \u5757`;
+    const remove = root.querySelector(".vw-danger");
+    if (remove)
+      remove.disabled = this.selected.size === 0;
+  }
+  confirmDelete(items, exitMulti = false) {
+    if (!items.length)
+      return;
+    new DeleteBoardsModal(this.app, items.map((item) => item.title), () => {
+      void this.deleteBoards(items.map((item) => item.file), exitMulti);
+    }).open();
+  }
+  async deleteBoards(files, exitMulti = false) {
+    let removed = 0;
+    for (const file of files) {
+      try {
+        await this.app.fileManager.trashFile(file);
+        removed += 1;
+      } catch (e) {
+        try {
+          await this.app.vault.delete(file);
+          removed += 1;
+        } catch (error) {
+          new import_obsidian3.Notice(error instanceof Error ? error.message : "\u5220\u9664\u753B\u5E03\u5931\u8D25");
+        }
+      }
+    }
+    for (const file of files)
+      this.selected.delete(file.path);
+    if (exitMulti && removed > 0) {
+      this.multi = false;
+      this.selected.clear();
+      this.signature = "";
+    }
+    await this.loadItems();
+  }
+  async createBoard() {
+    try {
+      await this.plugin.createGalleryBoard();
+      await this.loadItems();
+    } catch (error) {
+      new import_obsidian3.Notice(error instanceof Error ? error.message : "\u65B0\u5EFA\u753B\u5E03\u5931\u8D25");
+    }
+  }
+};
+function prop(icon, label) {
+  const row = node("span", "vw-prop");
+  const glyph = node("span", "vw-ico");
+  glyph.innerHTML = icon;
+  const text = document.createElement("span");
+  text.textContent = label;
+  row.appendChild(glyph);
+  row.appendChild(text);
+  return row;
+}
+function edgeLayer(edges) {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("class", "vw-cover-lines");
+  svg.setAttribute("viewBox", "0 0 100 100");
+  svg.setAttribute("preserveAspectRatio", "none");
+  for (const edge of edges) {
+    const line = document.createElementNS(SVG_NS, "line");
+    line.setAttribute("x1", String(edge.x1));
+    line.setAttribute("y1", String(edge.y1));
+    line.setAttribute("x2", String(edge.x2));
+    line.setAttribute("y2", String(edge.y2));
+    svg.appendChild(line);
+  }
+  return svg;
+}
+function applyBox(el, box) {
+  el.style.left = `${box.x}%`;
+  el.style.top = `${box.y}%`;
+  el.style.width = `${box.w}%`;
+  el.style.height = `${box.h}%`;
+}
+function applyTone(el, tone) {
+  if (!tone)
+    return;
+  if (tone.startsWith("#"))
+    el.style.setProperty("--tn", tone);
+  else
+    el.setAttribute("data-tone", tone);
+}
+function node(tag, className) {
+  const el = document.createElement(tag);
+  el.className = className;
+  return el;
+}
+function simpleButton(label, className, onClick) {
+  const button = document.createElement("button");
+  button.className = className;
+  const text = document.createElement("span");
+  text.textContent = label;
+  button.appendChild(text);
+  button.addEventListener("click", onClick);
+  return button;
+}
+var DeleteBoardsModal = class extends import_obsidian3.Modal {
+  constructor(app, names, onConfirm) {
+    super(app);
+    this.names = names;
+    this.onConfirm = onConfirm;
+  }
+  onOpen() {
+    const el = this.contentEl;
+    while (el.firstChild)
+      el.removeChild(el.firstChild);
+    el.classList.add("volis-delete-modal");
+    const heading2 = document.createElement("h2");
+    heading2.textContent = this.names.length === 1 ? "\u5220\u9664\u8FD9\u5757\u753B\u5E03\uFF1F" : `\u5220\u9664\u8FD9 ${this.names.length} \u5757\u753B\u5E03\uFF1F`;
+    const detail = document.createElement("p");
+    const shown = this.names.slice(0, 3).join("\u3001");
+    detail.textContent = this.names.length > 3 ? `\u4F1A\u79FB\u5230\u7CFB\u7EDF\u56DE\u6536\u7AD9\uFF1A${shown} \u7B49 ${this.names.length} \u5757\u3002` : `\u4F1A\u79FB\u5230\u7CFB\u7EDF\u56DE\u6536\u7AD9\uFF1A${shown}\u3002`;
+    const row = node("div", "vw-modal-actions");
+    const cancel = document.createElement("button");
+    cancel.className = "vw-ghost";
+    cancel.textContent = "\u53D6\u6D88";
+    cancel.addEventListener("click", () => this.close());
+    const confirm = document.createElement("button");
+    confirm.className = "vw-primary vw-danger";
+    confirm.textContent = "\u5220\u9664";
+    confirm.addEventListener("click", () => {
+      this.close();
+      this.onConfirm();
+    });
+    row.appendChild(cancel);
+    row.appendChild(confirm);
+    el.appendChild(heading2);
+    el.appendChild(detail);
+    el.appendChild(row);
+  }
+  onClose() {
+    const el = this.contentEl;
+    while (el.firstChild)
+      el.removeChild(el.firstChild);
+  }
+};
+
+// src/workbench/styles.ts
+var WORKBENCH_CSS = `
+/* This view only: Obsidian's own header row is trimmed to a thin bar, and the
+   wall is pinned to the leaf so its frame sits right under the tabs and right
+   above the bottom of the pane. */
+.workspace-leaf:has(.wb-root),
+.workspace-leaf:has(.wb-root) .workspace-leaf-content { position: relative; }
+.workspace-leaf:has(.wb-root) .view-header {
+  box-sizing: border-box;
+  height: 24px;
+  min-height: 24px;
+  padding: 0 8px;
+}
+.workspace-leaf:has(.wb-root) .view-header .view-header-nav-buttons,
+.workspace-leaf:has(.wb-root) .view-header .view-actions { height: 24px; }
+
+.wb-root {
+  --vw-line: var(--background-modifier-border, var(--background-modifier-hover));
+  --vw-soft: var(--background-modifier-hover);
+  --vw-tint: var(--background-secondary-alt, var(--background-secondary));
+  --vw-shadow: 0 14px 30px -20px rgba(0, 0, 0, .6);
+  --vw-card-w: 208px;
+
+  position: absolute;
+  top: 24px;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  box-sizing: border-box;
+  padding: 4px 8px;
+  overflow: hidden;
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  font-family: inherit;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---------- Frame: the whole page sits on one bordered layer ---------- */
+.wb-root .vw-frame {
+  position: relative;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  border: 1px solid var(--vw-line);
+  border-radius: 12px;
+  background: var(--background-primary);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .05);
+}
+.wb-root .vw-toolbar {
+  position: relative;
+  z-index: 2;
+  flex: 0 0 auto;
+  margin: 10px 20px 12px;
+  padding: 9px 12px;
+  border: 1px solid var(--vw-line);
+  border-radius: 10px;
+  background: var(--background-primary);
+  box-shadow: 0 3px 10px -6px rgba(0, 0, 0, .32);
+}
+.wb-root .vw-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 24px 14px;
+}
+
+/* ---------- Header ---------- */
+.wb-root .vw-head {
+  display: flex;
+  align-items: flex-end;
+  gap: 18px;
+  padding: 0;
+  flex-wrap: wrap;
+}
+.wb-root .vw-intro { min-width: 0; }
+.wb-root .vw-title { display: flex; align-items: baseline; gap: 10px; }
+.wb-root .vw-title h1 {
+  margin: 0;
+  font-size: 26px;
+  line-height: 1.12;
+  font-weight: 650;
+  letter-spacing: -.032em;
+  color: var(--text-normal);
+}
+.wb-root .vw-count {
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  background: var(--vw-soft);
+  border-radius: 20px;
+  padding: 3px 9px;
+  transform: translateY(-2px);
+}
+
+/* ---------- Toolbar ---------- */
+.wb-root .vw-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+.wb-root .vw-ico { display: inline-flex; align-items: center; }
+.wb-root .vw-ico svg { width: 14px; height: 14px; }
+
+/* ---------- Search ---------- */
+.wb-root .vw-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 9px;
+  border: 1px solid var(--vw-line);
+  border-radius: 8px;
+  background: var(--background-secondary);
+  color: var(--text-faint);
+  transition: border-color .14s ease;
+}
+.wb-root .vw-search:focus-within {
+  border-color: var(--background-modifier-border-hover, var(--text-faint));
+}
+.wb-root .vw-search-input {
+  all: unset;
+  display: block;
+  width: 116px;
+  padding: 0;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.3;
+  color: var(--text-normal);
+  background: transparent;
+  cursor: text;
+}
+.wb-root .vw-search-input::placeholder { color: var(--text-faint); opacity: 1; }
+.wb-root .vw-search-input::-webkit-search-cancel-button { -webkit-appearance: none; }
+
+.wb-root .vw-sort {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 8px 0 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: transparent;
+  cursor: pointer;
+  transition: color .14s ease, background .14s ease, border-color .14s ease;
+}
+.wb-root .vw-sort:hover {
+  color: var(--text-normal);
+  background: var(--vw-soft);
+  border-color: var(--vw-line);
+}
+.wb-root .vw-caret { opacity: .6; margin-left: -1px; }
+.wb-root .vw-caret svg { width: 12px; height: 12px; }
+
+.wb-root .vw-primary {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 32px;
+  padding: 0 15px;
+  border: 1px solid var(--vw-line);
+  border-radius: 9px;
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: -.005em;
+  cursor: pointer;
+  transition: opacity .14s ease, transform .14s ease;
+}
+.wb-root .vw-ghost {
+  display: inline-flex;
+  align-items: center;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--vw-line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-normal);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.wb-root .vw-ghost:hover { background: var(--vw-soft); }
+.wb-root .vw-ghost:disabled, .wb-root .vw-primary:disabled { opacity: .45; cursor: default; }
+.wb-root .vw-multi-count {
+  margin-right: auto;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-normal);
+}
+.wb-root .vw-danger {
+  background: var(--color-red, var(--text-normal));
+  color: var(--background-primary);
+  border-color: transparent;
+}
+.wb-root .vw-more { padding: 0 8px; }
+.wb-root .vw-more .vw-ico svg { width: 16px; height: 16px; }
+.wb-root .vw-primary:hover {
+  background: var(--background-modifier-border-hover, var(--vw-soft));
+}
+.wb-root .vw-primary:active { transform: scale(.985); }
+.wb-root .vw-primary.is-large {
+  height: 36px;
+  padding: 0 18px;
+  font-size: 13px;
+  margin-top: 20px;
+}
+
+/* ---------- Grid: fixed card width, identical in every pane layout -------- */
+.wb-root .vw-grid {
+  display: grid;
+  /* A fixed track, not a flexible one: the card must be the same size whether
+     the pane is 2-column or 3-column. Cards always start at the left edge,
+     like the first tile in a file browser. */
+  grid-template-columns: repeat(auto-fill, min(var(--vw-card-w), 100%));
+  gap: 14px;
+  align-content: start;
+  justify-content: start;
+}
+
+.wb-root .vw-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--vw-line);
+  border-radius: 11px;
+  overflow: hidden;
+  background: var(--background-primary);
+  cursor: pointer;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, .06);
+  animation: vw-rise .3s cubic-bezier(.22, .61, .36, 1) both;
+  transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease;
+}
+.wb-root .vw-card.is-selected {
+  border-color: var(--color-blue, var(--text-muted));
+  box-shadow: 0 0 0 2px var(--color-blue, var(--text-muted)), var(--vw-shadow);
+}
+.wb-root .vw-card-del {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  z-index: 3;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid var(--vw-line);
+  border-radius: 7px;
+  background: var(--background-primary);
+  color: var(--text-muted);
+  opacity: 0;
+  cursor: pointer;
+  transition: opacity .15s ease, color .15s ease, border-color .15s ease;
+}
+.wb-root .vw-card:hover .vw-card-del,
+.wb-root .vw-card-del:focus { opacity: 1; }
+.wb-root .vw-card-del:hover {
+  color: var(--color-red, var(--text-normal));
+  border-color: var(--color-red, var(--vw-line));
+}
+.wb-root .vw-card-del svg { width: 14px; height: 14px; }
+.wb-root .vw-check {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 3;
+  display: none;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  background: var(--color-blue, var(--text-muted));
+  color: var(--background-primary);
+}
+.wb-root .vw-card.is-selected .vw-check { display: grid; }
+.wb-root .vw-check svg { width: 12px; height: 12px; }
+.wb-root .vw-card:nth-child(2) { animation-delay: .035s; }
+.wb-root .vw-card:nth-child(3) { animation-delay: .07s; }
+.wb-root .vw-card:nth-child(4) { animation-delay: .105s; }
+.wb-root .vw-card:nth-child(5) { animation-delay: .14s; }
+.wb-root .vw-card:nth-child(n+6) { animation-delay: .18s; }
+.wb-root .vw-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--background-modifier-border-hover, var(--text-faint));
+  box-shadow: var(--vw-shadow);
+}
+/* Hover must not mask the selection ring: same specificity as :hover, but
+   declared later, so a selected card keeps its blue outline while pointed at. */
+.wb-root .vw-card.is-selected:hover {
+  border-color: var(--color-blue, var(--text-muted));
+  box-shadow: 0 0 0 2px var(--color-blue, var(--text-muted)), var(--vw-shadow);
+}
+@keyframes vw-rise {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* ---------- Cover: a miniature of the board ---------- */
+.wb-root .vw-cover {
+  position: relative;
+  aspect-ratio: 16 / 10;
+  overflow: hidden;
+  border-bottom: 1px solid var(--vw-line);
+  background-color: var(--vw-tint);
+  background-image: radial-gradient(var(--vw-line) 1px, transparent 1px);
+  background-size: 14px 14px;
+  background-position: 6px 6px;
+}
+.wb-root .vw-cover.is-blank {
+  display: grid;
+  place-items: center;
+}
+.wb-root .vw-cover-ghost {
+  display: inline-flex;
+  color: var(--text-faint);
+  opacity: .55;
+}
+.wb-root .vw-cover-ghost svg { width: 30px; height: 30px; }
+/* An empty board still shows a canvas: a dashed artboard inside the cover. */
+.wb-root .vw-cover.is-blank::after {
+  content: "";
+  position: absolute;
+  inset: 15%;
+  border: 1px dashed var(--vw-line);
+  border-radius: 5px;
+  opacity: .8;
+  pointer-events: none;
+}
+
+.wb-root .vw-cover-lines {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+.wb-root .vw-cover-lines line {
+  stroke: var(--text-faint);
+  stroke-width: 1;
+  opacity: .45;
+  vector-effect: non-scaling-stroke;
+}
+
+.wb-root .vw-chip {
+  position: absolute;
+  display: block;
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--background-primary);
+  box-shadow: inset 0 0 0 1px var(--vw-line);
+  transition: box-shadow .18s ease;
+}
+.wb-root .vw-chip::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: var(--tn, var(--text-muted));
+  opacity: .18;
+}
+.wb-root .vw-chip[data-kind="text"]::before { opacity: .26; }
+.wb-root .vw-chip[data-kind="group"]::before { opacity: .1; }
+.wb-root .vw-card:hover .vw-chip { box-shadow: inset 0 0 0 1px var(--text-faint); }
+.wb-root .vw-chip-text {
+  position: relative;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
+  overflow: hidden;
+  padding: 2px 3px;
+  font-size: 7px;
+  line-height: 1.4;
+  letter-spacing: 0;
+  color: var(--text-normal);
+  opacity: .92;
+  word-break: break-word;
+}
+.wb-root .vw-chip[data-tone="orange"] { --tn: var(--color-orange); }
+.wb-root .vw-chip[data-tone="red"] { --tn: var(--color-red); }
+.wb-root .vw-chip[data-tone="yellow"] { --tn: var(--color-yellow); }
+.wb-root .vw-chip[data-tone="green"] { --tn: var(--color-green); }
+.wb-root .vw-chip[data-tone="cyan"] { --tn: var(--color-cyan); }
+.wb-root .vw-chip[data-tone="blue"] { --tn: var(--color-blue); }
+.wb-root .vw-chip[data-tone="purple"] { --tn: var(--color-purple); }
+.wb-root .vw-chip[data-tone="pink"] { --tn: var(--color-pink); }
+
+/* ---------- Card body: title, date, properties ---------- */
+.wb-root .vw-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 11px 13px 12px;
+}
+.wb-root .vw-card-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.wb-root .vw-card-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  transition: color .16s ease;
+}
+.wb-root .vw-card:hover .vw-card-icon { color: var(--text-muted); }
+.wb-root .vw-card-icon svg { width: 14px; height: 14px; }
+.wb-root .vw-card-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -.012em;
+  color: var(--text-normal);
+}
+.wb-root .vw-card-date {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.wb-root .vw-card-props {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-top: 2px;
+  font-size: 11px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+.wb-root .vw-prop { display: inline-flex; align-items: center; gap: 4px; }
+.wb-root .vw-prop .vw-ico svg { width: 11px; height: 11px; }
+
+/* ---------- Confirmation modal ---------- */
+.volis-delete-modal .vw-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 22px;
+}
+.volis-delete-modal button { font: inherit; }
+.volis-rename-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 20px;
+}
+
+/* ---------- Empty ---------- */
+.wb-root .vw-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 38px 24px 44px;
+  animation: vw-rise .32s ease both;
+}
+.wb-root .vw-empty-art {
+  display: grid;
+  place-items: center;
+  width: 74px;
+  height: 74px;
+  border-radius: 20px;
+  color: var(--text-muted);
+  background: var(--background-secondary);
+  border: 1px solid var(--vw-line);
+  box-shadow: var(--vw-shadow);
+}
+.wb-root .vw-empty-art svg { width: 32px; height: 32px; }
+.wb-root .vw-empty-title {
+  margin-top: 18px;
+  font-size: 15.5px;
+  font-weight: 600;
+  letter-spacing: -.01em;
+  color: var(--text-normal);
+}
+.wb-root .vw-empty-hint {
+  margin: 7px 0 0;
+  max-width: 320px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+/* ---------- Error ---------- */
+.wb-root .vw-error {
+  margin: 30px 0;
+  padding: 18px 20px;
+  border-radius: 12px;
+  border: 1px solid var(--color-red, var(--vw-line));
+  background: var(--background-secondary);
+  color: var(--text-normal);
+}
+.wb-root .vw-error strong { display: block; font-size: 13.5px; margin-bottom: 6px; }
+.wb-root .vw-error p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-muted);
+  word-break: break-word;
+}
+
+@media (max-width: 780px) {
+  .wb-root { padding: 4px 6px; }
+  .wb-root .vw-scroll { padding: 0 14px 12px; }
+  .wb-root .vw-grid { gap: 12px; }
+  .wb-root .vw-actions { margin-left: 0; }
+}
+`;
+
 // src/parse/cardRef.ts
 var BLOCK_LINK_RE = /\[\[([^[\]|#]+?)#\^([^[\]|\n]+)(?:\|([^\]\n]+))?\]\]/g;
 function extractBlockLinks(text) {
@@ -413,7 +1786,7 @@ function makeBlockLink(ref) {
 }
 
 // src/store/cardStore.ts
-var import_obsidian2 = require("obsidian");
+var import_obsidian4 = require("obsidian");
 
 // src/parse/blockLocator.ts
 var LIST_START = /^[ \t]*(?:[-*+]|\d+[.)])[ \t]/;
@@ -520,7 +1893,7 @@ function extractTags(body) {
 }
 async function readCard(app, ref) {
   const file = app.vault.getAbstractFileByPath(ref.file);
-  if (!(file instanceof import_obsidian2.TFile)) {
+  if (!(file instanceof import_obsidian4.TFile)) {
     return { ref, body: "", timePrefix: "", editable: "", tags: [], stale: true };
   }
   const content = await app.vault.cachedRead(file);
@@ -556,7 +1929,7 @@ async function readCard(app, ref) {
 }
 async function writeCard(app, ref, newBody) {
   const file = app.vault.getAbstractFileByPath(ref.file);
-  if (!(file instanceof import_obsidian2.TFile))
+  if (!(file instanceof import_obsidian4.TFile))
     return false;
   let written = false;
   await app.vault.process(file, (content) => {
@@ -574,7 +1947,7 @@ async function writeCard(app, ref, newBody) {
 }
 async function listCardsInFile(app, filePath) {
   const file = app.vault.getAbstractFileByPath(filePath);
-  if (!(file instanceof import_obsidian2.TFile))
+  if (!(file instanceof import_obsidian4.TFile))
     return [];
   const content = await app.vault.cachedRead(file);
   const lines = content.split("\n");
@@ -634,9 +2007,9 @@ var NodeIndex = class {
     try {
       const seen = /* @__PURE__ */ new Set();
       const pending = [];
-      for (const node of collectNodes(canvas.nodes)) {
+      for (const node2 of collectNodes(canvas.nodes)) {
         try {
-          const data = typeof node.getData === "function" ? (_c = node.getData()) != null ? _c : null : node;
+          const data = typeof node2.getData === "function" ? (_c = node2.getData()) != null ? _c : null : node2;
           if (!data || data.type !== "text")
             continue;
           const id = data.id;
@@ -706,7 +2079,7 @@ var ActionRegistry = class {
 };
 
 // src/canvas/syncEngine.ts
-var import_obsidian3 = require("obsidian");
+var import_obsidian5 = require("obsidian");
 var SyncEngine = class {
   constructor(app, onRefreshed, canRefresh = () => true) {
     this.app = app;
@@ -714,7 +2087,7 @@ var SyncEngine = class {
     this.canRefresh = canRefresh;
     this.pending = /* @__PURE__ */ new Set();
     this.refreshing = false;
-    this.scheduled = (0, import_obsidian3.debounce)(() => this.flush(), 400, true);
+    this.scheduled = (0, import_obsidian5.debounce)(() => this.flush(), 400, true);
   }
   flushPending() {
     if (this.pending.size > 0)
@@ -818,11 +2191,11 @@ function applyBadges(canvasView, index, settings) {
   if (!(canvas == null ? void 0 : canvas.nodes))
     return;
   const container = canvasView.containerEl;
-  for (const node of collectNodes(canvas.nodes)) {
-    const nodeId = (_c = node.id) != null ? _c : (_b = (_a = node.getData) == null ? void 0 : _a.call(node)) == null ? void 0 : _b.id;
+  for (const node2 of collectNodes(canvas.nodes)) {
+    const nodeId = (_c = node2.id) != null ? _c : (_b = (_a = node2.getData) == null ? void 0 : _a.call(node2)) == null ? void 0 : _b.id;
     if (!nodeId)
       continue;
-    const el = (_d = node.nodeEl) != null ? _d : container.querySelector(`.canvas-node[data-id="${nodeId}"]`);
+    const el = (_d = node2.nodeEl) != null ? _d : container.querySelector(`.canvas-node[data-id="${nodeId}"]`);
     if (!el)
       continue;
     let badge = el.querySelector(`.${BADGE_CLASS}`);
@@ -855,8 +2228,8 @@ function clearBadges(canvasView) {
   const canvas = canvasView.canvas;
   if (!(canvas == null ? void 0 : canvas.nodes))
     return;
-  for (const node of collectNodes(canvas.nodes)) {
-    const badge = (_a = node.nodeEl) == null ? void 0 : _a.querySelector(`.${BADGE_CLASS}`);
+  for (const node2 of collectNodes(canvas.nodes)) {
+    const badge = (_a = node2.nodeEl) == null ? void 0 : _a.querySelector(`.${BADGE_CLASS}`);
     if (badge)
       badge.remove();
   }
@@ -901,7 +2274,7 @@ function paint(badge, text, stale) {
 }
 
 // src/board/BoardView.ts
-var import_obsidian14 = require("obsidian");
+var import_obsidian16 = require("obsidian");
 
 // src/ui/inlineEditor.ts
 var InlineEditor = class {
@@ -1028,7 +2401,7 @@ var InlineEditor = class {
 };
 
 // src/ui/markdownNodeEditor.ts
-var import_obsidian4 = require("obsidian");
+var import_obsidian6 = require("obsidian");
 var MarkdownNodeEditor = class {
   constructor(app, nodeEl, file, initialBody, onCommit, onCancel, onClosed) {
     this.app = app;
@@ -1099,7 +2472,7 @@ var MarkdownNodeEditor = class {
       try {
         await this.app.fileManager.renameFile(this.file, nextPath);
         const renamed = this.app.vault.getAbstractFileByPath(nextPath);
-        if (renamed instanceof import_obsidian4.TFile)
+        if (renamed instanceof import_obsidian6.TFile)
           target = renamed;
       } catch (error) {
       }
@@ -1123,11 +2496,11 @@ var MarkdownNodeEditor = class {
 };
 
 // src/ui/mediaModal.ts
-var import_obsidian5 = require("obsidian");
+var import_obsidian7 = require("obsidian");
 var IMAGE_EXT = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"];
 var VIDEO_EXT = ["mp4", "webm", "mov", "mkv"];
 var AUDIO_EXT = ["mp3", "wav", "m4a", "ogg"];
-var MediaModal = class extends import_obsidian5.Modal {
+var MediaModal = class extends import_obsidian7.Modal {
   constructor(app, file) {
     super(app);
     this.file = file;
@@ -1170,8 +2543,8 @@ var MediaModal = class extends import_obsidian5.Modal {
 };
 
 // src/ui/renameModal.ts
-var import_obsidian6 = require("obsidian");
-var RenameModal = class extends import_obsidian6.Modal {
+var import_obsidian8 = require("obsidian");
+var RenameModal = class extends import_obsidian8.Modal {
   constructor(app, initial, onSubmit) {
     super(app);
     this.initial = initial;
@@ -1203,7 +2576,7 @@ var RenameModal = class extends import_obsidian6.Modal {
         this.close();
       }
     });
-    new import_obsidian6.Setting(contentEl).addButton(
+    new import_obsidian8.Setting(contentEl).addButton(
       (button) => button.setButtonText("\u91CD\u547D\u540D").setCta().onClick(submit)
     );
   }
@@ -1213,8 +2586,8 @@ var RenameModal = class extends import_obsidian6.Modal {
 };
 
 // src/ui/confirmModal.ts
-var import_obsidian7 = require("obsidian");
-var ConfirmModal = class extends import_obsidian7.Modal {
+var import_obsidian9 = require("obsidian");
+var ConfirmModal = class extends import_obsidian9.Modal {
   constructor(app, heading2, message, confirmText, onConfirm) {
     super(app);
     this.heading = heading2;
@@ -1227,7 +2600,7 @@ var ConfirmModal = class extends import_obsidian7.Modal {
     contentEl.empty();
     contentEl.createEl("h3", { text: this.heading });
     contentEl.createEl("p", { text: this.message, cls: "volis-confirm-text" });
-    new import_obsidian7.Setting(contentEl).addButton((button) => button.setButtonText("\u53D6\u6D88").onClick(() => this.close())).addButton(
+    new import_obsidian9.Setting(contentEl).addButton((button) => button.setButtonText("\u53D6\u6D88").onClick(() => this.close())).addButton(
       (button) => button.setButtonText(this.confirmText).setWarning().onClick(() => {
         this.close();
         this.onConfirm();
@@ -1240,7 +2613,7 @@ var ConfirmModal = class extends import_obsidian7.Modal {
 };
 
 // src/board/cardWriter.ts
-var import_obsidian8 = require("obsidian");
+var import_obsidian10 = require("obsidian");
 var DATE_HEADING = /^##[ \t]+(\d{4}-\d{2}-\d{2})[ \t]*$/;
 var CARD_BODY_LINE = /^(\d{1,2}:\d{2})[ \t]+/;
 async function resolveCardFolder(app, fallback) {
@@ -1384,7 +2757,7 @@ async function createNoteFromText(app, folder, content, title = "\u672A\u547D\u5
     }
     const firstPath = dir ? `${dir}/${base}.md` : `${base}.md`;
     const existing = app.vault.getAbstractFileByPath(firstPath);
-    if (existing instanceof import_obsidian8.TFile) {
+    if (existing instanceof import_obsidian10.TFile) {
       const head = (await app.vault.read(existing)).slice(0, 32);
       if (head.startsWith("\u6765\u6E90\uFF1A")) {
         await app.vault.modify(existing, content);
@@ -1406,7 +2779,7 @@ async function createNoteFromText(app, folder, content, title = "\u672A\u547D\u5
 }
 
 // src/ai/provider.ts
-var import_obsidian9 = require("obsidian");
+var import_obsidian11 = require("obsidian");
 var DEFAULT_MAX_TOKENS = 8192;
 var THINKING_ATE_BUDGET = "\u6A21\u578B\u7684\u601D\u8003\u8FC7\u7A0B\u7528\u5B8C\u4E86\u8FD9\u6B21\u8F93\u51FA\u989D\u5EA6\uFF0C\u6CA1\u7559\u4E0B\u6B63\u6587\u3002\u53EF\u4EE5\u5728\u8BBE\u7F6E\u91CC\u628A\u8FD9\u4E2A\u6A21\u578B\u7684\u300C\u5355\u6B21\u8F93\u51FA\u4E0A\u9650\u300D\u8C03\u5927\uFF0C\u6216\u628A\u300C\u601D\u8003\u6A21\u5F0F\u300D\u8BBE\u4E3A\u5173\u95ED\u540E\u91CD\u8BD5\u3002";
 function isThinkingBudgetError(error) {
@@ -1632,7 +3005,7 @@ var OpenAICompatibleProvider = class {
       calls += 1;
       let response;
       try {
-        response = await (0, import_obsidian9.requestUrl)({
+        response = await (0, import_obsidian11.requestUrl)({
           url,
           method: "POST",
           headers: {
@@ -1730,7 +3103,7 @@ var AnthropicProvider = class {
       calls += 1;
       let response;
       try {
-        response = await (0, import_obsidian9.requestUrl)({
+        response = await (0, import_obsidian11.requestUrl)({
           url,
           method: "POST",
           headers: {
@@ -1804,13 +3177,13 @@ function estimateTokens(text) {
   const other = text.length - cjk;
   return Math.ceil((cjk * 0.58 + other * 0.3) * 1.05);
 }
-function floorFor(node, policy) {
+function floorFor(node2, policy) {
   var _a;
   const smallest = (_a = policy.ladder[policy.ladder.length - 1]) != null ? _a : 200;
-  return node.kind === "note" || node.kind === "file" ? policy.noteFloorChars : smallest;
+  return node2.kind === "note" || node2.kind === "file" ? policy.noteFloorChars : smallest;
 }
-function capFor(node, policy) {
-  return node.kind === "note" || node.kind === "file" ? policy.noteCapChars : Number.MAX_SAFE_INTEGER;
+function capFor(node2, policy) {
+  return node2.kind === "note" || node2.kind === "file" ? policy.noteCapChars : Number.MAX_SAFE_INTEGER;
 }
 function allocate(sizes, floors, caps, charBudget) {
   const allowed = sizes.map((size, i) => Math.min(size, Math.min(floors[i], caps[i])));
@@ -1859,9 +3232,9 @@ function cleanBody(text, limit) {
   return { text: flat.slice(0, keep) + suffix, truncated: true };
 }
 function buildBoardContext(input, budgetTokens, policy) {
-  const contentNodes = input.nodes.filter((node) => node.kind !== "group");
+  const contentNodes = input.nodes.filter((node2) => node2.kind !== "group");
   const tagOf = /* @__PURE__ */ new Map();
-  contentNodes.forEach((node, i) => tagOf.set(node.id, `N${i + 1}`));
+  contentNodes.forEach((node2, i) => tagOf.set(node2.id, `N${i + 1}`));
   const groupLines = [];
   for (const group of input.groups) {
     const tags = group.memberIds.map((id) => tagOf.get(id)).filter((tag) => Boolean(tag));
@@ -1877,74 +3250,74 @@ function buildBoardContext(input, budgetTokens, policy) {
     return `${tagOf.get(edge.from)}${relation}${tagOf.get(edge.to)}${label}`;
   });
   const overheadChars = groupLines.join("\n").length + edgeLines.join("\n").length + 120;
-  const bodies = contentNodes.map((node) => {
+  const bodies = contentNodes.map((node2) => {
     var _a;
-    return node.readable ? (_a = node.text) != null ? _a : "" : "";
+    return node2.readable ? (_a = node2.text) != null ? _a : "" : "";
   });
   const totalChars = bodies.reduce((sum, body) => sum + body.length, 0);
   const ratio = totalChars > 200 ? estimateTokens(bodies.join("")) / totalChars : 0.58;
   const charBudget = Math.max(0, Math.floor((budgetTokens - overheadChars * ratio) / Math.max(0.2, ratio)));
   const sizes = bodies.map((body) => body.length);
-  const floors = contentNodes.map((node) => floorFor(node, policy));
-  const caps = contentNodes.map((node) => capFor(node, policy));
+  const floors = contentNodes.map((node2) => floorFor(node2, policy));
+  const caps = contentNodes.map((node2) => capFor(node2, policy));
   const compose = (budgetChars2) => {
     const { allowed, omitted } = allocate(sizes, floors, caps, budgetChars2);
     const cells = [];
     const nodes = [];
-    contentNodes.forEach((node, i) => {
+    contentNodes.forEach((node2, i) => {
       var _a, _b, _c, _d, _e;
-      const tag = (_a = tagOf.get(node.id)) != null ? _a : `N${i + 1}`;
+      const tag = (_a = tagOf.get(node2.id)) != null ? _a : `N${i + 1}`;
       const body = bodies[i];
       if (omitted.includes(i)) {
         nodes.push({
-          id: node.id,
+          id: node2.id,
           tag,
-          label: node.label,
-          kind: node.kind,
+          label: node2.label,
+          kind: node2.kind,
           charsSent: 0,
           charsTotal: body.length,
           truncated: false,
-          readable: node.readable,
+          readable: node2.readable,
           note: "\u9884\u7B97\u4E0D\u8DB3\uFF0C\u672A\u53D1\u9001"
         });
         return;
       }
-      const { text: text2, truncated } = node.readable ? cleanBody(body, allowed[i]) : { text: "", truncated: false };
-      const bits = [kindLabel(node.kind)];
-      if ((_b = node.meta) == null ? void 0 : _b.date) {
-        bits.push(node.meta.date + (node.meta.time ? ` ${node.meta.time}` : ""));
+      const { text: text2, truncated } = node2.readable ? cleanBody(body, allowed[i]) : { text: "", truncated: false };
+      const bits = [kindLabel(node2.kind)];
+      if ((_b = node2.meta) == null ? void 0 : _b.date) {
+        bits.push(node2.meta.date + (node2.meta.time ? ` ${node2.meta.time}` : ""));
       }
-      if ((_d = (_c = node.meta) == null ? void 0 : _c.tags) == null ? void 0 : _d.length) {
-        bits.push(node.meta.tags.map((tagText) => `#${tagText}`).join(" "));
+      if ((_d = (_c = node2.meta) == null ? void 0 : _c.tags) == null ? void 0 : _d.length) {
+        bits.push(node2.meta.tags.map((tagText) => `#${tagText}`).join(" "));
       }
-      if (node.color)
-        bits.push(`\u989C\u8272:${node.color}`);
-      if (node.path)
-        bits.push(`\u6765\u6E90:${node.path}`);
+      if (node2.color)
+        bits.push(`\u989C\u8272:${node2.color}`);
+      if (node2.path)
+        bits.push(`\u6765\u6E90:${node2.path}`);
       let content = text2 || "\uFF08\u7A7A\uFF09";
-      if (!node.readable) {
-        content = `\uFF08${(_e = node.mediaKind) != null ? _e : "\u6587\u4EF6"}\uFF0C\u672C\u6B21\u53EA\u53D1\u9001\u4E86\u6587\u4EF6\u540D\uFF0C\u6B63\u6587\u672A\u89E3\u6790\uFF09`;
-      } else if (node.kind === "note" || node.kind === "file") {
+      if (!node2.readable) {
+        content = `\uFF08${(_e = node2.mediaKind) != null ? _e : "\u6587\u4EF6"}\uFF0C\u672C\u6B21\u53EA\u53D1\u9001\u4E86\u6587\u4EF6\u540D\uFF0C\u6B63\u6587\u672A\u89E3\u6790\uFF09`;
+      } else if (node2.kind === "note" || node2.kind === "file") {
         if (!body.trim())
           content = "\uFF08\u7B14\u8BB0\u5185\u5BB9\u4E3A\u7A7A\u6216\u672A\u8BFB\u53D6\u5230\uFF09";
       }
       cells.push(`\u3010${tag}\u3011${bits.join(" \xB7 ")}
 ${content}`);
       nodes.push({
-        id: node.id,
+        id: node2.id,
         tag,
-        label: node.label,
-        kind: node.kind,
+        label: node2.label,
+        kind: node2.kind,
         charsSent: text2.length,
         charsTotal: body.length,
         truncated,
-        readable: node.readable,
+        readable: node2.readable,
         note: truncated ? "\u5DF2\u622A\u65AD" : void 0
       });
     });
-    const sentCount = nodes.filter((node) => node.charsSent > 0 || !node.readable).length;
+    const sentCount = nodes.filter((node2) => node2.charsSent > 0 || !node2.readable).length;
     const droppedCount = nodes.length - sentCount;
-    const truncatedAny = nodes.some((node) => node.truncated);
+    const truncatedAny = nodes.some((node2) => node2.truncated);
     const sections = [];
     if (groupLines.length > 0)
       sections.push(groupLines.join("\n"));
@@ -1962,17 +3335,17 @@ ${edgeLines.join("\n")}`);
     if (droppedCount > 0)
       notes.push(`\u9884\u7B97\u4E0D\u8DB3\uFF0C${droppedCount} \u4E2A\u8282\u70B9\u672A\u53D1\u9001`);
     if (truncatedAny) {
-      const count2 = nodes.filter((node) => node.truncated).length;
+      const count2 = nodes.filter((node2) => node2.truncated).length;
       notes.push(`${count2} \u4E2A\u8282\u70B9\u5185\u5BB9\u88AB\u622A\u65AD`);
     }
-    const unreadable = nodes.filter((node) => !node.readable).length;
+    const unreadable = nodes.filter((node2) => !node2.readable).length;
     if (unreadable > 0)
       notes.push(`${unreadable} \u4E2A\u8282\u70B9\u53EA\u53D1\u9001\u4E86\u6587\u4EF6\u540D`);
     return {
       text,
       manifest: {
         nodes,
-        omitted: nodes.filter((node) => node.note === "\u9884\u7B97\u4E0D\u8DB3\uFF0C\u672A\u53D1\u9001").map((node) => ({ id: node.id, label: node.label, charsTotal: node.charsTotal })),
+        omitted: nodes.filter((node2) => node2.note === "\u9884\u7B97\u4E0D\u8DB3\uFF0C\u672A\u53D1\u9001").map((node2) => ({ id: node2.id, label: node2.label, charsTotal: node2.charsTotal })),
         usedTokens: estimateTokens(text),
         budgetTokens,
         charBudget: budgetChars2,
@@ -2001,7 +3374,7 @@ function kindLabel(kind) {
 }
 
 // src/board/insertSearch.ts
-var import_obsidian10 = require("obsidian");
+var import_obsidian12 = require("obsidian");
 var MEDIA_EXT = /* @__PURE__ */ new Set([
   "png",
   "jpg",
@@ -2035,7 +3408,7 @@ async function searchInsertItems(app, cardFolderSetting, query, filter) {
   const out = [];
   if (filter === "media") {
     for (const file of app.vault.getFiles()) {
-      if (!(file instanceof import_obsidian10.TFile))
+      if (!(file instanceof import_obsidian12.TFile))
         continue;
       if (!MEDIA_EXT.has(file.extension.toLowerCase()))
         continue;
@@ -2141,15 +3514,15 @@ function clampLabelT(t) {
 }
 
 // src/board/doctor.ts
-function doctorNodeName(node) {
+function doctorNodeName(node2) {
   var _a, _b;
-  if (node.type === "group")
-    return ((_a = node.label) == null ? void 0 : _a.trim()) || "\u672A\u547D\u540D\u5206\u7EC4";
-  if (node.type === "text") {
-    const first = (_b = node.text.split("\n").find((line) => line.trim())) != null ? _b : "";
+  if (node2.type === "group")
+    return ((_a = node2.label) == null ? void 0 : _a.trim()) || "\u672A\u547D\u540D\u5206\u7EC4";
+  if (node2.type === "text") {
+    const first = (_b = node2.text.split("\n").find((line) => line.trim())) != null ? _b : "";
     return first.trim().slice(0, 20) || "\u7A7A\u767D\u6587\u672C";
   }
-  return node.file.split("/").pop() || node.file;
+  return node2.file.split("/").pop() || node2.file;
 }
 function pairKey(a, b) {
   return a < b ? `${a}|${b}` : `${b}|${a}`;
@@ -2173,23 +3546,23 @@ var KIND_ORDER = [
 function scanBoard(input) {
   var _a, _b;
   const issues = [];
-  const byId = new Map(input.nodes.map((node) => [node.id, node]));
+  const byId = new Map(input.nodes.map((node2) => [node2.id, node2]));
   const present = (id) => byId.has(id);
   const name = (id) => {
-    const node = byId.get(id);
-    return node ? doctorNodeName(node) : "\u5DF2\u5220\u9664\u7684\u8282\u70B9";
+    const node2 = byId.get(id);
+    return node2 ? doctorNodeName(node2) : "\u5DF2\u5220\u9664\u7684\u8282\u70B9";
   };
-  for (const node of input.nodes) {
-    if (node.type !== "card" || !input.staleIds.has(node.id))
+  for (const node2 of input.nodes) {
+    if (node2.type !== "card" || !input.staleIds.has(node2.id))
       continue;
     issues.push({
-      key: `stale:${node.id}`,
+      key: `stale:${node2.id}`,
       level: "error",
       kind: "stale-ref",
       title: "\u5F15\u7528\u5931\u6548",
-      detail: `${doctorNodeName(node)} \u7684\u5757\u5F15\u7528\u5728\u6E90\u7B14\u8BB0\u91CC\u627E\u4E0D\u5230\uFF0C\u5361\u7247\u6B63\u6587\u4E3A\u7A7A`,
-      nodeIds: [node.id],
-      removableNodeId: node.id
+      detail: `${doctorNodeName(node2)} \u7684\u5757\u5F15\u7528\u5728\u6E90\u7B14\u8BB0\u91CC\u627E\u4E0D\u5230\uFF0C\u5361\u7247\u6B63\u6587\u4E3A\u7A7A`,
+      nodeIds: [node2.id],
+      removableNodeId: node2.id
     });
   }
   const danglingNodeIds = /* @__PURE__ */ new Set();
@@ -2209,12 +3582,12 @@ function scanBoard(input) {
     });
   }
   const byRef = /* @__PURE__ */ new Map();
-  for (const node of input.nodes) {
-    if (node.type !== "card")
+  for (const node2 of input.nodes) {
+    if (node2.type !== "card")
       continue;
-    const ref = `${node.file}#^${node.blockId}`;
+    const ref = `${node2.file}#^${node2.blockId}`;
     const list = (_a = byRef.get(ref)) != null ? _a : [];
-    list.push(node);
+    list.push(node2);
     byRef.set(ref, list);
   }
   const duplicatePairs = /* @__PURE__ */ new Set();
@@ -2236,7 +3609,7 @@ function scanBoard(input) {
       });
     }
   }
-  const texts = input.nodes.filter((node) => node.type !== "group" && !input.staleIds.has(node.id)).slice(0, 300).map((node) => ({ node, text: normalise(input.textOf(node)) })).filter((item) => item.text.length >= 24);
+  const texts = input.nodes.filter((node2) => node2.type !== "group" && !input.staleIds.has(node2.id)).slice(0, 300).map((node2) => ({ node: node2, text: normalise(input.textOf(node2)) })).filter((item) => item.text.length >= 24);
   for (let i = 0; i < texts.length; i++) {
     for (let j = i + 1; j < texts.length; j++) {
       const a = texts[i];
@@ -2280,26 +3653,26 @@ function scanBoard(input) {
     connected.add(edge.from);
     connected.add(edge.to);
   }
-  for (const node of input.nodes) {
-    if (node.type === "group")
+  for (const node2 of input.nodes) {
+    if (node2.type === "group")
       continue;
-    if (connected.has(node.id) || danglingNodeIds.has(node.id))
+    if (connected.has(node2.id) || danglingNodeIds.has(node2.id))
       continue;
     issues.push({
-      key: `isolated:${node.id}`,
+      key: `isolated:${node2.id}`,
       level: "hint",
       kind: "isolated-node",
       title: "\u5B64\u7ACB\u8282\u70B9",
-      detail: `\u300C${doctorNodeName(node)}\u300D\u6CA1\u6709\u4EFB\u4F55\u8FDE\u7EBF\uFF0C\u786E\u8BA4\u662F\u4E0D\u662F\u6F0F\u753B\u4E86\u5173\u7CFB`,
-      nodeIds: [node.id]
+      detail: `\u300C${doctorNodeName(node2)}\u300D\u6CA1\u6709\u4EFB\u4F55\u8FDE\u7EBF\uFF0C\u786E\u8BA4\u662F\u4E0D\u662F\u6F0F\u753B\u4E86\u5173\u7CFB`,
+      nodeIds: [node2.id]
     });
   }
-  const boxes = input.nodes.filter((node) => node.type !== "group").slice(0, 400).map((node) => ({
-    node,
-    x: node.x,
-    y: node.y,
-    w: node.width,
-    h: Math.max(1, input.heightOf(node))
+  const boxes = input.nodes.filter((node2) => node2.type !== "group").slice(0, 400).map((node2) => ({
+    node: node2,
+    x: node2.x,
+    y: node2.y,
+    w: node2.width,
+    h: Math.max(1, input.heightOf(node2))
   }));
   for (let i = 0; i < boxes.length; i++) {
     for (let j = i + 1; j < boxes.length; j++) {
@@ -2322,11 +3695,11 @@ function scanBoard(input) {
     }
   }
   if (input.nodes.length >= 4) {
-    const others = input.nodes.filter((node) => node.type !== "group");
-    for (const node of others) {
+    const others = input.nodes.filter((node2) => node2.type !== "group");
+    for (const node2 of others) {
       if (others.length < 4)
         break;
-      const rest = others.filter((other) => other.id !== node.id);
+      const rest = others.filter((other) => other.id !== node2.id);
       if (rest.length === 0)
         continue;
       const minX = Math.min(...rest.map((item) => item.x));
@@ -2335,43 +3708,43 @@ function scanBoard(input) {
       const maxY = Math.max(
         ...rest.map((item) => item.y + Math.max(1, input.heightOf(item)))
       );
-      const gapX = Math.max(0, minX - (node.x + node.width), node.x - maxX);
+      const gapX = Math.max(0, minX - (node2.x + node2.width), node2.x - maxX);
       const gapY = Math.max(
         0,
-        minY - (node.y + input.heightOf(node)),
-        node.y - maxY
+        minY - (node2.y + input.heightOf(node2)),
+        node2.y - maxY
       );
       if (Math.hypot(gapX, gapY) < 1200)
         continue;
       issues.push({
-        key: `far:${node.id}`,
+        key: `far:${node2.id}`,
         level: "hint",
         kind: "far-away",
         title: "\u8FDC\u79BB\u5185\u5BB9\u533A",
-        detail: `\u300C${doctorNodeName(node)}\u300D\u79BB\u5176\u4ED6\u8282\u70B9\u5F88\u8FDC\uFF0C\u4ECD\u5728 AI \u4E0A\u4E0B\u6587\u91CC\u5360\u989D\u5EA6`,
-        nodeIds: [node.id]
+        detail: `\u300C${doctorNodeName(node2)}\u300D\u79BB\u5176\u4ED6\u8282\u70B9\u5F88\u8FDC\uFF0C\u4ECD\u5728 AI \u4E0A\u4E0B\u6587\u91CC\u5360\u989D\u5EA6`,
+        nodeIds: [node2.id]
       });
     }
   }
-  for (const node of input.nodes) {
-    if (node.type === "text" && !node.text.trim()) {
+  for (const node2 of input.nodes) {
+    if (node2.type === "text" && !node2.text.trim()) {
       issues.push({
-        key: `empty:${node.id}`,
+        key: `empty:${node2.id}`,
         level: "hint",
         kind: "empty-node",
         title: "\u7A7A\u767D\u6587\u672C\u8282\u70B9",
         detail: "\u8FD9\u4E2A\u6587\u672C\u8282\u70B9\u6CA1\u6709\u5185\u5BB9\uFF0CAI \u4F1A\u8BFB\u5230\u5360\u4F4D\u7B26",
-        nodeIds: [node.id]
+        nodeIds: [node2.id]
       });
     }
-    if (node.type === "group" && input.memberIdsOf(node).length === 0) {
+    if (node2.type === "group" && input.memberIdsOf(node2).length === 0) {
       issues.push({
-        key: `emptygroup:${node.id}`,
+        key: `emptygroup:${node2.id}`,
         level: "hint",
         kind: "empty-group",
         title: "\u7A7A\u5206\u7EC4",
-        detail: `\u5206\u7EC4\u300C${doctorNodeName(node)}\u300D\u91CC\u6CA1\u6709\u8282\u70B9`,
-        nodeIds: [node.id]
+        detail: `\u5206\u7EC4\u300C${doctorNodeName(node2)}\u300D\u91CC\u6CA1\u6709\u8282\u70B9`,
+        nodeIds: [node2.id]
       });
     }
   }
@@ -2385,13 +3758,13 @@ function scanBoard(input) {
 }
 
 // src/ui/doctorModal.ts
-var import_obsidian11 = require("obsidian");
+var import_obsidian13 = require("obsidian");
 var GROUPS = [
   { level: "error", label: "\u9519\u8BEF", note: "\u5F15\u7528\u6216\u7ED3\u6784\u5DF2\u7ECF\u4E0D\u5BF9" },
   { level: "warning", label: "\u63D0\u9192", note: "\u6570\u636E\u6CA1\u574F\uFF0C\u4F46\u4F1A\u5F71\u54CD AI \u7406\u89E3" },
   { level: "hint", label: "\u5EFA\u8BAE", note: "\u6309\u9700\u5904\u7406\uFF0C\u901A\u5E38\u53EF\u4EE5\u5FFD\u7565" }
 ];
-var BoardDoctorModal = class extends import_obsidian11.Modal {
+var BoardDoctorModal = class extends import_obsidian13.Modal {
   constructor(app, issues, actions) {
     super(app);
     this.issues = issues;
@@ -2521,7 +3894,7 @@ var BoardDoctorModal = class extends import_obsidian11.Modal {
 };
 
 // src/ui/shortcutHelpModal.ts
-var import_obsidian12 = require("obsidian");
+var import_obsidian14 = require("obsidian");
 
 // src/board/shortcuts.ts
 var BOARD_SHORTCUTS = [
@@ -2563,7 +3936,7 @@ var BOARD_SHORTCUTS = [
 ];
 
 // src/ui/shortcutHelpModal.ts
-var ShortcutHelpModal = class extends import_obsidian12.Modal {
+var ShortcutHelpModal = class extends import_obsidian14.Modal {
   constructor(app) {
     super(app);
   }
@@ -2679,7 +4052,7 @@ function orderSiblings(ids, seqOut, nodeById) {
 }
 function buildOutline(nodes, edges, infoOf) {
   var _a, _b, _c, _d, _e;
-  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  const nodeById = new Map(nodes.map((node2) => [node2.id, node2]));
   const active = /* @__PURE__ */ new Set();
   let cycle = false;
   for (const edge of edges) {
@@ -2693,9 +4066,9 @@ function buildOutline(nodes, edges, infoOf) {
     active.add(edge.to);
   }
   const included = nodes.filter(
-    (node) => node.kind !== "group" || active.has(node.id)
+    (node2) => node2.kind !== "group" || active.has(node2.id)
   );
-  const includedIds = new Set(included.map((node) => node.id));
+  const includedIds = new Set(included.map((node2) => node2.id));
   const candidates = /* @__PURE__ */ new Map();
   const badges = /* @__PURE__ */ new Map();
   const seqOut = /* @__PURE__ */ new Map();
@@ -2742,12 +4115,12 @@ function buildOutline(nodes, edges, infoOf) {
   }
   const parentOf = /* @__PURE__ */ new Map();
   let hasHierarchy = false;
-  for (const node of included) {
-    const list = candidates.get(node.id);
+  for (const node2 of included) {
+    const list = candidates.get(node2.id);
     if (!list)
       continue;
     for (const candidate of list) {
-      if (candidate.parent === node.id) {
+      if (candidate.parent === node2.id) {
         cycle = true;
         continue;
       }
@@ -2756,7 +4129,7 @@ function buildOutline(nodes, edges, infoOf) {
       let guard = 0;
       while (current && guard < 1e4) {
         guard += 1;
-        if (current === node.id) {
+        if (current === node2.id) {
           loops = true;
           break;
         }
@@ -2766,7 +4139,7 @@ function buildOutline(nodes, edges, infoOf) {
         cycle = true;
         continue;
       }
-      parentOf.set(node.id, {
+      parentOf.set(node2.id, {
         parent: candidate.parent,
         relation: candidate.relation
       });
@@ -2775,22 +4148,22 @@ function buildOutline(nodes, edges, infoOf) {
     }
   }
   const childrenOf = /* @__PURE__ */ new Map();
-  for (const node of included) {
-    const parent = parentOf.get(node.id);
+  for (const node2 of included) {
+    const parent = parentOf.get(node2.id);
     if (!parent)
       continue;
     const list = (_e = childrenOf.get(parent.parent)) != null ? _e : [];
-    list.push(node.id);
+    list.push(node2.id);
     childrenOf.set(parent.parent, list);
   }
   const buildItem = (id) => {
     var _a2, _b2, _c2, _d2;
-    const node = nodeById.get(id);
-    const info = node ? infoOf(node) : { title: "\u672A\u547D\u540D" };
+    const node2 = nodeById.get(id);
+    const info = node2 ? infoOf(node2) : { title: "\u672A\u547D\u540D" };
     const kids = orderSiblings((_a2 = childrenOf.get(id)) != null ? _a2 : [], seqOut, nodeById);
     return {
       id,
-      kind: (_b2 = node == null ? void 0 : node.kind) != null ? _b2 : "text",
+      kind: (_b2 = node2 == null ? void 0 : node2.kind) != null ? _b2 : "text",
       title: info.title || "\u672A\u547D\u540D",
       snippet: info.snippet,
       relation: (_c2 = parentOf.get(id)) == null ? void 0 : _c2.relation,
@@ -2798,7 +4171,7 @@ function buildOutline(nodes, edges, infoOf) {
       children: kids.map(buildItem)
     };
   };
-  const roots = included.filter((node) => !parentOf.has(node.id)).map((node) => node.id);
+  const roots = included.filter((node2) => !parentOf.has(node2.id)).map((node2) => node2.id);
   return {
     roots: orderSiblings(roots, seqOut, nodeById).map(buildItem),
     nodeCount: included.length,
@@ -2901,8 +4274,8 @@ function buildExportMarkdown(input, format) {
 }
 
 // src/ui/exportModal.ts
-var import_obsidian13 = require("obsidian");
-var MarkdownExportModal = class extends import_obsidian13.Modal {
+var import_obsidian15 = require("obsidian");
+var MarkdownExportModal = class extends import_obsidian15.Modal {
   constructor(app, options) {
     super(app);
     this.options = options;
@@ -3002,19 +4375,19 @@ var MarkdownExportModal = class extends import_obsidian13.Modal {
   async copy() {
     try {
       await navigator.clipboard.writeText(this.markdown);
-      new import_obsidian13.Notice("\u5DF2\u590D\u5236 Markdown");
+      new import_obsidian15.Notice("\u5DF2\u590D\u5236 Markdown");
     } catch (error) {
-      new import_obsidian13.Notice("\u590D\u5236\u5931\u8D25\uFF0C\u8BF7\u5728\u9884\u89C8\u6846\u4E2D\u624B\u52A8\u9009\u4E2D\u590D\u5236");
+      new import_obsidian15.Notice("\u590D\u5236\u5931\u8D25\uFF0C\u8BF7\u5728\u9884\u89C8\u6846\u4E2D\u624B\u52A8\u9009\u4E2D\u590D\u5236");
     }
   }
   async save() {
     try {
       const path = await this.options.save(this.markdown);
-      new import_obsidian13.Notice(`\u5DF2\u4FDD\u5B58\u4E3A\u7B14\u8BB0\uFF1A${path}`);
+      new import_obsidian15.Notice(`\u5DF2\u4FDD\u5B58\u4E3A\u7B14\u8BB0\uFF1A${path}`);
       this.close();
     } catch (error) {
       console.error("[Volis] export note failed", error);
-      new import_obsidian13.Notice("\u4FDD\u5B58\u5931\u8D25\uFF0C\u8BF7\u68C0\u67E5\u767D\u677F\u6240\u5728\u76EE\u5F55\u7684\u5199\u5165\u6743\u9650");
+      new import_obsidian15.Notice("\u4FDD\u5B58\u5931\u8D25\uFF0C\u8BF7\u68C0\u67E5\u767D\u677F\u6240\u5728\u76EE\u5F55\u7684\u5199\u5165\u6743\u9650");
     }
   }
   onClose() {
@@ -3059,7 +4432,7 @@ var NODE_COLORS = [
   { name: "blue", label: "\u84DD", line: "#378add", bg: "#dfeafa" },
   { name: "purple", label: "\u7D2B", line: "#7f77dd", bg: "#e7e5f9" }
 ];
-var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
+var _BoardView = class _BoardView extends import_obsidian16.TextFileView {
   constructor(leaf, plugin) {
     super(leaf);
     this.plugin = plugin;
@@ -3372,9 +4745,9 @@ var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
         return;
       }
       if (drag.type === "resize") {
-        const node = this.nodeMap.get(drag.nodeId);
+        const node2 = this.nodeMap.get(drag.nodeId);
         const el = this.nodeEls.get(drag.nodeId);
-        if (!node || !el)
+        if (!node2 || !el)
           return;
         const dx2 = (evt.clientX - drag.startX) / this.scale;
         const dy2 = (evt.clientY - drag.startY) / this.scale;
@@ -3409,13 +4782,13 @@ var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
             y -= MIN_H - height;
           height = MIN_H;
         }
-        node.x = Math.round(x);
-        node.y = Math.round(y);
-        node.width = Math.round(width);
-        node.height = Math.round(height);
-        el.style.width = `${node.width}px`;
-        el.style.height = `${node.height}px`;
-        el.style.transform = `translate3d(${node.x}px, ${node.y}px, 0)`;
+        node2.x = Math.round(x);
+        node2.y = Math.round(y);
+        node2.width = Math.round(width);
+        node2.height = Math.round(height);
+        el.style.width = `${node2.width}px`;
+        el.style.height = `${node2.height}px`;
+        el.style.transform = `translate3d(${node2.x}px, ${node2.y}px, 0)`;
         this.renderEdges();
         this.updateFrame();
         return;
@@ -3433,13 +4806,13 @@ var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
         guides = snap.lines;
       }
       for (const [id, initial] of drag.initial) {
-        const node = this.nodeMap.get(id);
+        const node2 = this.nodeMap.get(id);
         const el = this.nodeEls.get(id);
-        if (!node || !el)
+        if (!node2 || !el)
           continue;
-        node.x = Math.round(initial.x + dx);
-        node.y = Math.round(initial.y + dy);
-        el.style.transform = `translate3d(${node.x}px, ${node.y}px, 0)`;
+        node2.x = Math.round(initial.x + dx);
+        node2.y = Math.round(initial.y + dy);
+        el.style.transform = `translate3d(${node2.x}px, ${node2.y}px, 0)`;
       }
       this.renderEdges();
       this.drawGuides(guides);
@@ -3483,9 +4856,9 @@ var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
       const distance = Math.hypot(evt.clientX - pendingClick.x, evt.clientY - pendingClick.y);
       if (distance > 6)
         return;
-      const node = this.nodeMap.get(pendingClick.id);
-      if (node)
-        this.activateNode(node);
+      const node2 = this.nodeMap.get(pendingClick.id);
+      if (node2)
+        this.activateNode(node2);
     };
     this.onDoubleClick = (evt) => {
       var _a, _b, _c, _d;
@@ -3506,19 +4879,19 @@ var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
       }
       const nodeId = (_d = (_c = this.lastDownNodeId) != null ? _c : (_b = target.closest(".volis-bnode")) == null ? void 0 : _b.getAttribute("data-node-id")) != null ? _d : null;
       if (nodeId) {
-        const node = this.nodeMap.get(nodeId);
-        if (!node)
+        const node2 = this.nodeMap.get(nodeId);
+        if (!node2)
           return;
-        if (node.type === "file") {
-          const file = this.app.vault.getAbstractFileByPath(node.file);
-          if (file instanceof import_obsidian14.TFile && file.extension.toLowerCase() === "md") {
-            void this.openEditor(node);
+        if (node2.type === "file") {
+          const file = this.app.vault.getAbstractFileByPath(node2.file);
+          if (file instanceof import_obsidian16.TFile && file.extension.toLowerCase() === "md") {
+            void this.openEditor(node2);
             return;
           }
-          this.openMedia(node.file);
+          this.openMedia(node2.file);
           return;
         }
-        void this.openEditor(node);
+        void this.openEditor(node2);
         return;
       }
       void this.createTextNode(this.toWorld(evt.clientX, evt.clientY));
@@ -3563,7 +4936,7 @@ var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
       const candidate = plain.trim();
       if (candidate) {
         const direct = this.app.vault.getAbstractFileByPath(candidate);
-        if (direct instanceof import_obsidian14.TFile) {
+        if (direct instanceof import_obsidian16.TFile) {
           await this.addFileNode(direct.path, point);
           return;
         }
@@ -3579,7 +4952,7 @@ var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
             const rel = basePath && full.startsWith(basePath) ? full.slice(basePath.length).replace(/^\//, "") : "";
             if (rel) {
               const inside = this.app.vault.getAbstractFileByPath(rel);
-              if (inside instanceof import_obsidian14.TFile) {
+              if (inside instanceof import_obsidian16.TFile) {
                 await this.addFileNode(inside.path, point);
                 handled = true;
                 continue;
@@ -3640,13 +5013,13 @@ var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
     });
     this.registerEvent(
       this.app.vault.on("modify", (file) => {
-        if (file instanceof import_obsidian14.TFile)
+        if (file instanceof import_obsidian16.TFile)
           void this.refreshNodesForFile(file.path, 80);
       })
     );
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
-        if (file instanceof import_obsidian14.TFile)
+        if (file instanceof import_obsidian16.TFile)
           this.handleFileRename(file.path, oldPath);
       })
     );
@@ -3663,23 +5036,23 @@ var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
       await new Promise((resolve) => window.setTimeout(resolve, delay));
     }
     const targets = this.nodes.filter(
-      (node) => (node.type === "file" || node.type === "card") && node.file === path
+      (node2) => (node2.type === "file" || node2.type === "card") && node2.file === path
     );
-    for (const node of targets) {
-      const el = this.nodeEls.get(node.id);
+    for (const node2 of targets) {
+      const el = this.nodeEls.get(node2.id);
       if (el && el.hasClass("volis-editing"))
         continue;
-      await this.renderNode(node);
+      await this.renderNode(node2);
     }
     this.scheduleOutlineRefresh();
   }
   handleFileRename(newPath, oldPath) {
     let touched = false;
-    for (const node of this.nodes) {
-      if (node.type === "file" && node.file === oldPath) {
-        node.file = newPath;
+    for (const node2 of this.nodes) {
+      if (node2.type === "file" && node2.file === oldPath) {
+        node2.file = newPath;
         touched = true;
-        void this.renderNode(node);
+        void this.renderNode(node2);
       }
     }
     if (touched)
@@ -3739,7 +5112,7 @@ var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
         cls: "volis-board-btn",
         attr: { "aria-label": label }
       });
-      (0, import_obsidian14.setIcon)(button, icon);
+      (0, import_obsidian16.setIcon)(button, icon);
       button.addEventListener("click", (evt) => {
         evt.preventDefault();
         evt.stopPropagation();
@@ -3846,7 +5219,7 @@ var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
         this.world.empty();
       this.updateHint();
       this.updateToolbar();
-      new import_obsidian14.Notice("\u767D\u677F\u6587\u4EF6\u65E0\u6CD5\u89E3\u6790\uFF0C\u5DF2\u4FDD\u62A4\u539F\u6587\u4EF6\u4E0D\u88AB\u8986\u76D6");
+      new import_obsidian16.Notice("\u767D\u677F\u6587\u4EF6\u65E0\u6CD5\u89E3\u6790\uFF0C\u5DF2\u4FDD\u62A4\u539F\u6587\u4EF6\u4E0D\u88AB\u8986\u76D6");
       return;
     }
     this.rawFallback = null;
@@ -3872,10 +5245,10 @@ var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
       this.selection.clear();
       this.nodes = (_a = data == null ? void 0 : data.nodes) != null ? _a : [];
       this.edges = (_b = data == null ? void 0 : data.edges) != null ? _b : [];
-      this.nodeMap = new Map(this.nodes.map((node) => [node.id, node]));
+      this.nodeMap = new Map(this.nodes.map((node2) => [node2.id, node2]));
       this.applyTransform();
       try {
-        await Promise.all(this.nodes.map((node) => this.renderNode(node)));
+        await Promise.all(this.nodes.map((node2) => this.renderNode(node2)));
       } catch (error) {
         console.error("[Volis] node render failed", error);
       }
@@ -3892,26 +5265,26 @@ var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
   selectedNodes() {
     const out = [];
     for (const id of this.selection) {
-      const node = this.nodeMap.get(id);
-      if (node)
-        out.push(node);
+      const node2 = this.nodeMap.get(id);
+      if (node2)
+        out.push(node2);
     }
     return out;
   }
-  isOpenable(node) {
-    return node.type === "card" || node.type === "file";
+  isOpenable(node2) {
+    return node2.type === "card" || node2.type === "file";
   }
-  openNode(node, mode) {
-    if (node.type === "text")
+  openNode(node2, mode) {
+    if (node2.type === "text")
       return;
-    if (node.type === "card") {
-      void this.openCardView(node, mode);
+    if (node2.type === "card") {
+      void this.openCardView(node2, mode);
       return;
     }
-    if (node.type === "group")
+    if (node2.type === "group")
       return;
-    const file = this.app.vault.getAbstractFileByPath(node.file);
-    if (!(file instanceof import_obsidian14.TFile))
+    const file = this.app.vault.getAbstractFileByPath(node2.file);
+    if (!(file instanceof import_obsidian16.TFile))
       return;
     const leaf = this.app.workspace.getLeaf(mode === "window" ? "window" : "tab");
     void leaf.openFile(file);
@@ -3922,15 +5295,15 @@ var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
    * embeds just that block — opening it shows exactly that card, and it stays
    * in sync because it is an embed, not a copy.
    */
-  async openCardView(node, mode) {
-    const source = this.app.vault.getAbstractFileByPath(node.file);
-    if (!(source instanceof import_obsidian14.TFile)) {
-      new import_obsidian14.Notice("\u6E90\u7B14\u8BB0\u4E0D\u5B58\u5728");
+  async openCardView(node2, mode) {
+    const source = this.app.vault.getAbstractFileByPath(node2.file);
+    if (!(source instanceof import_obsidian16.TFile)) {
+      new import_obsidian16.Notice("\u6E90\u7B14\u8BB0\u4E0D\u5B58\u5728");
       return;
     }
-    const baseName = source.basename;
-    const path = `${baseName}-${node.blockId}.md`;
-    const embed = `![[${node.file.replace(/\.md$/, "")}#^${node.blockId}]]
+    const baseName2 = source.basename;
+    const path = `${baseName2}-${node2.blockId}.md`;
+    const embed = `![[${node2.file.replace(/\.md$/, "")}#^${node2.blockId}]]
 `;
     try {
       let file = this.app.vault.getAbstractFileByPath(path);
@@ -3946,7 +5319,7 @@ var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
       await leaf.openFile(file, { state: { mode: "preview" } });
     } catch (error) {
       console.error("[Volis] open card view failed", error);
-      new import_obsidian14.Notice("\u6253\u5F00\u5361\u7247\u5931\u8D25");
+      new import_obsidian16.Notice("\u6253\u5F00\u5361\u7247\u5931\u8D25");
     }
   }
   /**
@@ -4043,7 +5416,7 @@ var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
       cls: "volis-swatch is-clear",
       attr: { "aria-label": "\u65E0\u989C\u8272" }
     });
-    (0, import_obsidian14.setIcon)(clear, "ban");
+    (0, import_obsidian16.setIcon)(clear, "ban");
     clear.addEventListener("click", () => {
       this.applyNodeColor(nodes, "");
       this.closeColorPop();
@@ -4093,7 +5466,7 @@ var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
         cls: "volis-tool-btn",
         attr: { "aria-label": action.label }
       });
-      (0, import_obsidian14.setIcon)(button, action.icon);
+      (0, import_obsidian16.setIcon)(button, action.icon);
       button.addEventListener("click", () => action.run());
     }
     const rect = this.root.getBoundingClientRect();
@@ -4110,14 +5483,14 @@ var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
     };
     document.addEventListener("mousedown", this.alignOutside, true);
   }
-  applyNodeGeometry(node) {
-    const el = this.nodeEls.get(node.id);
+  applyNodeGeometry(node2) {
+    const el = this.nodeEls.get(node2.id);
     if (!el)
       return;
-    el.style.transform = `translate3d(${node.x}px, ${node.y}px, 0)`;
-    el.style.width = `${node.width}px`;
-    if (node.height)
-      el.style.height = `${node.height}px`;
+    el.style.transform = `translate3d(${node2.x}px, ${node2.y}px, 0)`;
+    el.style.width = `${node2.width}px`;
+    if (node2.height)
+      el.style.height = `${node2.height}px`;
   }
   afterLayout() {
     this.renderEdges();
@@ -4126,44 +5499,44 @@ var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
     this.scheduleSave();
   }
   alignNodes(nodes, mode) {
-    const items = nodes.map((node) => ({ node, height: this.nodeHeight(node) }));
+    const items = nodes.map((node2) => ({ node: node2, height: this.nodeHeight(node2) }));
     if (items.length < 2)
       return;
     const minX = Math.min(...items.map((item) => item.node.x));
     const maxX = Math.max(...items.map((item) => item.node.x + item.node.width));
     const minY = Math.min(...items.map((item) => item.node.y));
     const maxY = Math.max(...items.map((item) => item.node.y + item.height));
-    for (const { node, height } of items) {
+    for (const { node: node2, height } of items) {
       switch (mode) {
         case "left":
-          node.x = Math.round(minX);
+          node2.x = Math.round(minX);
           break;
         case "right":
-          node.x = Math.round(maxX - node.width);
+          node2.x = Math.round(maxX - node2.width);
           break;
         case "hcenter":
-          node.x = Math.round((minX + maxX) / 2 - node.width / 2);
+          node2.x = Math.round((minX + maxX) / 2 - node2.width / 2);
           break;
         case "top":
-          node.y = Math.round(minY);
+          node2.y = Math.round(minY);
           break;
         case "bottom":
-          node.y = Math.round(maxY - height);
+          node2.y = Math.round(maxY - height);
           break;
         case "vcenter":
-          node.y = Math.round((minY + maxY) / 2 - height / 2);
+          node2.y = Math.round((minY + maxY) / 2 - height / 2);
           break;
         default:
           break;
       }
-      this.applyNodeGeometry(node);
+      this.applyNodeGeometry(node2);
     }
     this.afterLayout();
   }
   distributeNodes(nodes, axis) {
     if (nodes.length < 3)
       return;
-    const items = nodes.map((node) => ({ node, height: this.nodeHeight(node) }));
+    const items = nodes.map((node2) => ({ node: node2, height: this.nodeHeight(node2) }));
     if (axis === "h") {
       items.sort((a, b) => a.node.x - b.node.x);
       const first = items[0];
@@ -4204,15 +5577,15 @@ var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
     return (_b = (_a = nodes[0]) == null ? void 0 : _a.color) != null ? _b : null;
   }
   applyNodeColor(nodes, color) {
-    const ids = new Set(nodes.map((node) => node.id));
-    for (const node of this.nodes) {
-      if (!ids.has(node.id))
+    const ids = new Set(nodes.map((node2) => node2.id));
+    for (const node2 of this.nodes) {
+      if (!ids.has(node2.id))
         continue;
       if (color)
-        node.color = color;
+        node2.color = color;
       else
-        delete node.color;
-      const el = this.nodeEls.get(node.id);
+        delete node2.color;
+      const el = this.nodeEls.get(node2.id);
       if (!el)
         continue;
       this.paintColor(el, color || void 0);
@@ -4220,22 +5593,22 @@ var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
     this.pushHistory();
     this.scheduleSave();
   }
-  showMoreMenu(node, evt) {
-    const menu = new import_obsidian14.Menu();
-    if (node.type === "text") {
+  showMoreMenu(node2, evt) {
+    const menu = new import_obsidian16.Menu();
+    if (node2.type === "text") {
       menu.addItem(
         (item) => item.setTitle("\u8F6C\u4E3A\u5361\u7247\u7B14\u8BB0").setIcon("list").onClick(() => {
-          void this.convertToCard(node);
+          void this.convertToCard(node2);
         })
       );
     }
-    if (node.type === "text" || node.type === "card") {
+    if (node2.type === "text" || node2.type === "card") {
       menu.addItem(
         (item) => item.setTitle("\u8F6C\u4E3A\u72EC\u7ACB\u7B14\u8BB0").setIcon("file-text").onClick(() => {
-          if (node.type === "text")
-            void this.convertToNote(node);
+          if (node2.type === "text")
+            void this.convertToNote(node2);
           else
-            void this.convertCardToNote(node);
+            void this.convertCardToNote(node2);
         })
       );
     }
@@ -4247,11 +5620,11 @@ var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
     const cleaned = first.replace(/#[\p{L}\p{N}_/-]+/gu, " ").replace(/[\\/:*?"<>|]/g, " ").replace(/\s+/g, " ").trim();
     return cleaned.slice(0, 15).trim() || "\u672A\u547D\u540D";
   }
-  async convertCardToNote(node) {
+  async convertCardToNote(node2) {
     var _a, _b;
-    if (node.type !== "card")
+    if (node2.type !== "card")
       return;
-    const current = this.nodeMap.get(node.id);
+    const current = this.nodeMap.get(node2.id);
     if (!current || current.type !== "card")
       return;
     const meta = await readCard(this.app, {
@@ -4260,12 +5633,12 @@ var _BoardView = class _BoardView extends import_obsidian14.TextFileView {
       linkpath: ""
     });
     if (meta.stale) {
-      new import_obsidian14.Notice("\u5361\u7247\u5DF2\u4E0D\u5B58\u5728");
+      new import_obsidian16.Notice("\u5361\u7247\u5DF2\u4E0D\u5B58\u5728");
       return;
     }
     const text = meta.editable.trim();
     if (!text) {
-      new import_obsidian14.Notice("\u5361\u7247\u5185\u5BB9\u4E3A\u7A7A");
+      new import_obsidian16.Notice("\u5361\u7247\u5185\u5BB9\u4E3A\u7A7A");
       return;
     }
     const title = this.deriveTitle(text);
@@ -4279,7 +5652,7 @@ ${text}
     const folder = (_a = this.plugin.settings.boardFolder) != null ? _a : "";
     const file = await createNoteFromText(this.app, folder, content, title);
     if (!file) {
-      new import_obsidian14.Notice("\u8F6C\u6362\u5931\u8D25\uFF1A\u65E0\u6CD5\u521B\u5EFA\u7B14\u8BB0");
+      new import_obsidian16.Notice("\u8F6C\u6362\u5931\u8D25\uFF1A\u65E0\u6CD5\u521B\u5EFA\u7B14\u8BB0");
       return;
     }
     const next = {
@@ -4301,21 +5674,21 @@ ${text}
     this.pushHistory();
     this.scheduleSave();
     this.updateToolbar();
-    new import_obsidian14.Notice("\u5DF2\u8F6C\u4E3A\u72EC\u7ACB\u7B14\u8BB0\uFF0C\u6E90\u5361\u7247\u4FDD\u7559");
+    new import_obsidian16.Notice("\u5DF2\u8F6C\u4E3A\u72EC\u7ACB\u7B14\u8BB0\uFF0C\u6E90\u5361\u7247\u4FDD\u7559");
   }
-  async convertToCard(node) {
-    const current = this.nodeMap.get(node.id);
+  async convertToCard(node2) {
+    const current = this.nodeMap.get(node2.id);
     if (!current || current.type !== "text")
       return;
     const text = current.text.trim();
     if (!text) {
-      new import_obsidian14.Notice("\u5185\u5BB9\u4E3A\u7A7A\uFF0C\u65E0\u6CD5\u8F6C\u6362");
+      new import_obsidian16.Notice("\u5185\u5BB9\u4E3A\u7A7A\uFF0C\u65E0\u6CD5\u8F6C\u6362");
       return;
     }
     const folder = await resolveCardFolder(this.app, this.plugin.settings.cardFolder);
     const result = await appendCard(this.app, folder, text);
     if (!result) {
-      new import_obsidian14.Notice("\u8F6C\u6362\u5931\u8D25\uFF1A\u5199\u5165\u5361\u7247\u6587\u4EF6\u540E\u6821\u9A8C\u672A\u901A\u8FC7");
+      new import_obsidian16.Notice("\u8F6C\u6362\u5931\u8D25\uFF1A\u5199\u5165\u5361\u7247\u6587\u4EF6\u540E\u6821\u9A8C\u672A\u901A\u8FC7");
       return;
     }
     const { x, y, width, height } = current;
@@ -4325,7 +5698,7 @@ ${text}
     this.detachNodeElement(current.id);
     const added = await this.addCardNodeAt(result.file, result.blockId, x, y, width, height);
     if (!added) {
-      new import_obsidian14.Notice("\u5361\u7247\u5DF2\u5199\u5165\u7B14\u8BB0\uFF0C\u4F46\u672A\u80FD\u6DFB\u52A0\u5230\u767D\u677F");
+      new import_obsidian16.Notice("\u5361\u7247\u5DF2\u5199\u5165\u7B14\u8BB0\uFF0C\u4F46\u672A\u80FD\u6DFB\u52A0\u5230\u767D\u677F");
       this.scheduleSave();
       return;
     }
@@ -4335,10 +5708,10 @@ ${text}
     this.updateHint();
     this.pushHistory();
     this.updateToolbar();
-    new import_obsidian14.Notice("\u5DF2\u8F6C\u4E3A\u5361\u7247\u7B14\u8BB0");
+    new import_obsidian16.Notice("\u5DF2\u8F6C\u4E3A\u5361\u7247\u7B14\u8BB0");
   }
   async addCardNodeAt(file, blockId, x, y, width, height) {
-    const node = {
+    const node2 = {
       id: createId(),
       type: "card",
       file,
@@ -4348,25 +5721,25 @@ ${text}
       width,
       height
     };
-    this.nodes.push(node);
-    this.nodeMap.set(node.id, node);
-    await this.renderNode(node);
+    this.nodes.push(node2);
+    this.nodeMap.set(node2.id, node2);
+    await this.renderNode(node2);
     this.scheduleSave();
-    return node;
+    return node2;
   }
-  async convertToNote(node) {
+  async convertToNote(node2) {
     var _a, _b;
-    const current = this.nodeMap.get(node.id);
+    const current = this.nodeMap.get(node2.id);
     if (!current || current.type !== "text")
       return;
     const text = current.text.trim();
     if (!text) {
-      new import_obsidian14.Notice("\u5185\u5BB9\u4E3A\u7A7A\uFF0C\u65E0\u6CD5\u8F6C\u6362");
+      new import_obsidian16.Notice("\u5185\u5BB9\u4E3A\u7A7A\uFF0C\u65E0\u6CD5\u8F6C\u6362");
       return;
     }
     const file = await createNoteFromText(this.app, (_a = this.plugin.settings.boardFolder) != null ? _a : "", text);
     if (!file) {
-      new import_obsidian14.Notice("\u8F6C\u6362\u5931\u8D25\uFF1A\u65E0\u6CD5\u521B\u5EFA\u7B14\u8BB0\u6587\u4EF6");
+      new import_obsidian16.Notice("\u8F6C\u6362\u5931\u8D25\uFF1A\u65E0\u6CD5\u521B\u5EFA\u7B14\u8BB0\u6587\u4EF6");
       return;
     }
     const next = {
@@ -4388,7 +5761,7 @@ ${text}
     this.pushHistory();
     this.scheduleSave();
     this.updateToolbar();
-    new import_obsidian14.Notice("\u5DF2\u8F6C\u4E3A\u72EC\u7ACB\u7B14\u8BB0");
+    new import_obsidian16.Notice("\u5DF2\u8F6C\u4E3A\u72EC\u7ACB\u7B14\u8BB0");
   }
   buildToolbarActions() {
     const single = (nodes) => nodes.length === 1;
@@ -4469,14 +5842,14 @@ ${text}
     try {
       await this.app.fileManager.renameFile(file, `${prefix}${name}.volis`);
     } catch (error) {
-      new import_obsidian14.Notice("\u91CD\u547D\u540D\u5931\u8D25\uFF1A\u540D\u79F0\u53EF\u80FD\u91CD\u590D\u6216\u5305\u542B\u975E\u6CD5\u5B57\u7B26");
+      new import_obsidian16.Notice("\u91CD\u547D\u540D\u5931\u8D25\uFF1A\u540D\u79F0\u53EF\u80FD\u91CD\u590D\u6216\u5305\u542B\u975E\u6CD5\u5B57\u7B26");
     }
   }
   repaintColors() {
-    for (const node of this.nodes) {
-      const el = this.nodeEls.get(node.id);
+    for (const node2 of this.nodes) {
+      const el = this.nodeEls.get(node2.id);
       if (el)
-        this.paintColor(el, node.color);
+        this.paintColor(el, node2.color);
     }
   }
   hasEditingNode() {
@@ -4498,12 +5871,12 @@ ${text}
     let minY = viewTop;
     let maxX = viewRight;
     let maxY = viewBottom;
-    for (const node of this.nodes) {
-      const height = this.nodeHeight(node);
-      minX = Math.min(minX, node.x);
-      minY = Math.min(minY, node.y);
-      maxX = Math.max(maxX, node.x + node.width);
-      maxY = Math.max(maxY, node.y + height);
+    for (const node2 of this.nodes) {
+      const height = this.nodeHeight(node2);
+      minX = Math.min(minX, node2.x);
+      minY = Math.min(minY, node2.y);
+      maxX = Math.max(maxX, node2.x + node2.width);
+      maxY = Math.max(maxY, node2.y + height);
     }
     const pad2 = 60;
     let x = minX - pad2;
@@ -4540,14 +5913,14 @@ ${text}
     while (svg.firstChild)
       svg.removeChild(svg.firstChild);
     svg.setAttribute("viewBox", `${world.x} ${world.y} ${world.w} ${world.h}`);
-    for (const node of this.nodes) {
+    for (const node2 of this.nodes) {
       const rect = this.svgNode("rect");
-      rect.setAttribute("x", String(node.x));
-      rect.setAttribute("y", String(node.y));
-      rect.setAttribute("width", String(node.width));
-      rect.setAttribute("height", String(this.nodeHeight(node)));
-      rect.setAttribute("rx", node.type === "group" ? "8" : "4");
-      rect.setAttribute("class", `volis-mini-node is-${node.type}`);
+      rect.setAttribute("x", String(node2.x));
+      rect.setAttribute("y", String(node2.y));
+      rect.setAttribute("width", String(node2.width));
+      rect.setAttribute("height", String(this.nodeHeight(node2)));
+      rect.setAttribute("rx", node2.type === "group" ? "8" : "4");
+      rect.setAttribute("class", `volis-mini-node is-${node2.type}`);
       svg.appendChild(rect);
     }
     const view = this.svgNode("rect");
@@ -4607,7 +5980,7 @@ ${text}
           attr: { "aria-label": action.label }
         });
         button.disabled = action.enabled ? !action.enabled(nodes) : false;
-        (0, import_obsidian14.setIcon)(button, action.icon);
+        (0, import_obsidian16.setIcon)(button, action.icon);
         button.addEventListener("click", (evt) => {
           evt.preventDefault();
           evt.stopPropagation();
@@ -4647,13 +6020,13 @@ ${text}
     let minY = Infinity;
     let maxX = -Infinity;
     let maxY = -Infinity;
-    for (const node of nodes) {
-      const el = this.nodeEls.get(node.id);
+    for (const node2 of nodes) {
+      const el = this.nodeEls.get(node2.id);
       const height = (_a = el == null ? void 0 : el.offsetHeight) != null ? _a : 100;
-      minX = Math.min(minX, node.x);
-      minY = Math.min(minY, node.y);
-      maxX = Math.max(maxX, node.x + node.width);
-      maxY = Math.max(maxY, node.y + height);
+      minX = Math.min(minX, node2.x);
+      minY = Math.min(minY, node2.y);
+      maxX = Math.max(maxX, node2.x + node2.width);
+      maxY = Math.max(maxY, node2.y + height);
     }
     if (!Number.isFinite(minX))
       return null;
@@ -4682,7 +6055,7 @@ ${text}
     if (this.selection.size === 0)
       return;
     const ids = new Set(this.selection);
-    this.clipboard = this.nodes.filter((node) => ids.has(node.id)).map((node) => ({ ...node }));
+    this.clipboard = this.nodes.filter((node2) => ids.has(node2.id)).map((node2) => ({ ...node2 }));
     this.clipboardEdges = this.edges.filter((edge) => ids.has(edge.from) && ids.has(edge.to)).map((edge) => ({ ...edge }));
   }
   async pasteClipboard() {
@@ -4693,12 +6066,12 @@ ${text}
       let minY = Infinity;
       let maxX = -Infinity;
       let maxY = -Infinity;
-      for (const node of nodes) {
-        const height = this.nodeHeight(node);
-        minX = Math.min(minX, node.x);
-        minY = Math.min(minY, node.y);
-        maxX = Math.max(maxX, node.x + node.width);
-        maxY = Math.max(maxY, node.y + height);
+      for (const node2 of nodes) {
+        const height = this.nodeHeight(node2);
+        minX = Math.min(minX, node2.x);
+        minY = Math.min(minY, node2.y);
+        maxX = Math.max(maxX, node2.x + node2.width);
+        maxY = Math.max(maxY, node2.y + height);
       }
       return { minX, minY, maxX, maxY };
     };
@@ -4710,14 +6083,14 @@ ${text}
       dy = this.lastPointerWorld.y - (box.minY + box.maxY) / 2;
     }
     const idMap = /* @__PURE__ */ new Map();
-    const copies = this.clipboard.map((node) => {
+    const copies = this.clipboard.map((node2) => {
       const id = createId();
-      idMap.set(node.id, id);
+      idMap.set(node2.id, id);
       return {
-        ...node,
+        ...node2,
         id,
-        x: Math.round(node.x + dx),
-        y: Math.round(node.y + dy)
+        x: Math.round(node2.x + dx),
+        y: Math.round(node2.y + dy)
       };
     });
     const edges = this.clipboardEdges.map((edge) => {
@@ -4730,18 +6103,18 @@ ${text}
       };
     }).filter((edge) => edge.from && edge.to);
     this.nodes.push(...copies);
-    for (const node of copies)
-      this.nodeMap.set(node.id, node);
+    for (const node2 of copies)
+      this.nodeMap.set(node2.id, node2);
     this.edges.push(...edges);
     try {
-      await Promise.all(copies.map((node) => this.renderNode(node)));
+      await Promise.all(copies.map((node2) => this.renderNode(node2)));
     } catch (error) {
       console.error("[Volis] paste render failed", error);
     }
     this.renderEdges();
     this.selection.clear();
-    for (const node of copies)
-      this.selection.add(node.id);
+    for (const node2 of copies)
+      this.selection.add(node2.id);
     this.paintSelection();
     this.updateHint();
     this.pushHistory();
@@ -4749,7 +6122,7 @@ ${text}
   }
   async undo() {
     if (this.hasEditingNode()) {
-      new import_obsidian14.Notice("\u8BF7\u5148\u7ED3\u675F\u7F16\u8F91\u518D\u64A4\u9500");
+      new import_obsidian16.Notice("\u8BF7\u5148\u7ED3\u675F\u7F16\u8F91\u518D\u64A4\u9500");
       return;
     }
     if (this.historyIndex <= 0)
@@ -4760,7 +6133,7 @@ ${text}
   }
   async redo() {
     if (this.hasEditingNode()) {
-      new import_obsidian14.Notice("\u8BF7\u5148\u7ED3\u675F\u7F16\u8F91\u518D\u91CD\u505A");
+      new import_obsidian16.Notice("\u8BF7\u5148\u7ED3\u675F\u7F16\u8F91\u518D\u91CD\u505A");
       return;
     }
     if (this.historyIndex >= this.history.length - 1)
@@ -4788,7 +6161,7 @@ ${text}
     this.ensureLayers();
     this.selection.clear();
     this.staleIds.clear();
-    const nextIds = new Set(next.map((node) => node.id));
+    const nextIds = new Set(next.map((node2) => node2.id));
     for (const [id, el] of Array.from(this.nodeEls.entries())) {
       if (nextIds.has(id))
         continue;
@@ -4799,19 +6172,19 @@ ${text}
     this.closeEdgeLabelEditor(false);
     this.nodes = next;
     this.edges = nextEdges;
-    this.nodeMap = new Map(next.map((node) => [node.id, node]));
+    this.nodeMap = new Map(next.map((node2) => [node2.id, node2]));
     const rebuilds = [];
-    for (const node of next) {
-      const el = this.nodeEls.get(node.id);
-      const previous = previousMap.get(node.id);
-      if (!el || !previous || this.nodeContentChanged(previous, node)) {
-        rebuilds.push(this.renderNode(node));
+    for (const node2 of next) {
+      const el = this.nodeEls.get(node2.id);
+      const previous = previousMap.get(node2.id);
+      if (!el || !previous || this.nodeContentChanged(previous, node2)) {
+        rebuilds.push(this.renderNode(node2));
         continue;
       }
-      el.style.transform = `translate3d(${node.x}px, ${node.y}px, 0)`;
-      el.style.width = `${node.width}px`;
-      if (node.height)
-        el.style.height = `${node.height}px`;
+      el.style.transform = `translate3d(${node2.x}px, ${node2.y}px, 0)`;
+      el.style.width = `${node2.width}px`;
+      if (node2.height)
+        el.style.height = `${node2.height}px`;
       else
         el.style.removeProperty("height");
     }
@@ -4849,7 +6222,7 @@ ${text}
     }
     if (ids.size === 0)
       return;
-    this.nodes = this.nodes.filter((node) => !ids.has(node.id));
+    this.nodes = this.nodes.filter((node2) => !ids.has(node2.id));
     for (const id of ids) {
       const el = this.nodeEls.get(id);
       if (el)
@@ -4895,25 +6268,25 @@ ${text}
   svgNode(tag) {
     return document.createElementNS("http://www.w3.org/2000/svg", tag);
   }
-  nodeHeight(node) {
+  nodeHeight(node2) {
     var _a, _b, _c;
-    return (_c = (_b = (_a = this.nodeEls.get(node.id)) == null ? void 0 : _a.offsetHeight) != null ? _b : node.height) != null ? _c : 100;
+    return (_c = (_b = (_a = this.nodeEls.get(node2.id)) == null ? void 0 : _a.offsetHeight) != null ? _b : node2.height) != null ? _c : 100;
   }
   /** Where the line leaves a node's box, heading towards `towards`. */
-  borderPoint(node, towards) {
+  borderPoint(node2, towards) {
     return this.borderPointAt(
-      node,
+      node2,
       towards.x + towards.width / 2,
       towards.y + this.nodeHeight(towards) / 2
     );
   }
-  borderPointAt(node, tx, ty) {
-    const cx = node.x + node.width / 2;
-    const cy = node.y + this.nodeHeight(node) / 2;
+  borderPointAt(node2, tx, ty) {
+    const cx = node2.x + node2.width / 2;
+    const cy = node2.y + this.nodeHeight(node2) / 2;
     const dx = tx - cx;
     const dy = ty - cy;
-    const halfW = node.width / 2;
-    const halfH = this.nodeHeight(node) / 2;
+    const halfW = node2.width / 2;
+    const halfH = this.nodeHeight(node2) / 2;
     const scaleX = Math.abs(dx) < 1e-3 ? Number.POSITIVE_INFINITY : halfW / Math.abs(dx);
     const scaleY = Math.abs(dy) < 1e-3 ? Number.POSITIVE_INFINITY : halfH / Math.abs(dy);
     const scale = Math.min(scaleX, scaleY);
@@ -4921,18 +6294,18 @@ ${text}
       return { x: cx, y: cy };
     return { x: cx + dx * scale, y: cy + dy * scale };
   }
-  portPoint(node, side, ratio = 0.5) {
-    const height = this.nodeHeight(node);
+  portPoint(node2, side, ratio = 0.5) {
+    const height = this.nodeHeight(node2);
     const clamped = Math.min(0.9, Math.max(0.1, ratio));
     switch (side) {
       case "top":
-        return { x: node.x + node.width * clamped, y: node.y };
+        return { x: node2.x + node2.width * clamped, y: node2.y };
       case "bottom":
-        return { x: node.x + node.width * clamped, y: node.y + height };
+        return { x: node2.x + node2.width * clamped, y: node2.y + height };
       case "left":
-        return { x: node.x, y: node.y + height * clamped };
+        return { x: node2.x, y: node2.y + height * clamped };
       default:
-        return { x: node.x + node.width, y: node.y + height * clamped };
+        return { x: node2.x + node2.width, y: node2.y + height * clamped };
     }
   }
   sideNormal(side) {
@@ -4995,13 +6368,13 @@ ${text}
   edgeLabelT(edge) {
     return typeof edge.labelAt === "number" ? clampLabelT(edge.labelAt) : 0.5;
   }
-  nearestSide(node, x, y) {
-    const height = this.nodeHeight(node);
-    const cx = node.x + node.width / 2;
-    const cy = node.y + height / 2;
+  nearestSide(node2, x, y) {
+    const height = this.nodeHeight(node2);
+    const cx = node2.x + node2.width / 2;
+    const cy = node2.y + height / 2;
     const dx = x - cx;
     const dy = y - cy;
-    const nx = Math.abs(dx) / Math.max(1, node.width / 2);
+    const nx = Math.abs(dx) / Math.max(1, node2.width / 2);
     const ny = Math.abs(dy) / Math.max(1, height / 2);
     if (nx >= ny)
       return dx >= 0 ? "right" : "left";
@@ -5037,12 +6410,12 @@ ${text}
     let minY = Infinity;
     let maxX = -Infinity;
     let maxY = -Infinity;
-    for (const node of this.nodes) {
-      const height = this.nodeHeight(node);
-      minX = Math.min(minX, node.x);
-      minY = Math.min(minY, node.y);
-      maxX = Math.max(maxX, node.x + node.width);
-      maxY = Math.max(maxY, node.y + height);
+    for (const node2 of this.nodes) {
+      const height = this.nodeHeight(node2);
+      minX = Math.min(minX, node2.x);
+      minY = Math.min(minY, node2.y);
+      maxX = Math.max(maxX, node2.x + node2.width);
+      maxY = Math.max(maxY, node2.y + height);
     }
     if (!Number.isFinite(minX)) {
       minX = 0;
@@ -5171,17 +6544,17 @@ ${text}
   }
   /** Small icon sitting on the top border, so the node type stays readable
    *  even when the content is scaled down to an illegible blur. */
-  attachTypeBadge(el, node) {
+  attachTypeBadge(el, node2) {
     var _a;
-    const ext = node.type === "file" ? ((_a = node.file.split(".").pop()) != null ? _a : "").toLowerCase() : "";
+    const ext = node2.type === "file" ? ((_a = node2.file.split(".").pop()) != null ? _a : "").toLowerCase() : "";
     let kind = "file";
     let icon = "file";
-    if (node.type === "card") {
+    if (node2.type === "card") {
       kind = "card";
       icon = "quote";
-    } else if (node.type === "text") {
-      kind = node.sticky ? "sticky" : "text";
-      icon = node.sticky ? "sticky-note" : "type";
+    } else if (node2.type === "text") {
+      kind = node2.sticky ? "sticky" : "text";
+      icon = node2.sticky ? "sticky-note" : "type";
     } else if (ext === "md") {
       kind = "note";
       icon = "file-text";
@@ -5194,17 +6567,17 @@ ${text}
     }
     const badge = el.createDiv({ cls: "volis-type-badge" });
     badge.dataset.kind = kind;
-    (0, import_obsidian14.setIcon)(badge, icon);
+    (0, import_obsidian16.setIcon)(badge, icon);
   }
-  renderGroupBody(el, node) {
+  renderGroupBody(el, node2) {
     var _a, _b;
     el.addClass("is-group");
-    this.nodeText.set(node.id, (_a = node.label) != null ? _a : "");
+    this.nodeText.set(node2.id, (_a = node2.label) != null ? _a : "");
     const input = document.createElement("input");
     input.className = "volis-group-label";
     input.type = "text";
     input.spellcheck = false;
-    input.value = (_b = node.label) != null ? _b : "\u5206\u7EC4";
+    input.value = (_b = node2.label) != null ? _b : "\u5206\u7EC4";
     input.addEventListener("pointerdown", (evt) => evt.stopPropagation());
     input.addEventListener("dblclick", (evt) => evt.stopPropagation());
     input.addEventListener("focus", () => input.select());
@@ -5213,8 +6586,8 @@ ${text}
       if (committing)
         return;
       committing = true;
-      node.label = input.value.trim() || "\u5206\u7EC4";
-      input.value = node.label;
+      node2.label = input.value.trim() || "\u5206\u7EC4";
+      input.value = node2.label;
       this.pushHistory();
       this.scheduleSave();
       committing = false;
@@ -5231,7 +6604,7 @@ ${text}
       }
       if (evt.key === "Escape") {
         evt.preventDefault();
-        input.value = (_a2 = node.label) != null ? _a2 : "\u5206\u7EC4";
+        input.value = (_a2 = node2.label) != null ? _a2 : "\u5206\u7EC4";
         input.blur();
       }
     });
@@ -5245,12 +6618,12 @@ ${text}
     const top = group.y;
     const right = group.x + group.width;
     const bottom = group.y + ((_a = group.height) != null ? _a : 0);
-    return this.nodes.filter((node) => {
-      if (node.id === group.id || node.type === "group")
+    return this.nodes.filter((node2) => {
+      if (node2.id === group.id || node2.type === "group")
         return false;
-      const height = this.nodeHeight(node);
-      const cx = node.x + node.width / 2;
-      const cy = node.y + height / 2;
+      const height = this.nodeHeight(node2);
+      const cx = node2.x + node2.width / 2;
+      const cy = node2.y + height / 2;
       return cx >= left && cx <= right && cy >= top && cy <= bottom;
     });
   }
@@ -5262,23 +6635,23 @@ ${text}
   expandGroups(nodes) {
     const out = [];
     const seen = /* @__PURE__ */ new Set();
-    const push = (node) => {
-      if (seen.has(node.id))
+    const push = (node2) => {
+      if (seen.has(node2.id))
         return;
-      seen.add(node.id);
-      out.push(node);
+      seen.add(node2.id);
+      out.push(node2);
     };
-    for (const node of nodes) {
-      push(node);
-      if (node.type !== "group")
+    for (const node2 of nodes) {
+      push(node2);
+      if (node2.type !== "group")
         continue;
-      for (const member of this.groupMembers(node))
+      for (const member of this.groupMembers(node2))
         push(member);
     }
     return out;
   }
   async createGroupFromSelection() {
-    const nodes = this.selectedNodes().filter((node) => node.type !== "group");
+    const nodes = this.selectedNodes().filter((node2) => node2.type !== "group");
     if (nodes.length === 0)
       return;
     const box = this.selectionBox(nodes);
@@ -5304,81 +6677,81 @@ ${text}
     this.pushHistory();
     this.scheduleSave();
   }
-  async renderNode(node) {
-    const existing = this.nodeEls.get(node.id);
+  async renderNode(node2) {
+    const existing = this.nodeEls.get(node2.id);
     if (existing && existing.hasClass("volis-editing"))
       return existing;
-    this.staleIds.delete(node.id);
+    this.staleIds.delete(node2.id);
     const el = this.world.createDiv({ cls: "volis-bnode" });
-    el.dataset.nodeId = node.id;
-    el.style.width = `${node.width}px`;
-    if (node.height)
-      el.style.height = `${node.height}px`;
-    el.style.transform = `translate3d(${node.x}px, ${node.y}px, 0)`;
-    el.toggleClass("is-sticky", node.type === "text" && Boolean(node.sticky));
-    this.paintColor(el, node.color);
+    el.dataset.nodeId = node2.id;
+    el.style.width = `${node2.width}px`;
+    if (node2.height)
+      el.style.height = `${node2.height}px`;
+    el.style.transform = `translate3d(${node2.x}px, ${node2.y}px, 0)`;
+    el.toggleClass("is-sticky", node2.type === "text" && Boolean(node2.sticky));
+    this.paintColor(el, node2.color);
     for (const dir of ["n", "s", "e", "w", "ne", "nw", "se", "sw"]) {
       const handle = el.createDiv({ cls: "volis-resize-handle" });
       handle.dataset.dir = dir;
     }
-    if (node.type !== "group") {
+    if (node2.type !== "group") {
       for (const side of ["top", "right", "bottom", "left"]) {
         const port = el.createDiv({ cls: `volis-port is-${side}` });
         port.dataset.port = side;
       }
-      this.attachTypeBadge(el, node);
+      this.attachTypeBadge(el, node2);
     }
-    if (node.type === "group") {
-      this.renderGroupBody(el, node);
-    } else if (node.type === "text") {
-      await this.renderTextBody(el, node);
-    } else if (node.type === "card") {
-      await this.renderCardBody(el, node);
+    if (node2.type === "group") {
+      this.renderGroupBody(el, node2);
+    } else if (node2.type === "text") {
+      await this.renderTextBody(el, node2);
+    } else if (node2.type === "card") {
+      await this.renderCardBody(el, node2);
     } else {
-      await this.renderFileBody(el, node);
+      await this.renderFileBody(el, node2);
     }
-    const previous = this.nodeEls.get(node.id);
-    if (node.type === "group" && this.frameEl) {
+    const previous = this.nodeEls.get(node2.id);
+    if (node2.type === "group" && this.frameEl) {
       this.world.insertBefore(el, this.frameEl);
     }
-    this.nodeEls.set(node.id, el);
+    this.nodeEls.set(node2.id, el);
     if (previous && previous !== el)
       previous.remove();
-    if (this.aiPanel && this.aiNumberMap.size >= 2 && this.aiNumberMap.has(node.id)) {
+    if (this.aiPanel && this.aiNumberMap.size >= 2 && this.aiNumberMap.has(node2.id)) {
       const badge = el.createDiv({
         cls: "volis-ai-node-number",
-        text: this.aiNumberMap.get(node.id)
+        text: this.aiNumberMap.get(node2.id)
       });
       badge.setAttribute("aria-hidden", "true");
-      this.aiBadges.set(node.id, badge);
+      this.aiBadges.set(node2.id, badge);
     }
     this.updateToolbar();
     return el;
   }
-  async renderTextBody(el, node) {
+  async renderTextBody(el, node2) {
     const body = el.createDiv({ cls: "volis-bnode-body" });
-    this.nodeText.set(node.id, node.text);
-    if (!node.text.trim())
+    this.nodeText.set(node2.id, node2.text);
+    if (!node2.text.trim())
       return;
-    await import_obsidian14.MarkdownRenderer.render(this.app, node.text, body, "", this);
+    await import_obsidian16.MarkdownRenderer.render(this.app, node2.text, body, "", this);
     this.decorateNumericTags(body);
   }
-  async renderCardBody(el, node) {
+  async renderCardBody(el, node2) {
     el.addClass("is-card");
     const meta = await readCard(this.app, {
-      file: node.file,
-      blockId: node.blockId,
+      file: node2.file,
+      blockId: node2.blockId,
       linkpath: ""
     });
     const body = el.createDiv({ cls: "volis-bnode-body" });
     if (meta.stale) {
-      this.staleIds.add(node.id);
+      this.staleIds.add(node2.id);
       body.createDiv({ cls: "volis-bnode-placeholder", text: "\u5361\u7247\u5DF2\u5220\u9664" });
       return;
     }
-    this.nodeText.set(node.id, meta.editable);
-    this.nodeMeta.set(node.id, { date: meta.date, time: meta.time, tags: meta.tags });
-    await import_obsidian14.MarkdownRenderer.render(this.app, normalizeTags(meta.body), body, node.file, this);
+    this.nodeText.set(node2.id, meta.editable);
+    this.nodeMeta.set(node2.id, { date: meta.date, time: meta.time, tags: meta.tags });
+    await import_obsidian16.MarkdownRenderer.render(this.app, normalizeTags(meta.body), body, node2.file, this);
     this.decorateNumericTags(body);
     const parts = [];
     if (meta.date)
@@ -5408,15 +6781,15 @@ ${text}
     this.noteTextCache.set(file.path, { mtime: file.stat.mtime, text });
     return text;
   }
-  async renderFileBody(el, node) {
+  async renderFileBody(el, node2) {
     el.addClass("is-file");
-    const file = this.app.vault.getAbstractFileByPath(node.file);
-    if (file instanceof import_obsidian14.TFile) {
+    const file = this.app.vault.getAbstractFileByPath(node2.file);
+    if (file instanceof import_obsidian16.TFile) {
       const isNote = file.extension.toLowerCase() === "md";
-      this.nodeText.set(node.id, isNote ? await this.readNoteText(file) : file.basename);
+      this.nodeText.set(node2.id, isNote ? await this.readNoteText(file) : file.basename);
     }
-    if (!(file instanceof import_obsidian14.TFile)) {
-      this.staleIds.add(node.id);
+    if (!(file instanceof import_obsidian16.TFile)) {
+      this.staleIds.add(node2.id);
       el.createDiv({ cls: "volis-bnode-placeholder", text: "\u6587\u4EF6\u7F3A\u5931" });
       return;
     }
@@ -5433,7 +6806,7 @@ ${text}
         content = "";
       }
       if (content.trim()) {
-        await import_obsidian14.MarkdownRenderer.render(this.app, content, body, file.path, this);
+        await import_obsidian16.MarkdownRenderer.render(this.app, content, body, file.path, this);
         this.decorateNumericTags(body);
       } else {
         body.createDiv({ cls: "volis-bnode-placeholder", text: "\u7A7A\u7B14\u8BB0" });
@@ -5484,7 +6857,7 @@ ${text}
     audioPlay.addEventListener("pointerdown", (evt) => evt.stopPropagation());
     audioPlay.addEventListener("click", (evt) => {
       evt.stopPropagation();
-      this.openMedia(node.file);
+      this.openMedia(node2.file);
     });
   }
   /**
@@ -5496,14 +6869,14 @@ ${text}
   decorateNumericTags(container) {
     var _a, _b;
     const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
-      acceptNode: (node) => {
+      acceptNode: (node2) => {
         var _a2;
-        const parent = node.parentElement;
+        const parent = node2.parentElement;
         if (!parent)
           return NodeFilter.FILTER_REJECT;
         if (parent.closest("code, pre, a, .tag"))
           return NodeFilter.FILTER_REJECT;
-        return /(^|\s)#\d+\b/.test((_a2 = node.nodeValue) != null ? _a2 : "") ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+        return /(^|\s)#\d+\b/.test((_a2 = node2.nodeValue) != null ? _a2 : "") ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
       }
     });
     const targets = [];
@@ -5573,7 +6946,7 @@ ${text}
   }
   showBoardMenu(evt) {
     var _a;
-    const menu = new import_obsidian14.Menu();
+    const menu = new import_obsidian16.Menu();
     const issueCount = scanBoard(this.doctorInput()).length;
     menu.addItem(
       (item) => item.setTitle("\u67E5\u627E\u8282\u70B9").setIcon("search").onClick(() => this.openNodeSearch())
@@ -5600,11 +6973,11 @@ ${text}
       nodes: this.nodes,
       edges: this.edges,
       staleIds: this.staleIds,
-      textOf: (node) => {
+      textOf: (node2) => {
         var _a;
-        return (_a = this.nodeText.get(node.id)) != null ? _a : node.type === "text" ? node.text : "";
+        return (_a = this.nodeText.get(node2.id)) != null ? _a : node2.type === "text" ? node2.text : "";
       },
-      heightOf: (node) => this.nodeHeight(node),
+      heightOf: (node2) => this.nodeHeight(node2),
       memberIdsOf: (group) => this.groupMembers(group).map((member) => member.id)
     };
   }
@@ -5645,9 +7018,9 @@ ${text}
   locateDoctorIssue(issue) {
     const firstId = issue.nodeIds[0];
     if (firstId) {
-      const node = this.nodeMap.get(firstId);
-      if (node) {
-        this.centerOnNode(node);
+      const node2 = this.nodeMap.get(firstId);
+      if (node2) {
+        this.centerOnNode(node2);
         return;
       }
     }
@@ -5681,23 +7054,23 @@ ${text}
   }
   confirmDoctorRemoveNode(nodeId) {
     var _a;
-    const node = this.nodeMap.get(nodeId);
-    if (!node)
+    const node2 = this.nodeMap.get(nodeId);
+    if (!node2)
       return;
     if ((_a = this.nodeEls.get(nodeId)) == null ? void 0 : _a.hasClass("volis-editing")) {
-      new import_obsidian14.Notice("\u8BF7\u5148\u7ED3\u675F\u8FD9\u5F20\u5361\u7247\u7684\u7F16\u8F91\u518D\u79FB\u9664");
+      new import_obsidian16.Notice("\u8BF7\u5148\u7ED3\u675F\u8FD9\u5F20\u5361\u7247\u7684\u7F16\u8F91\u518D\u79FB\u9664");
       return;
     }
     new ConfirmModal(
       this.app,
       "\u79FB\u9664\u8FD9\u4E2A\u8282\u70B9\uFF1F",
-      `\u5C06\u4ECE\u767D\u677F\u79FB\u9664\u300C${doctorNodeName(node)}\u300D\uFF0C\u76F8\u5173\u8FDE\u7EBF\u4E00\u5E76\u6E05\u9664\u3002\u6E90\u7B14\u8BB0\u4E0D\u4F1A\u88AB\u4FEE\u6539\uFF0C\u53EF\u6309 Ctrl+Z \u64A4\u9500\u3002`,
+      `\u5C06\u4ECE\u767D\u677F\u79FB\u9664\u300C${doctorNodeName(node2)}\u300D\uFF0C\u76F8\u5173\u8FDE\u7EBF\u4E00\u5E76\u6E05\u9664\u3002\u6E90\u7B14\u8BB0\u4E0D\u4F1A\u88AB\u4FEE\u6539\uFF0C\u53EF\u6309 Ctrl+Z \u64A4\u9500\u3002`,
       "\u79FB\u9664\u8282\u70B9",
       () => {
         this.selection.clear();
         this.selection.add(nodeId);
         this.deleteSelection();
-        new import_obsidian14.Notice("\u5DF2\u79FB\u9664\u8282\u70B9\uFF0C\u53EF\u6309 Ctrl+Z \u64A4\u9500");
+        new import_obsidian16.Notice("\u5DF2\u79FB\u9664\u8282\u70B9\uFF0C\u53EF\u6309 Ctrl+Z \u64A4\u9500");
         this.openBoardDoctor();
       }
     ).open();
@@ -5714,7 +7087,7 @@ ${text}
       () => {
         this.selectedEdgeId = edgeId;
         this.deleteSelectedEdge();
-        new import_obsidian14.Notice("\u5DF2\u5220\u9664\u8FDE\u7EBF\uFF0C\u53EF\u6309 Ctrl+Z \u64A4\u9500");
+        new import_obsidian16.Notice("\u5DF2\u5220\u9664\u8FDE\u7EBF\uFF0C\u53EF\u6309 Ctrl+Z \u64A4\u9500");
         this.openBoardDoctor();
       }
     ).open();
@@ -5760,13 +7133,13 @@ ${text}
     let minY = Infinity;
     let maxX = -Infinity;
     let maxY = -Infinity;
-    for (const node of this.nodes) {
-      const el = this.nodeEls.get(node.id);
+    for (const node2 of this.nodes) {
+      const el = this.nodeEls.get(node2.id);
       const height2 = (_a = el == null ? void 0 : el.offsetHeight) != null ? _a : 120;
-      minX = Math.min(minX, node.x);
-      minY = Math.min(minY, node.y);
-      maxX = Math.max(maxX, node.x + node.width);
-      maxY = Math.max(maxY, node.y + height2);
+      minX = Math.min(minX, node2.x);
+      minY = Math.min(minY, node2.y);
+      maxX = Math.max(maxX, node2.x + node2.width);
+      maxY = Math.max(maxY, node2.y + height2);
     }
     const width = Math.max(1, maxX - minX);
     const height = Math.max(1, maxY - minY);
@@ -5794,9 +7167,9 @@ ${text}
     return clientX - rect.left >= rect.width - barScreen;
   }
   startResize(evt, nodeId, dir) {
-    const node = this.nodeMap.get(nodeId);
+    const node2 = this.nodeMap.get(nodeId);
     const el = this.nodeEls.get(nodeId);
-    if (!node || !el)
+    if (!node2 || !el)
       return;
     evt.preventDefault();
     evt.stopPropagation();
@@ -5808,7 +7181,7 @@ ${text}
       dir,
       startX: evt.clientX,
       startY: evt.clientY,
-      start: { x: node.x, y: node.y, width: node.width, height: el.offsetHeight }
+      start: { x: node2.x, y: node2.y, width: node2.width, height: el.offsetHeight }
     };
     this.root.setPointerCapture(evt.pointerId);
     this.root.addClass("is-resizing");
@@ -5816,10 +7189,10 @@ ${text}
   /** Node whose box is within `slack` world units of the point. */
   nodeNear(x, y, slack) {
     for (let i = this.nodes.length - 1; i >= 0; i--) {
-      const node = this.nodes[i];
-      const height = this.nodeHeight(node);
-      if (x >= node.x - slack && x <= node.x + node.width + slack && y >= node.y - slack && y <= node.y + height + slack) {
-        return node;
+      const node2 = this.nodes[i];
+      const height = this.nodeHeight(node2);
+      if (x >= node2.x - slack && x <= node2.x + node2.width + slack && y >= node2.y - slack && y <= node2.y + height + slack) {
+        return node2;
       }
     }
     return null;
@@ -5833,23 +7206,23 @@ ${text}
     (_a = this.searchPanel) == null ? void 0 : _a.remove();
     this.searchPanel = null;
   }
-  centerOnNode(node) {
+  centerOnNode(node2) {
     const rect = this.root.getBoundingClientRect();
-    const height = this.nodeHeight(node);
-    const fit = rect.width * 0.33 / Math.max(1, node.width);
+    const height = this.nodeHeight(node2);
+    const fit = rect.width * 0.33 / Math.max(1, node2.width);
     this.scale = Math.max(0.6, Math.min(1.1, fit));
-    this.tx = rect.width / 2 - (node.x + node.width / 2) * this.scale;
-    this.ty = rect.height / 2 - (node.y + height / 2) * this.scale;
+    this.tx = rect.width / 2 - (node2.x + node2.width / 2) * this.scale;
+    this.ty = rect.height / 2 - (node2.y + height / 2) * this.scale;
     this.applyTransform();
     this.scheduleSave();
     this.selection.clear();
-    this.selection.add(node.id);
+    this.selection.add(node2.id);
     this.paintSelection();
-    const el = this.nodeEls.get(node.id);
+    const el = this.nodeEls.get(node2.id);
     if (!el)
       return;
     for (const [id, other] of this.nodeEls) {
-      other.toggleClass("is-dimmed", id !== node.id);
+      other.toggleClass("is-dimmed", id !== node2.id);
     }
     this.root.addClass("is-focusing");
     el.addClass("is-flash");
@@ -5878,46 +7251,46 @@ ${text}
    */
   contextInput(nodes) {
     var _a, _b, _c, _d, _e, _f;
-    const present = new Set(nodes.map((node) => node.id));
+    const present = new Set(nodes.map((node2) => node2.id));
     const inputs = [];
     const groups = [];
-    for (const node of nodes) {
-      if (node.type === "group") {
-        const members = this.groupMembers(node).filter((member) => present.has(member.id));
+    for (const node2 of nodes) {
+      if (node2.type === "group") {
+        const members = this.groupMembers(node2).filter((member) => present.has(member.id));
         groups.push({
-          id: node.id,
-          label: (_a = node.label) != null ? _a : "\u672A\u547D\u540D",
+          id: node2.id,
+          label: (_a = node2.label) != null ? _a : "\u672A\u547D\u540D",
           memberIds: members.map((member) => member.id)
         });
         continue;
       }
-      const meta = this.nodeMeta.get(node.id);
-      const text = (_b = this.nodeText.get(node.id)) != null ? _b : "";
-      if (node.type === "file") {
-        const ext = (_d = (_c = node.file.split(".").pop()) == null ? void 0 : _c.toLowerCase()) != null ? _d : "";
+      const meta = this.nodeMeta.get(node2.id);
+      const text = (_b = this.nodeText.get(node2.id)) != null ? _b : "";
+      if (node2.type === "file") {
+        const ext = (_d = (_c = node2.file.split(".").pop()) == null ? void 0 : _c.toLowerCase()) != null ? _d : "";
         const isNote = ext === "md" || ext === "markdown";
-        const name = (_e = node.file.split("/").pop()) != null ? _e : node.file;
+        const name = (_e = node2.file.split("/").pop()) != null ? _e : node2.file;
         inputs.push({
-          id: node.id,
+          id: node2.id,
           kind: isNote ? "note" : "file",
           label: name.replace(/\.md$/i, ""),
           text: isNote ? text : "",
           readable: isNote,
           mediaKind: isNote ? void 0 : mediaLabel(ext),
-          path: node.file
+          path: node2.file
         });
         continue;
       }
-      const kind = node.type === "card" ? "card" : "text";
+      const kind = node2.type === "card" ? "card" : "text";
       const firstLine = (_f = text.split("\n").find((line) => line.trim())) != null ? _f : "";
       inputs.push({
-        id: node.id,
+        id: node2.id,
         kind,
         label: firstLine.trim().slice(0, 24) || (kind === "card" ? "\u5361\u7247" : "\u6587\u672C"),
         text,
         readable: true,
         meta: meta ? { date: meta.date, time: meta.time, tags: meta.tags } : void 0,
-        color: "color" in node ? node.color : void 0
+        color: "color" in node2 ? node2.color : void 0
       });
     }
     const edges = this.edges.filter((edge) => present.has(edge.from) && present.has(edge.to)).map((edge) => {
@@ -5945,12 +7318,12 @@ ${text}
    * turns. `force` is used after an edit or when the model profile changes.
    */
   ensureSystem(profile, force = false) {
-    const nodeKey = this.aiTargets.map((node) => {
+    const nodeKey = this.aiTargets.map((node2) => {
       var _a;
-      const text = (_a = this.nodeText.get(node.id)) != null ? _a : "";
-      return `${node.id}:${node.type}:${text.length}:${"label" in node ? node.label : ""}`;
+      const text = (_a = this.nodeText.get(node2.id)) != null ? _a : "";
+      return `${node2.id}:${node2.type}:${text.length}:${"label" in node2 ? node2.label : ""}`;
     }).join("|");
-    const targetIds = new Set(this.aiTargets.map((node) => node.id));
+    const targetIds = new Set(this.aiTargets.map((node2) => node2.id));
     const edgeKey = this.edges.filter((edge) => targetIds.has(edge.from) && targetIds.has(edge.to)).map((edge) => {
       var _a;
       return `${edge.from}>${edge.to}:${(_a = edge.label) != null ? _a : ""}`;
@@ -5966,7 +7339,7 @@ ${text}
     );
     this.aiManifest = result.manifest;
     this.aiNumberMap = new Map(
-      result.manifest.nodes.map((node) => [node.tag, node.id])
+      result.manifest.nodes.map((node2) => [node2.tag, node2.id])
     );
     this.aiSystemKey = key;
     this.aiSystem = [
@@ -5975,21 +7348,21 @@ ${text}
 ${result.text}`, cache: true }
     ];
     const missing = this.aiTargets.filter(
-      (node) => {
+      (node2) => {
         var _a;
-        return node.type === "file" && node.file.toLowerCase().endsWith(".md") && !((_a = this.nodeText.get(node.id)) != null ? _a : "").trim();
+        return node2.type === "file" && node2.file.toLowerCase().endsWith(".md") && !((_a = this.nodeText.get(node2.id)) != null ? _a : "").trim();
       }
     );
     if (missing.length > 0 && !this.aiNotesLoading) {
       this.aiNotesLoading = true;
       void Promise.all(
-        missing.map(async (node) => {
-          if (node.type !== "file")
+        missing.map(async (node2) => {
+          if (node2.type !== "file")
             return;
-          const file = this.app.vault.getAbstractFileByPath(node.file);
-          if (!(file instanceof import_obsidian14.TFile))
+          const file = this.app.vault.getAbstractFileByPath(node2.file);
+          if (!(file instanceof import_obsidian16.TFile))
             return;
-          this.nodeText.set(node.id, await this.readNoteText(file));
+          this.nodeText.set(node2.id, await this.readNoteText(file));
         })
       ).then(() => {
         this.aiNotesLoading = false;
@@ -6073,7 +7446,7 @@ ${summary.trim()}`;
     this.aiHistory = head.role === "user" ? [{ role: "user", content: `${block}
 
 ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...recent];
-    new import_obsidian14.Notice("\u5BF9\u8BDD\u8F83\u957F\uFF0C\u65E9\u671F\u7684\u5F80\u6765\u5DF2\u538B\u7F29\u4E3A\u6458\u8981\uFF08\u767D\u677F\u5185\u5BB9\u4E0D\u53D7\u5F71\u54CD\uFF09");
+    new import_obsidian16.Notice("\u5BF9\u8BDD\u8F83\u957F\uFF0C\u65E9\u671F\u7684\u5F80\u6765\u5DF2\u538B\u7F29\u4E3A\u6458\u8981\uFF08\u767D\u677F\u5185\u5BB9\u4E0D\u53D7\u5F71\u54CD\uFF09");
   }
   openAIPanel() {
     var _a;
@@ -6081,22 +7454,22 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     const profile = activeProfile(this.plugin.settings.ai);
     const provider = createProvider(profile);
     if (!this.plugin.settings.ai.enabled || !provider.configured) {
-      new import_obsidian14.Notice("\u8BF7\u5148\u5728\u8BBE\u7F6E\u4E2D\u542F\u7528 AI \u5E76\u6DFB\u52A0\u4E00\u4E2A\u6A21\u578B\u914D\u7F6E");
+      new import_obsidian16.Notice("\u8BF7\u5148\u5728\u8BBE\u7F6E\u4E2D\u542F\u7528 AI \u5E76\u6DFB\u52A0\u4E00\u4E2A\u6A21\u578B\u914D\u7F6E");
       return;
     }
     const selected = this.selectedNodes();
     const expanded = selected.length > 0 ? this.expandGroups(selected) : [];
-    const contentNodes = expanded.filter((node) => node.type !== "group");
+    const contentNodes = expanded.filter((node2) => node2.type !== "group");
     if (selected.length > 0 && contentNodes.length === 0) {
-      new import_obsidian14.Notice("\u9009\u4E2D\u7684\u5206\u7EC4\u91CC\u8FD8\u6CA1\u6709\u5185\u5BB9\uFF0C\u5148\u628A\u5361\u7247\u653E\u8FDB\u53BB\u518D\u5206\u6790");
+      new import_obsidian16.Notice("\u9009\u4E2D\u7684\u5206\u7EC4\u91CC\u8FD8\u6CA1\u6709\u5185\u5BB9\uFF0C\u5148\u628A\u5361\u7247\u653E\u8FDB\u53BB\u518D\u5206\u6790");
       return;
     }
     const targets = expanded.length > 0 ? expanded : this.nodes.slice(0, 200);
     if (targets.length === 0) {
-      new import_obsidian14.Notice("\u767D\u677F\u4E0A\u8FD8\u6CA1\u6709\u8282\u70B9");
+      new import_obsidian16.Notice("\u767D\u677F\u4E0A\u8FD8\u6CA1\u6709\u8282\u70B9");
       return;
     }
-    const targetCount = targets.filter((node) => node.type !== "group").length || targets.length;
+    const targetCount = targets.filter((node2) => node2.type !== "group").length || targets.length;
     this.aiProvider = provider;
     this.aiTargets = targets;
     this.aiHistory = [];
@@ -6119,7 +7492,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     panel.addEventListener("dblclick", (evt) => evt.stopPropagation());
     const head = panel.createDiv({ cls: "volis-ai-head" });
     const headIcon = head.createDiv({ cls: "volis-ai-head-icon" });
-    (0, import_obsidian14.setIcon)(headIcon, "sparkles");
+    (0, import_obsidian16.setIcon)(headIcon, "sparkles");
     head.createDiv({
       cls: "volis-ai-head-title",
       text: `${selected.length > 0 ? "\u5206\u6790\u9009\u4E2D\u7684" : "\u5206\u6790\u5168\u90E8"} ${targetCount} \u4E2A\u8282\u70B9`
@@ -6130,22 +7503,22 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       cls: "volis-ai-head-btn",
       attr: { "aria-label": "\u65B0\u5BF9\u8BDD" }
     });
-    (0, import_obsidian14.setIcon)(newBtn, "square-pen");
+    (0, import_obsidian16.setIcon)(newBtn, "square-pen");
     const historyBtn = head.createEl("button", {
       cls: "volis-ai-head-btn",
       attr: { "aria-label": "\u5386\u53F2\u5BF9\u8BDD" }
     });
-    (0, import_obsidian14.setIcon)(historyBtn, "history");
+    (0, import_obsidian16.setIcon)(historyBtn, "history");
     const expandBtn = head.createEl("button", {
       cls: "volis-ai-head-btn",
       attr: { "aria-label": "\u5C55\u5F00" }
     });
-    (0, import_obsidian14.setIcon)(expandBtn, "maximize-2");
+    (0, import_obsidian16.setIcon)(expandBtn, "maximize-2");
     const closeBtn = head.createEl("button", {
       cls: "volis-ai-head-btn",
       attr: { "aria-label": "\u5173\u95ED" }
     });
-    (0, import_obsidian14.setIcon)(closeBtn, "x");
+    (0, import_obsidian16.setIcon)(closeBtn, "x");
     const stream = panel.createDiv({ cls: "volis-ai-stream" });
     const dock = panel.createDiv({ cls: "volis-ai-dock" });
     const compose = dock.createDiv({ cls: "volis-ai-compose" });
@@ -6157,7 +7530,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       cls: "volis-ai-send",
       attr: { "aria-label": "\u53D1\u9001" }
     });
-    (0, import_obsidian14.setIcon)(sendBtn, "arrow-up");
+    (0, import_obsidian16.setIcon)(sendBtn, "arrow-up");
     const actions = dock.createDiv({ cls: "volis-ai-actions" });
     const insertBtn = actions.createEl("button", {
       cls: "volis-ai-btn is-primary",
@@ -6286,16 +7659,16 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
         text: `${snapshot.nodes.length} \u4E2A\u8282\u70B9 \xB7 ${formatTokens(snapshot.usedTokens)} token`
       });
       const body = details.createDiv({ cls: "volis-ai-context-body" });
-      for (const node of snapshot.nodes) {
+      for (const node2 of snapshot.nodes) {
         const line = body.createDiv({ cls: "volis-ai-context-row" });
-        line.createSpan({ cls: "volis-ai-context-tag", text: node.tag });
-        line.createSpan({ cls: "volis-ai-context-name", text: node.label });
+        line.createSpan({ cls: "volis-ai-context-tag", text: node2.tag });
+        line.createSpan({ cls: "volis-ai-context-name", text: node2.label });
         line.createSpan({
           cls: "volis-ai-context-size",
-          text: node.readable ? `${node.charsSent}/${node.charsTotal} \u5B57` : "\u4EC5\u6587\u4EF6\u540D"
+          text: node2.readable ? `${node2.charsSent}/${node2.charsTotal} \u5B57` : "\u4EC5\u6587\u4EF6\u540D"
         });
-        if (node.note)
-          line.createSpan({ cls: "volis-ai-context-flag", text: node.note });
+        if (node2.note)
+          line.createSpan({ cls: "volis-ai-context-flag", text: node2.note });
       }
       for (const note of snapshot.notes) {
         body.createDiv({ cls: "volis-ai-context-note", text: note });
@@ -6304,19 +7677,19 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     };
     const appendCopy = (host, text) => {
       const button = host.createEl("button", { cls: "volis-ai-reply-icon" });
-      (0, import_obsidian14.setIcon)(button, "copy");
+      (0, import_obsidian16.setIcon)(button, "copy");
       button.addEventListener("click", (evt) => {
         evt.stopPropagation();
         void navigator.clipboard.writeText(text).then(
           () => {
-            (0, import_obsidian14.setIcon)(button, "check");
+            (0, import_obsidian16.setIcon)(button, "check");
             button.addClass("is-done");
             window.setTimeout(() => {
-              (0, import_obsidian14.setIcon)(button, "copy");
+              (0, import_obsidian16.setIcon)(button, "copy");
               button.removeClass("is-done");
             }, 1200);
           },
-          () => new import_obsidian14.Notice("\u590D\u5236\u5931\u8D25\uFF0C\u8BF7\u68C0\u67E5\u526A\u8D34\u677F\u6743\u9650")
+          () => new import_obsidian16.Notice("\u590D\u5236\u5931\u8D25\uFF0C\u8BF7\u68C0\u67E5\u526A\u8D34\u677F\u6743\u9650")
         );
       });
     };
@@ -6327,9 +7700,9 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       const row = stream.createDiv({ cls: "volis-ai-msg is-ai" });
       row.dataset.answerIndex = String(index);
       appendContext(row, snapshot);
-      const refMap = snapshot ? new Map(snapshot.nodes.map((node) => [node.tag, node.id])) : this.aiNumberMap;
+      const refMap = snapshot ? new Map(snapshot.nodes.map((node2) => [node2.tag, node2.id])) : this.aiNumberMap;
       const body = row.createDiv({ cls: "volis-ai-reply" });
-      await import_obsidian14.MarkdownRenderer.render(this.app, this.decorateAnswer(text, refMap), body, "", this);
+      await import_obsidian16.MarkdownRenderer.render(this.app, this.decorateAnswer(text, refMap), body, "", this);
       this.linkAnswerRefs(body, refMap);
       const bar = row.createDiv({ cls: "volis-ai-reply-bar" });
       appendCopy(bar, text);
@@ -6396,7 +7769,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       });
       const bar = body.createDiv({ cls: "volis-ai-reply-bar" });
       const retryBtn = bar.createEl("button", { cls: "volis-ai-reply-icon" });
-      (0, import_obsidian14.setIcon)(retryBtn, "rotate-ccw");
+      (0, import_obsidian16.setIcon)(retryBtn, "rotate-ccw");
       retryBtn.addEventListener("click", (evt) => {
         evt.stopPropagation();
         retry();
@@ -6407,7 +7780,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       this.aiBusy = value;
       input.disabled = value;
       sendBtn.empty();
-      (0, import_obsidian14.setIcon)(sendBtn, value ? "square" : "arrow-up");
+      (0, import_obsidian16.setIcon)(sendBtn, value ? "square" : "arrow-up");
       sendBtn.toggleClass("is-stop", value);
       sendBtn.setAttribute("aria-label", value ? "\u505C\u6B62\u751F\u6210" : "\u53D1\u9001");
       if (value) {
@@ -6430,15 +7803,15 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       const snapshot = this.aiManifest ? {
         usedTokens: this.aiManifest.usedTokens,
         stage: this.aiManifest.stage,
-        nodes: this.aiManifest.nodes.map((node) => ({
-          id: node.id,
-          tag: node.tag,
-          label: node.label,
-          charsSent: node.charsSent,
-          charsTotal: node.charsTotal,
-          truncated: node.truncated,
-          readable: node.readable,
-          note: node.note
+        nodes: this.aiManifest.nodes.map((node2) => ({
+          id: node2.id,
+          tag: node2.tag,
+          label: node2.label,
+          charsSent: node2.charsSent,
+          charsTotal: node2.charsTotal,
+          truncated: node2.truncated,
+          readable: node2.readable,
+          note: node2.note
         })),
         notes: [...this.aiManifest.notes]
       } : null;
@@ -6451,7 +7824,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       this.ensureSystem(profile);
       await this.compactHistory(profile);
       if (snapshot && snapshot.notes.length > 0) {
-        new import_obsidian14.Notice(`\u672C\u6B21\u5DF2\u8BFB\u53D6\u4E0A\u4E0B\u6587\uFF1A${snapshot.notes.join("\uFF1B")}`.slice(0, 160));
+        new import_obsidian16.Notice(`\u672C\u6B21\u5DF2\u8BFB\u53D6\u4E0A\u4E0B\u6587\uFF1A${snapshot.notes.join("\uFF1B")}`.slice(0, 160));
       }
       this.aiHistory.push({ role: "user", content: question });
       let result = null;
@@ -6516,9 +7889,9 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
         await addAiBubble(reply, snapshot);
         this.persistConversation(question);
         if (continueFailed) {
-          new import_obsidian14.Notice("\u7EED\u5199\u5931\u8D25\uFF0C\u8FD9\u6B21\u7B54\u590D\u53EF\u80FD\u4E0D\u5B8C\u6574");
+          new import_obsidian16.Notice("\u7EED\u5199\u5931\u8D25\uFF0C\u8FD9\u6B21\u7B54\u590D\u53EF\u80FD\u4E0D\u5B8C\u6574");
         } else if (result.truncated) {
-          new import_obsidian14.Notice("\u56DE\u7B54\u4ECD\u88AB\u957F\u5EA6\u4E0A\u9650\u622A\u65AD\uFF0C\u53EF\u5728\u6A21\u578B\u914D\u7F6E\u91CC\u8C03\u5927\u300C\u5355\u6B21\u8F93\u51FA\u4E0A\u9650\u300D");
+          new import_obsidian16.Notice("\u56DE\u7B54\u4ECD\u88AB\u957F\u5EA6\u4E0A\u9650\u622A\u65AD\uFF0C\u53EF\u5728\u6A21\u578B\u914D\u7F6E\u91CC\u8C03\u5927\u300C\u5355\u6B21\u8F93\u51FA\u4E0A\u9650\u300D");
         }
         insertBtn.disabled = false;
         noteBtn.disabled = false;
@@ -6560,7 +7933,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
         (_b = this.aiPending) == null ? void 0 : _b.row.remove();
         this.aiPending = null;
         setBusy(false);
-        new import_obsidian14.Notice("\u5DF2\u505C\u6B62\u751F\u6210");
+        new import_obsidian16.Notice("\u5DF2\u505C\u6B62\u751F\u6210");
         return;
       }
       void ask();
@@ -6591,7 +7964,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       )) == null ? void 0 : _a2.send;
       if (firstSnapshot) {
         this.aiNumberMap = new Map(
-          firstSnapshot.nodes.map((node) => [node.tag, node.id])
+          firstSnapshot.nodes.map((node2) => [node2.tag, node2.id])
         );
         this.applyNodeNumbers();
       }
@@ -6610,7 +7983,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     expandBtn.addEventListener("click", () => {
       this.aiExpanded = !this.aiExpanded;
       panel.toggleClass("is-expanded", this.aiExpanded);
-      (0, import_obsidian14.setIcon)(expandBtn, this.aiExpanded ? "minimize-2" : "maximize-2");
+      (0, import_obsidian16.setIcon)(expandBtn, this.aiExpanded ? "minimize-2" : "maximize-2");
       place();
     });
     closeBtn.addEventListener("click", () => this.closeAiPanel());
@@ -6633,7 +8006,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
         "AI \u6574\u7406"
       ).then((file) => {
         if (file)
-          new import_obsidian14.Notice(`\u5DF2\u4FDD\u5B58\u4E3A ${file.basename}`);
+          new import_obsidian16.Notice(`\u5DF2\u4FDD\u5B58\u4E3A ${file.basename}`);
       });
       this.closeAiPanel();
     });
@@ -6654,10 +8027,10 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
         () => {
           void this.overwriteNode(overwriteTarget, text).then((ok) => {
             if (ok) {
-              new import_obsidian14.Notice("\u5DF2\u8986\u76D6\u539F\u8282\u70B9\u5185\u5BB9\uFF0C\u53EF\u6309 Ctrl+Z \u64A4\u9500");
+              new import_obsidian16.Notice("\u5DF2\u8986\u76D6\u539F\u8282\u70B9\u5185\u5BB9\uFF0C\u53EF\u6309 Ctrl+Z \u64A4\u9500");
               this.closeAiPanel();
             } else {
-              new import_obsidian14.Notice("\u8986\u76D6\u5931\u8D25");
+              new import_obsidian16.Notice("\u8986\u76D6\u5931\u8D25");
             }
           });
         }
@@ -6700,7 +8073,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       return { role: "assistant", content: message.content, ...snapshot ? { send: snapshot } : {} };
     });
     conversation.updatedAt = Date.now();
-    conversation.nodeIds = this.aiTargets.map((node) => node.id);
+    conversation.nodeIds = this.aiTargets.map((node2) => node2.id);
     this.plugin.settings.conversations = store.sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 30);
     void this.plugin.saveSettings();
   }
@@ -6711,14 +8084,14 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       role: message.role,
       content: message.content
     }));
-    const alive = conversation.nodeIds.map((id) => this.nodeMap.get(id)).filter((node) => Boolean(node));
+    const alive = conversation.nodeIds.map((id) => this.nodeMap.get(id)).filter((node2) => Boolean(node2));
     if (alive.length > 0)
       this.aiTargets = this.expandGroups(alive);
     this.ensureSystem(activeProfile(this.plugin.settings.ai), true);
     this.applyNodeNumbers();
     (_a = this.aiRestore) == null ? void 0 : _a.call(this, conversation);
     if (alive.length < conversation.nodeIds.length) {
-      new import_obsidian14.Notice("\u90E8\u5206\u8282\u70B9\u5DF2\u4E0D\u5B58\u5728\uFF0C\u8FD9\u6B21\u5BF9\u8BDD\u53EA\u80FD\u67E5\u770B\uFF0C\u8FFD\u95EE\u65F6 AI \u770B\u4E0D\u5230\u5B83\u4EEC");
+      new import_obsidian16.Notice("\u90E8\u5206\u8282\u70B9\u5DF2\u4E0D\u5B58\u5728\uFF0C\u8FD9\u6B21\u5BF9\u8BDD\u53EA\u80FD\u67E5\u770B\uFF0C\u8FFD\u95EE\u65F6 AI \u770B\u4E0D\u5230\u5B83\u4EEC");
     }
   }
   deleteConversation(id) {
@@ -6783,7 +8156,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       if (conversation.id === this.aiConversationId)
         row.addClass("is-current");
       const iconEl = row.createDiv({ cls: "volis-ai-history-icon" });
-      (0, import_obsidian14.setIcon)(iconEl, "message-square");
+      (0, import_obsidian16.setIcon)(iconEl, "message-square");
       const body = row.createDiv({ cls: "volis-ai-history-body" });
       body.createDiv({ cls: "volis-ai-history-name", text: conversation.title });
       body.createDiv({
@@ -6794,7 +8167,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
         cls: "volis-ai-history-del",
         attr: { "aria-label": "\u5220\u9664\u8FD9\u6761\u8BB0\u5F55" }
       });
-      (0, import_obsidian14.setIcon)(del, "trash-2");
+      (0, import_obsidian16.setIcon)(del, "trash-2");
       del.addEventListener("click", (evt) => {
         evt.stopPropagation();
         this.deleteConversation(conversation.id);
@@ -6893,12 +8266,12 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
   }
   /** Centre and briefly highlight the node an answer referred to. */
   jumpToNumberedNode(nodeId) {
-    const node = this.nodeMap.get(nodeId);
-    if (!node || !this.nodeEls.has(nodeId)) {
-      new import_obsidian14.Notice("\u8FD9\u4E2A\u8282\u70B9\u5DF2\u7ECF\u4E0D\u5728\u5F53\u524D\u767D\u677F\u4E0A\u4E86");
+    const node2 = this.nodeMap.get(nodeId);
+    if (!node2 || !this.nodeEls.has(nodeId)) {
+      new import_obsidian16.Notice("\u8FD9\u4E2A\u8282\u70B9\u5DF2\u7ECF\u4E0D\u5728\u5F53\u524D\u767D\u677F\u4E0A\u4E86");
       return;
     }
-    this.centerOnNode(node);
+    this.centerOnNode(node2);
   }
   /** Selected text inside the panel, otherwise the latest full answer. */
   replyTextForOverwrite() {
@@ -6938,15 +8311,15 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     }
     return out.join("\n");
   }
-  async overwriteNode(node, text) {
+  async overwriteNode(node2, text) {
     const content = text.trim();
     if (!content)
       return false;
-    if (node.type === "text") {
-      node.text = content;
-      await this.renderNode(node);
-    } else if (node.type === "card") {
-      const ref = { file: node.file, blockId: node.blockId, linkpath: "" };
+    if (node2.type === "text") {
+      node2.text = content;
+      await this.renderNode(node2);
+    } else if (node2.type === "card") {
+      const ref = { file: node2.file, blockId: node2.blockId, linkpath: "" };
       const meta = await readCard(this.app, ref);
       const ok = await writeCard(
         this.app,
@@ -6955,13 +8328,13 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       );
       if (!ok)
         return false;
-      await this.renderNode(node);
-    } else if (node.type === "file") {
-      const file = this.app.vault.getAbstractFileByPath(node.file);
-      if (!(file instanceof import_obsidian14.TFile) || file.extension.toLowerCase() !== "md")
+      await this.renderNode(node2);
+    } else if (node2.type === "file") {
+      const file = this.app.vault.getAbstractFileByPath(node2.file);
+      if (!(file instanceof import_obsidian16.TFile) || file.extension.toLowerCase() !== "md")
         return false;
       await this.app.vault.modify(file, content);
-      await this.renderNode(node);
+      await this.renderNode(node2);
     } else {
       return false;
     }
@@ -6976,7 +8349,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
   /** Directly creates a new text node, optionally as a yellow sticky. */
   async createTextAtCenter(sticky = false) {
     const point = this.centerWorld();
-    const node = {
+    const node2 = {
       id: createId(),
       type: "text",
       text: "",
@@ -6985,17 +8358,17 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       width: DEFAULT_CARD_WIDTH
     };
     if (sticky)
-      node.sticky = true;
-    this.nodes.push(node);
-    this.nodeMap.set(node.id, node);
+      node2.sticky = true;
+    this.nodes.push(node2);
+    this.nodeMap.set(node2.id, node2);
     this.selection.clear();
-    this.selection.add(node.id);
-    const el = await this.renderNode(node);
+    this.selection.add(node2.id);
+    const el = await this.renderNode(node2);
     this.paintSelection();
     this.updateHint();
     this.pushHistory();
     this.scheduleSave();
-    void this.openEditor(node, el);
+    void this.openEditor(node2, el);
   }
   async createStickyAtCenter() {
     await this.createTextAtCenter(true);
@@ -7003,7 +8376,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
   async insertAIText(text, targets) {
     const box = this.selectionBox(targets);
     const anchor = box != null ? box : { minX: 0, minY: 0, maxX: 0, maxY: 0 };
-    const node = {
+    const node2 = {
       id: createId(),
       type: "text",
       text,
@@ -7011,11 +8384,11 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       y: Math.round(anchor.minY),
       width: 360
     };
-    this.nodes.push(node);
-    this.nodeMap.set(node.id, node);
-    await this.renderNode(node);
+    this.nodes.push(node2);
+    this.nodeMap.set(node2.id, node2);
+    await this.renderNode(node2);
     this.selection.clear();
-    this.selection.add(node.id);
+    this.selection.add(node2.id);
     this.paintSelection();
     this.updateHint();
     this.pushHistory();
@@ -7065,7 +8438,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     head.addEventListener("pointerup", endDrag);
     head.addEventListener("pointercancel", endDrag);
     const headIcon = head.createDiv({ cls: "volis-insert-head-icon" });
-    (0, import_obsidian14.setIcon)(headIcon, "search");
+    (0, import_obsidian16.setIcon)(headIcon, "search");
     const input = head.createEl("input", {
       cls: "volis-insert-input",
       attr: { type: "text", placeholder: "\u5728\u767D\u677F\u4E2D\u67E5\u627E\u8282\u70B9\u2026" }
@@ -7085,7 +8458,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
         list.createDiv({ cls: "volis-insert-empty", text: "\u6CA1\u6709\u5339\u914D\u7684\u8282\u70B9" });
         return;
       }
-      results.forEach((node, index) => {
+      results.forEach((node2, index) => {
         var _a;
         const row = list.createDiv({ cls: "volis-insert-item" });
         if (index === active) {
@@ -7093,31 +8466,31 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
           window.requestAnimationFrame(() => row.scrollIntoView({ block: "nearest" }));
         }
         const iconEl = row.createDiv({ cls: "volis-insert-item-icon" });
-        (0, import_obsidian14.setIcon)(
+        (0, import_obsidian16.setIcon)(
           iconEl,
-          node.type === "card" ? "list" : node.type === "group" ? "group" : node.type === "text" ? "type" : "file-text"
+          node2.type === "card" ? "list" : node2.type === "group" ? "group" : node2.type === "text" ? "type" : "file-text"
         );
         const body = row.createDiv({ cls: "volis-insert-item-body" });
-        const text = ((_a = this.nodeText.get(node.id)) != null ? _a : "").replace(/\s+/g, " ").trim();
+        const text = ((_a = this.nodeText.get(node2.id)) != null ? _a : "").replace(/\s+/g, " ").trim();
         body.createDiv({
           cls: "volis-insert-title",
           text: text.slice(0, 48) || "\uFF08\u7A7A\u8282\u70B9\uFF09"
         });
         body.createDiv({
           cls: "volis-insert-sub",
-          text: node.type === "card" ? "\u5361\u7247" : node.type === "group" ? "\u5206\u7EC4" : node.type === "text" ? "\u6587\u672C\u8282\u70B9" : node.file
+          text: node2.type === "card" ? "\u5361\u7247" : node2.type === "group" ? "\u5206\u7EC4" : node2.type === "text" ? "\u6587\u672C\u8282\u70B9" : node2.file
         });
         row.addEventListener("click", () => {
           this.closeSearchPanel();
-          this.centerOnNode(node);
+          this.centerOnNode(node2);
         });
       });
     };
     const search = (query) => {
       const q = query.trim().toLowerCase();
-      results = q ? all.filter((node) => {
+      results = q ? all.filter((node2) => {
         var _a;
-        const text = ((_a = this.nodeText.get(node.id)) != null ? _a : "").toLowerCase();
+        const text = ((_a = this.nodeText.get(node2.id)) != null ? _a : "").toLowerCase();
         return text.includes(q);
       }) : all.slice(0, 30);
       active = 0;
@@ -7144,11 +8517,11 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       }
       if (evt.key === "Enter") {
         evt.preventDefault();
-        const node = results[active];
-        if (!node)
+        const node2 = results[active];
+        if (!node2)
           return;
         this.closeSearchPanel();
-        this.centerOnNode(node);
+        this.centerOnNode(node2);
       }
     });
     this.searchOutside = (evt) => {
@@ -7223,7 +8596,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     head.addEventListener("pointerup", endDrag);
     head.addEventListener("pointercancel", endDrag);
     const headIcon = head.createDiv({ cls: "volis-insert-head-icon" });
-    (0, import_obsidian14.setIcon)(headIcon, "search");
+    (0, import_obsidian16.setIcon)(headIcon, "search");
     const input = head.createEl("input", {
       cls: "volis-insert-input",
       attr: { type: "text", placeholder: "\u641C\u7D22\u5361\u7247\u3001\u7B14\u8BB0\uFF0C\u6216\u65B0\u5EFA\u2026" }
@@ -7245,7 +8618,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
           });
         }
         const iconEl = row.createDiv({ cls: "volis-insert-item-icon" });
-        (0, import_obsidian14.setIcon)(
+        (0, import_obsidian16.setIcon)(
           iconEl,
           item.kind === "card" ? "list" : item.kind === "note" ? "file-text" : item.kind === "media" ? "image" : "type"
         );
@@ -7355,10 +8728,10 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
   }
   nodeAt(x, y) {
     for (let i = this.nodes.length - 1; i >= 0; i--) {
-      const node = this.nodes[i];
-      const height = this.nodeHeight(node);
-      if (x >= node.x && x <= node.x + node.width && y >= node.y && y <= node.y + height) {
-        return node;
+      const node2 = this.nodes[i];
+      const height = this.nodeHeight(node2);
+      if (x >= node2.x && x <= node2.x + node2.width && y >= node2.y && y <= node2.y + height) {
+        return node2;
       }
     }
     return null;
@@ -7388,13 +8761,13 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     let maxX = Number.NEGATIVE_INFINITY;
     let maxY = Number.NEGATIVE_INFINITY;
     for (const [id, start] of initial) {
-      const node = this.nodeMap.get(id);
-      if (!node)
+      const node2 = this.nodeMap.get(id);
+      if (!node2)
         continue;
-      const height = this.nodeHeight(node);
+      const height = this.nodeHeight(node2);
       minX = Math.min(minX, start.x + dx);
       minY = Math.min(minY, start.y + dy);
-      maxX = Math.max(maxX, start.x + dx + node.width);
+      maxX = Math.max(maxX, start.x + dx + node2.width);
       maxY = Math.max(maxY, start.y + dy + height);
     }
     if (!Number.isFinite(minX))
@@ -7599,7 +8972,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
         cls: "volis-tool-btn",
         attr: { "aria-label": label }
       });
-      (0, import_obsidian14.setIcon)(button, icon);
+      (0, import_obsidian16.setIcon)(button, icon);
       button.addEventListener("click", () => this.styleSelectedEdge({ arrow }));
     };
     arrowBtn("target", "arrow-right", "\u5355\u5411\u7BAD\u5934");
@@ -7610,7 +8983,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       cls: "volis-tool-btn",
       attr: { "aria-label": "\u8BBE\u7F6E\u5173\u7CFB" }
     });
-    (0, import_obsidian14.setIcon)(this.edgeRelationBtn, "git-branch");
+    (0, import_obsidian16.setIcon)(this.edgeRelationBtn, "git-branch");
     this.edgeRelationBtn.addEventListener("click", () => {
       if (this.selectedEdgeId)
         this.openEdgeLabelEditor(this.selectedEdgeId, void 0, "relation");
@@ -7619,7 +8992,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       cls: "volis-tool-btn",
       attr: { "aria-label": "\u6DFB\u52A0\u6807\u7B7E" }
     });
-    (0, import_obsidian14.setIcon)(this.edgeLabelBtn, "tag");
+    (0, import_obsidian16.setIcon)(this.edgeLabelBtn, "tag");
     this.edgeLabelBtn.addEventListener("click", () => {
       if (this.selectedEdgeId)
         this.openEdgeLabelEditor(this.selectedEdgeId);
@@ -7629,7 +9002,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       cls: "volis-tool-btn is-danger",
       attr: { "aria-label": "\u5220\u9664\u8FDE\u7EBF" }
     });
-    (0, import_obsidian14.setIcon)(remove, "trash-2");
+    (0, import_obsidian16.setIcon)(remove, "trash-2");
     remove.addEventListener("click", () => this.deleteSelectedEdge());
   }
   styleSelectedEdge(patch) {
@@ -7889,12 +9262,12 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
   beginNodeMove(evt) {
     const initial = /* @__PURE__ */ new Map();
     for (const id of this.selection) {
-      const node = this.nodeMap.get(id);
-      if (!node)
+      const node2 = this.nodeMap.get(id);
+      if (!node2)
         continue;
-      initial.set(node.id, { x: node.x, y: node.y });
-      if (node.type === "group") {
-        for (const member of this.groupMembers(node)) {
+      initial.set(node2.id, { x: node2.x, y: node2.y });
+      if (node2.type === "group") {
+        for (const member of this.groupMembers(node2)) {
           if (!initial.has(member.id)) {
             initial.set(member.id, { x: member.x, y: member.y });
           }
@@ -7983,28 +9356,28 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     const wx2 = (left + width - this.tx) / this.scale;
     const wy2 = (top + height - this.ty) / this.scale;
     this.selection.clear();
-    for (const node of this.nodes) {
-      const el = this.nodeEls.get(node.id);
+    for (const node2 of this.nodes) {
+      const el = this.nodeEls.get(node2.id);
       const nh = (_a = el == null ? void 0 : el.offsetHeight) != null ? _a : 100;
-      if (node.x > wx2 || node.x + node.width < wx1)
+      if (node2.x > wx2 || node2.x + node2.width < wx1)
         continue;
-      if (node.y > wy2 || node.y + nh < wy1)
+      if (node2.y > wy2 || node2.y + nh < wy1)
         continue;
-      this.selection.add(node.id);
+      this.selection.add(node2.id);
     }
     this.paintSelection();
   }
-  activateNode(node) {
-    if (node.type === "group")
+  activateNode(node2) {
+    if (node2.type === "group")
       return;
-    if (node.type === "file") {
-      const file = this.app.vault.getAbstractFileByPath(node.file);
-      if (file instanceof import_obsidian14.TFile && file.extension.toLowerCase() === "md") {
-        void this.openEditor(node);
+    if (node2.type === "file") {
+      const file = this.app.vault.getAbstractFileByPath(node2.file);
+      if (file instanceof import_obsidian16.TFile && file.extension.toLowerCase() === "md") {
+        void this.openEditor(node2);
       }
       return;
     }
-    void this.openEditor(node);
+    void this.openEditor(node2);
   }
   paintSelection() {
     for (const [id, el] of this.nodeEls) {
@@ -8028,15 +9401,15 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     let maxX = -Infinity;
     let maxY = -Infinity;
     for (const id of this.selection) {
-      const node = this.nodeMap.get(id);
-      if (!node)
+      const node2 = this.nodeMap.get(id);
+      if (!node2)
         continue;
       const el = this.nodeEls.get(id);
       const height = (_a = el == null ? void 0 : el.offsetHeight) != null ? _a : 100;
-      minX = Math.min(minX, node.x);
-      minY = Math.min(minY, node.y);
-      maxX = Math.max(maxX, node.x + node.width);
-      maxY = Math.max(maxY, node.y + height);
+      minX = Math.min(minX, node2.x);
+      minY = Math.min(minY, node2.y);
+      maxX = Math.max(maxX, node2.x + node2.width);
+      maxY = Math.max(maxY, node2.y + height);
     }
     if (!Number.isFinite(minX)) {
       frame.addClass("is-hidden");
@@ -8060,11 +9433,11 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
   }
   openMedia(path) {
     const file = this.app.vault.getAbstractFileByPath(path);
-    if (file instanceof import_obsidian14.TFile)
+    if (file instanceof import_obsidian16.TFile)
       new MediaModal(this.app, file).open();
   }
   async createTextNode(point) {
-    const node = {
+    const node2 = {
       id: createId(),
       type: "text",
       text: "",
@@ -8072,30 +9445,30 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       y: Math.round(point.y - 24),
       width: DEFAULT_CARD_WIDTH
     };
-    this.nodes.push(node);
-    this.nodeMap.set(node.id, node);
-    const el = await this.renderNode(node);
+    this.nodes.push(node2);
+    this.nodeMap.set(node2.id, node2);
+    const el = await this.renderNode(node2);
     this.selection.clear();
-    this.selection.add(node.id);
+    this.selection.add(node2.id);
     this.paintSelection();
     this.updateHint();
     this.pushHistory();
-    void this.openEditor(node, el);
-    return node;
+    void this.openEditor(node2, el);
+    return node2;
   }
-  async openEditor(node, existingEl) {
-    const el = existingEl != null ? existingEl : this.nodeEls.get(node.id);
+  async openEditor(node2, existingEl) {
+    const el = existingEl != null ? existingEl : this.nodeEls.get(node2.id);
     if (!el)
       return;
     if (el.hasClass("volis-editing"))
       return;
     const restoreBar = () => window.setTimeout(() => this.updateToolbar(), 0);
-    if (node.type === "text") {
+    if (node2.type === "text") {
       new InlineEditor(
         el,
-        node.text,
+        node2.text,
         async (value) => {
-          const current = this.nodeMap.get(node.id);
+          const current = this.nodeMap.get(node2.id);
           if (!current || current.type !== "text")
             return;
           current.text = value;
@@ -8108,10 +9481,10 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       );
       return;
     }
-    if (node.type === "card") {
+    if (node2.type === "card") {
       const meta = await readCard(this.app, {
-        file: node.file,
-        blockId: node.blockId,
+        file: node2.file,
+        blockId: node2.blockId,
         linkpath: ""
       });
       if (meta.stale)
@@ -8124,7 +9497,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
             return;
           const ok = await writeCard(this.app, meta.ref, meta.timePrefix + value);
           if (ok) {
-            const current = this.nodeMap.get(node.id);
+            const current = this.nodeMap.get(node2.id);
             if (current && current.type === "card") {
               await this.renderNode(current);
             }
@@ -8137,9 +9510,9 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       );
       return;
     }
-    if (node.type === "file") {
-      const file = this.app.vault.getAbstractFileByPath(node.file);
-      if (!(file instanceof import_obsidian14.TFile) || file.extension.toLowerCase() !== "md")
+    if (node2.type === "file") {
+      const file = this.app.vault.getAbstractFileByPath(node2.file);
+      if (!(file instanceof import_obsidian16.TFile) || file.extension.toLowerCase() !== "md")
         return;
       const content = await this.app.vault.read(file);
       new MarkdownNodeEditor(
@@ -8148,7 +9521,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
         file,
         content,
         async (target, body) => {
-          const current = this.nodeMap.get(node.id);
+          const current = this.nodeMap.get(node2.id);
           if (!current || current.type !== "file")
             return;
           if (body !== content) {
@@ -8211,7 +9584,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     }
   }
   async addCardNode(file, blockId, point) {
-    const node = {
+    const node2 = {
       id: createId(),
       type: "card",
       file,
@@ -8220,9 +9593,9 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       y: Math.round(point.y - 60),
       width: DEFAULT_CARD_WIDTH
     };
-    this.nodes.push(node);
-    this.nodeMap.set(node.id, node);
-    await this.renderNode(node);
+    this.nodes.push(node2);
+    this.nodeMap.set(node2.id, node2);
+    await this.renderNode(node2);
     this.updateHint();
     this.pushHistory();
     this.scheduleSave();
@@ -8230,10 +9603,10 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
   async addFileNode(file, point) {
     const target = this.app.vault.getAbstractFileByPath(file);
     const width = DEFAULT_FILE_WIDTH;
-    const ext = target instanceof import_obsidian14.TFile ? target.extension.toLowerCase() : "";
+    const ext = target instanceof import_obsidian16.TFile ? target.extension.toLowerCase() : "";
     const isImage = IMAGE_EXT2.includes(ext);
     const isNote = ext === "md";
-    const node = {
+    const node2 = {
       id: createId(),
       type: "file",
       file,
@@ -8242,13 +9615,13 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       width,
       height: isImage ? 240 : isNote ? 320 : void 0
     };
-    this.nodes.push(node);
-    this.nodeMap.set(node.id, node);
-    await this.renderNode(node);
+    this.nodes.push(node2);
+    this.nodeMap.set(node2.id, node2);
+    await this.renderNode(node2);
     this.updateHint();
     this.pushHistory();
     this.scheduleSave();
-    return node;
+    return node2;
   }
   toggleOutlinePanel() {
     if (this.outlinePanel) {
@@ -8271,7 +9644,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     panel.addEventListener("wheel", (evt) => evt.stopPropagation(), { passive: true });
     const head = panel.createDiv({ cls: "volis-outline-head" });
     const headIcon = head.createDiv({ cls: "volis-outline-head-icon" });
-    (0, import_obsidian14.setIcon)(headIcon, "list-tree");
+    (0, import_obsidian16.setIcon)(headIcon, "list-tree");
     head.createDiv({ cls: "volis-outline-head-title", text: "\u5927\u7EB2" });
     this.outlineMetaEl = head.createDiv({ cls: "volis-outline-head-meta" });
     head.createDiv({ cls: "volis-outline-head-spacer" });
@@ -8279,7 +9652,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       cls: "volis-outline-head-btn",
       attr: { "aria-label": "\u5173\u95ED" }
     });
-    (0, import_obsidian14.setIcon)(closeBtn, "x");
+    (0, import_obsidian16.setIcon)(closeBtn, "x");
     closeBtn.addEventListener("click", () => this.closeOutlinePanel());
     this.outlineBodyEl = panel.createDiv({ cls: "volis-outline-body" });
     this.outlinePanel = panel;
@@ -8343,11 +9716,11 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
       return;
     const scrollTop = body.scrollTop;
     body.empty();
-    const inputs = this.nodes.map((node) => ({
-      id: node.id,
-      x: node.x,
-      y: node.y,
-      kind: node.type
+    const inputs = this.nodes.map((node2) => ({
+      id: node2.id,
+      x: node2.x,
+      y: node2.y,
+      kind: node2.type
     }));
     const result = buildOutline(inputs, this.edges, (input) => this.outlineInfoOf(input));
     if (result.nodeCount === 0) {
@@ -8397,7 +9770,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
         cls: "volis-outline-toggle",
         attr: { "aria-label": collapsed ? "\u5C55\u5F00" : "\u6298\u53E0" }
       });
-      (0, import_obsidian14.setIcon)(toggle, collapsed ? "chevron-right" : "chevron-down");
+      (0, import_obsidian16.setIcon)(toggle, collapsed ? "chevron-right" : "chevron-down");
       toggle.addEventListener("click", (evt) => {
         evt.stopPropagation();
         if (collapsed)
@@ -8451,14 +9824,14 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
   }
   focusNodeInBoard(nodeId) {
     var _a, _b;
-    const node = this.nodeMap.get(nodeId);
-    if (!node)
+    const node2 = this.nodeMap.get(nodeId);
+    if (!node2)
       return;
     const el = this.nodeEls.get(nodeId);
-    const height = (_b = (_a = el == null ? void 0 : el.offsetHeight) != null ? _a : node.height) != null ? _b : 100;
+    const height = (_b = (_a = el == null ? void 0 : el.offsetHeight) != null ? _a : node2.height) != null ? _b : 100;
     const rect = this.root.getBoundingClientRect();
-    const centerX = node.x + node.width / 2;
-    const centerY = node.y + height / 2;
+    const centerX = node2.x + node2.width / 2;
+    const centerY = node2.y + height / 2;
     this.tx = rect.width / 2 - centerX * this.scale;
     this.ty = rect.height / 2 - centerY * this.scale;
     this.selectedEdgeId = null;
@@ -8498,29 +9871,29 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     }, 220);
   }
   outlineSignature() {
-    const nodes = this.nodes.map((node) => {
+    const nodes = this.nodes.map((node2) => {
       var _a;
-      const label = node.type === "group" ? (_a = node.label) != null ? _a : "" : "";
-      return `${node.id}@${Math.round(node.x)},${Math.round(node.y)}:${node.type}:${label}`;
+      const label = node2.type === "group" ? (_a = node2.label) != null ? _a : "" : "";
+      return `${node2.id}@${Math.round(node2.x)},${Math.round(node2.y)}:${node2.type}:${label}`;
     }).join("|");
     const edges = this.edges.map((edge) => {
       var _a;
       return `${edge.from}>${edge.to}:${(_a = edge.relation) != null ? _a : ""}`;
     }).join("|");
-    const text = this.nodes.map((node) => {
+    const text = this.nodes.map((node2) => {
       var _a;
-      return ((_a = this.nodeText.get(node.id)) != null ? _a : "").slice(0, 120);
+      return ((_a = this.nodeText.get(node2.id)) != null ? _a : "").slice(0, 120);
     }).join("|");
     return `${nodes}##${edges}##${text}`;
   }
   /** Opens the Markdown export dialog. Public so a command can reach it. */
   openExportModal() {
     var _a, _b;
-    const inputs = this.nodes.map((node) => ({
-      id: node.id,
-      x: node.x,
-      y: node.y,
-      kind: node.type
+    const inputs = this.nodes.map((node2) => ({
+      id: node2.id,
+      x: node2.x,
+      y: node2.y,
+      kind: node2.type
     }));
     const result = buildOutline(inputs, this.edges, (input) => this.outlineInfoOf(input));
     const infoById = /* @__PURE__ */ new Map();
@@ -8557,20 +9930,20 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     }).open();
   }
   exportTitleOf(id) {
-    const node = this.nodeMap.get(id);
-    if (!node)
+    const node2 = this.nodeMap.get(id);
+    if (!node2)
       return "\u672A\u547D\u540D";
-    return this.outlineInfoOf({ id, x: node.x, y: node.y, kind: node.type }).title;
+    return this.outlineInfoOf({ id, x: node2.x, y: node2.y, kind: node2.type }).title;
   }
   exportInfoOf(item) {
     var _a;
-    const node = this.nodeMap.get(item.id);
-    if (!node || node.type === "group")
+    const node2 = this.nodeMap.get(item.id);
+    if (!node2 || node2.type === "group")
       return { title: item.title, body: "" };
-    if (node.type === "file") {
-      return { title: item.title, body: `[[${node.file}|${item.title}]]` };
+    if (node2.type === "file") {
+      return { title: item.title, body: `[[${node2.file}|${item.title}]]` };
     }
-    const full = (_a = this.nodeText.get(node.id)) != null ? _a : node.type === "text" ? node.text : "";
+    const full = (_a = this.nodeText.get(node2.id)) != null ? _a : node2.type === "text" ? node2.text : "";
     return { title: item.title, body: this.exportBody(full) };
   }
   /** The first line already became the heading; the rest is the body. */
@@ -8598,9 +9971,9 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     const file = await this.app.vault.create(path, markdown);
     return file.path;
   }
-  outlineInfoOf(node) {
+  outlineInfoOf(node2) {
     var _a, _b, _c;
-    const source = this.nodeMap.get(node.id);
+    const source = this.nodeMap.get(node2.id);
     if (!source)
       return { title: "\u672A\u547D\u540D" };
     if (source.type === "group") {
@@ -8608,7 +9981,7 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     }
     if (source.type === "file") {
       const file = this.app.vault.getAbstractFileByPath(source.file);
-      const name = file instanceof import_obsidian14.TFile ? file.basename : (_b = source.file.split("/").pop()) != null ? _b : "\u6587\u4EF6";
+      const name = file instanceof import_obsidian16.TFile ? file.basename : (_b = source.file.split("/").pop()) != null ? _b : "\u6587\u4EF6";
       const body = this.nodeText.get(source.id);
       const snippet = body ? this.outlineSnippet(body) : "";
       return { title: name, snippet: snippet || void 0 };
@@ -8639,8 +10012,8 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     return raw.replace(/^\s{0,3}#{1,6}\s+/, "").replace(/^\s*>\s?/, "").replace(/^\s*[-*+]\s+\[[ xX]\]\s+/, "").replace(/^\s*[-*+]\s+/, "").replace(/!?\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_match, target, alias) => {
       if (alias)
         return alias;
-      const clean = target.split("#")[0];
-      return clean.split("/").pop() || target;
+      const clean2 = target.split("#")[0];
+      return clean2.split("/").pop() || target;
     }).replace(/\[([^\]]+)\]\([^)]*\)/g, "$1").replace(/`([^`]*)`/g, "$1").replace(/\*\*|__|~~/g, "").replace(/(^|\s)#[\p{L}\p{N}_/-]+/gu, " ").replace(/\s+/g, " ").trim();
   }
   outlineTruncate(text, max) {
@@ -8662,10 +10035,10 @@ ${head.content}` }, ...recent.slice(1)] : [{ role: "user", content: block }, ...
     return {
       version: 1,
       edges: this.edges,
-      nodes: this.nodes.map((node) => ({
-        ...node,
-        x: Math.round(node.x),
-        y: Math.round(node.y)
+      nodes: this.nodes.map((node2) => ({
+        ...node2,
+        x: Math.round(node2.x),
+        y: Math.round(node2.y)
       })),
       viewport: {
         tx: Math.round(this.tx),
@@ -8684,32 +10057,9 @@ function normalizeTags(text) {
   return text.replace(/([^\s#\w])#([\p{L}\p{N}_/-]+)/gu, "$1 #$2");
 }
 
-// src/board/boardStore.ts
-var BOARD_EXTENSION = "volis";
-function blankBoardData() {
-  return { version: 1, nodes: [], edges: [] };
-}
-async function nextBoardPath(app, folder) {
-  const dir = folder.replace(/^\/+|\/+$/g, "");
-  const adapter = app.vault.adapter;
-  const base = "\u672A\u547D\u540D";
-  let name = `${base}.${BOARD_EXTENSION}`;
-  let index = 1;
-  let path = dir ? `${dir}/${name}` : name;
-  while (await adapter.exists(path)) {
-    name = `${base} ${index}.${BOARD_EXTENSION}`;
-    path = dir ? `${dir}/${name}` : name;
-    index += 1;
-  }
-  return path;
-}
-function listBoards(app) {
-  return app.vault.getFiles().filter((file) => file.extension.toLowerCase() === BOARD_EXTENSION).sort((a, b) => b.stat.mtime - a.stat.mtime);
-}
-
 // src/board/boardPicker.ts
-var import_obsidian15 = require("obsidian");
-var BoardPickerModal = class extends import_obsidian15.FuzzySuggestModal {
+var import_obsidian17 = require("obsidian");
+var BoardPickerModal = class extends import_obsidian17.FuzzySuggestModal {
   constructor(app, onPick) {
     super(app);
     this.onPick = onPick;
@@ -8736,18 +10086,18 @@ var ContextMenuInjector = class {
   install(plugin) {
     const workspace = this.app.workspace;
     plugin.registerEvent(
-      workspace.on("canvas:node-menu", (menu, node) => {
+      workspace.on("canvas:node-menu", (menu, node2) => {
         try {
-          this.inject(menu, node);
+          this.inject(menu, node2);
         } catch (error) {
           console.error("[Volis] menu injection failed", error);
         }
       })
     );
   }
-  inject(menu, node) {
+  inject(menu, node2) {
     var _a;
-    const data = typeof node.getData === "function" ? (_a = node.getData()) != null ? _a : {} : node;
+    const data = typeof node2.getData === "function" ? (_a = node2.getData()) != null ? _a : {} : node2;
     const nodeId = data.id;
     if (!nodeId)
       return;
@@ -8770,8 +10120,8 @@ var ContextMenuInjector = class {
 };
 
 // src/ui/cardEditor.ts
-var import_obsidian16 = require("obsidian");
-var CardEditorModal = class extends import_obsidian16.Modal {
+var import_obsidian18 = require("obsidian");
+var CardEditorModal = class extends import_obsidian18.Modal {
   constructor(app, meta, onSave) {
     super(app);
     this.meta = meta;
@@ -8826,7 +10176,7 @@ var CardEditorModal = class extends import_obsidian16.Modal {
     }
     const ok = await this.onSave(this.value);
     if (!ok) {
-      new import_obsidian16.Notice("\u4FDD\u5B58\u5931\u8D25\uFF1A\u5361\u7247\u53EF\u80FD\u5DF2\u79FB\u52A8\u6216\u5220\u9664");
+      new import_obsidian18.Notice("\u4FDD\u5B58\u5931\u8D25\uFF1A\u5361\u7247\u53EF\u80FD\u5DF2\u79FB\u52A8\u6216\u5220\u9664");
       return;
     }
     this.close();
@@ -8837,10 +10187,10 @@ var CardEditorModal = class extends import_obsidian16.Modal {
 };
 
 // src/settingsTab.ts
-var import_obsidian18 = require("obsidian");
+var import_obsidian20 = require("obsidian");
 
 // src/ui/aiProfileModal.ts
-var import_obsidian17 = require("obsidian");
+var import_obsidian19 = require("obsidian");
 var PRESETS = {
   deepseek: { name: "DeepSeek", protocol: "openai", baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat" },
   kimi: { name: "Kimi", protocol: "openai", baseUrl: "https://api.moonshot.cn/v1", model: "moonshot-v1-8k" },
@@ -8850,7 +10200,7 @@ var PRESETS = {
   anthropic: { name: "Anthropic", protocol: "anthropic", baseUrl: "https://api.anthropic.com", model: "claude-sonnet-4-20250514" },
   ollama: { name: "\u672C\u5730 Ollama", protocol: "openai", baseUrl: "http://localhost:11434/v1", model: "qwen2.5" }
 };
-var AIProfileModal = class extends import_obsidian17.Modal {
+var AIProfileModal = class extends import_obsidian19.Modal {
   constructor(app, profile, onSubmit) {
     super(app);
     this.onSubmit = onSubmit;
@@ -8873,7 +10223,7 @@ var AIProfileModal = class extends import_obsidian17.Modal {
     contentEl.empty();
     contentEl.addClass("volis-ai-modal");
     contentEl.createEl("h3", { text: this.draft.name ? "\u7F16\u8F91\u6A21\u578B\u914D\u7F6E" : "\u6DFB\u52A0\u6A21\u578B\u914D\u7F6E" });
-    new import_obsidian17.Setting(contentEl).setName("\u5FEB\u901F\u586B\u5165").setDesc("\u9009\u4E00\u4E2A\u670D\u52A1\u81EA\u52A8\u586B\u597D\u5730\u5740\u548C\u6A21\u578B\uFF0CKey \u4ECD\u9700\u81EA\u5DF1\u586B\u3002").addDropdown((dropdown) => {
+    new import_obsidian19.Setting(contentEl).setName("\u5FEB\u901F\u586B\u5165").setDesc("\u9009\u4E00\u4E2A\u670D\u52A1\u81EA\u52A8\u586B\u597D\u5730\u5740\u548C\u6A21\u578B\uFF0CKey \u4ECD\u9700\u81EA\u5DF1\u586B\u3002").addDropdown((dropdown) => {
       dropdown.addOption("", "\u9009\u62E9\u670D\u52A1\u2026");
       for (const [key, preset] of Object.entries(PRESETS)) {
         dropdown.addOption(key, preset.name);
@@ -8892,7 +10242,7 @@ var AIProfileModal = class extends import_obsidian17.Modal {
       });
     });
     this.fieldsEl = contentEl.createDiv();
-    new import_obsidian17.Setting(contentEl).addButton((button) => button.setButtonText("\u53D6\u6D88").onClick(() => this.close())).addButton((button) => button.setButtonText("\u4FDD\u5B58").setCta().onClick(() => this.submit()));
+    new import_obsidian19.Setting(contentEl).addButton((button) => button.setButtonText("\u53D6\u6D88").onClick(() => this.close())).addButton((button) => button.setButtonText("\u4FDD\u5B58").setCta().onClick(() => this.submit()));
     this.renderFields();
   }
   renderFields() {
@@ -8901,22 +10251,22 @@ var AIProfileModal = class extends import_obsidian17.Modal {
     if (!host)
       return;
     host.empty();
-    new import_obsidian17.Setting(host).setName("\u540D\u79F0").addText((text) => {
+    new import_obsidian19.Setting(host).setName("\u540D\u79F0").addText((text) => {
       text.setPlaceholder("\u4F8B\u5982 DeepSeek").setValue(this.draft.name).onChange((value) => {
         this.draft.name = value.trim();
       });
     });
-    new import_obsidian17.Setting(host).setName("\u63A5\u53E3\u534F\u8BAE").addDropdown(
+    new import_obsidian19.Setting(host).setName("\u63A5\u53E3\u534F\u8BAE").addDropdown(
       (dropdown) => dropdown.addOption("openai", "OpenAI \u517C\u5BB9").addOption("anthropic", "Anthropic Messages").setValue(this.draft.protocol).onChange((value) => {
         this.draft.protocol = value === "anthropic" ? "anthropic" : "openai";
       })
     );
-    new import_obsidian17.Setting(host).setName("\u63A5\u53E3\u5730\u5740").setDesc("\u4F8B\u5982 https://api.deepseek.com/v1").addText((text) => {
+    new import_obsidian19.Setting(host).setName("\u63A5\u53E3\u5730\u5740").setDesc("\u4F8B\u5982 https://api.deepseek.com/v1").addText((text) => {
       text.setPlaceholder("https://").setValue(this.draft.baseUrl).onChange((value) => {
         this.draft.baseUrl = value.trim();
       });
     });
-    new import_obsidian17.Setting(host).setName("\u6A21\u578B").setDesc("\u6539\u52A8\u6A21\u578B\u540D\u540E\uFF0C\u80FD\u529B\u503C\u4F1A\u6309\u540D\u5B57\u91CD\u65B0\u63A8\u65AD\uFF1B\u4E5F\u53EF\u70B9\u4E0B\u9762\u7684\u300C\u63A2\u6D4B\u300D\u3002").addText((text) => {
+    new import_obsidian19.Setting(host).setName("\u6A21\u578B").setDesc("\u6539\u52A8\u6A21\u578B\u540D\u540E\uFF0C\u80FD\u529B\u503C\u4F1A\u6309\u540D\u5B57\u91CD\u65B0\u63A8\u65AD\uFF1B\u4E5F\u53EF\u70B9\u4E0B\u9762\u7684\u300C\u63A2\u6D4B\u300D\u3002").addText((text) => {
       text.setPlaceholder("deepseek-chat").setValue(this.draft.model).onChange((value) => {
         var _a2;
         this.draft.model = value.trim();
@@ -8925,7 +10275,7 @@ var AIProfileModal = class extends import_obsidian17.Modal {
         }
       });
     });
-    new import_obsidian17.Setting(host).setName("API Key").setDesc("\u4EC5\u4FDD\u5B58\u5728\u672C\u673A\u63D2\u4EF6\u914D\u7F6E\u4E2D\u3002").addText((text) => {
+    new import_obsidian19.Setting(host).setName("API Key").setDesc("\u4EC5\u4FDD\u5B58\u5728\u672C\u673A\u63D2\u4EF6\u914D\u7F6E\u4E2D\u3002").addText((text) => {
       text.inputEl.type = "password";
       text.setPlaceholder("sk-\u2026").setValue(this.draft.apiKey).onChange((value) => {
         this.draft.apiKey = value.trim();
@@ -8937,7 +10287,7 @@ var AIProfileModal = class extends import_obsidian17.Modal {
       text: "\u8FD9\u4E24\u9879\u586B\u7684\u662F\u300C\u8FD9\u4E2A\u6A21\u578B\u80FD\u5403\u591A\u5C11\u300D\uFF0C\u4E0D\u662F\u63D2\u4EF6\u7684\u9650\u5236\u3002\u7559\u7A7A\u8868\u793A\u6309\u6A21\u578B\u540D\u81EA\u52A8\u63A8\u65AD\uFF1B\u586B\u9519\u4E86\u53EA\u4F1A\u8BA9\u63D2\u4EF6\u5C11\u7528\u6216\u591A\u7528\u4E00\u70B9\u4F59\u91CF\uFF0C\u4E0D\u4F1A\u635F\u574F\u6570\u636E\u3002"
     });
     const capability = (_a = this.draft.capability) != null ? _a : inferCapability(this.draft.model);
-    new import_obsidian17.Setting(host).setName("\u4E0A\u4E0B\u6587\u7A97\u53E3\uFF08token\uFF09").setDesc(`\u5F53\u524D\uFF1A${describeCapability(capability)} \xB7 ${capabilitySourceLabel(capability.source)}`).addText((text) => {
+    new import_obsidian19.Setting(host).setName("\u4E0A\u4E0B\u6587\u7A97\u53E3\uFF08token\uFF09").setDesc(`\u5F53\u524D\uFF1A${describeCapability(capability)} \xB7 ${capabilitySourceLabel(capability.source)}`).addText((text) => {
       text.inputEl.type = "number";
       text.setPlaceholder(String(capability.contextWindow)).setValue(String(capability.contextWindow)).onChange((value) => {
         var _a2, _b;
@@ -8955,7 +10305,7 @@ var AIProfileModal = class extends import_obsidian17.Modal {
         };
       });
     });
-    new import_obsidian17.Setting(host).setName("\u5355\u6B21\u8F93\u51FA\u4E0A\u9650\uFF08token\uFF09").setDesc(
+    new import_obsidian19.Setting(host).setName("\u5355\u6B21\u8F93\u51FA\u4E0A\u9650\uFF08token\uFF09").setDesc(
       "\u6A21\u578B\u4E00\u6B21\u6700\u591A\u80FD\u5199\u591A\u5C11\u3002\u601D\u8003\u8FC7\u7A0B\u4E5F\u82B1\u8FD9\u4EFD\u989D\u5EA6\uFF0C\u6240\u4EE5\u5E26\u601D\u8003\u7684\u6A21\u578B\u5EFA\u8BAE 16384 \u4EE5\u4E0A\u3002"
     ).addText((text) => {
       text.inputEl.type = "number";
@@ -8980,13 +10330,13 @@ var AIProfileModal = class extends import_obsidian17.Modal {
         };
       });
     });
-    new import_obsidian17.Setting(host).setName("\u63A2\u6D4B\u771F\u5B9E\u4E0A\u9650").setDesc("\u5411\u63A5\u53E3\u95EE\u4E00\u6B21\uFF0C\u80FD\u8BFB\u5230\u5C31\u5199\u8FDB\u6765\uFF1B\u8BFB\u4E0D\u5230\u4F1A\u8BF4\u660E\u539F\u56E0\uFF0C\u4E0D\u4F1A\u778E\u731C\u3002").addButton(
+    new import_obsidian19.Setting(host).setName("\u63A2\u6D4B\u771F\u5B9E\u4E0A\u9650").setDesc("\u5411\u63A5\u53E3\u95EE\u4E00\u6B21\uFF0C\u80FD\u8BFB\u5230\u5C31\u5199\u8FDB\u6765\uFF1B\u8BFB\u4E0D\u5230\u4F1A\u8BF4\u660E\u539F\u56E0\uFF0C\u4E0D\u4F1A\u778E\u731C\u3002").addButton(
       (button) => button.setButtonText(this.probing ? "\u63A2\u6D4B\u4E2D\u2026" : "\u63A2\u6D4B").onClick(async () => {
         var _a2, _b;
         if (this.probing)
           return;
         if (!this.draft.baseUrl.trim() || !this.draft.model.trim() || !this.draft.apiKey.trim()) {
-          new import_obsidian17.Notice("\u5148\u586B\u597D\u5730\u5740\u3001\u6A21\u578B\u548C Key \u518D\u63A2\u6D4B");
+          new import_obsidian19.Notice("\u5148\u586B\u597D\u5730\u5740\u3001\u6A21\u578B\u548C Key \u518D\u63A2\u6D4B");
           return;
         }
         this.probing = true;
@@ -8998,12 +10348,12 @@ var AIProfileModal = class extends import_obsidian17.Modal {
           });
           if (result.capability) {
             this.draft.capability = result.capability;
-            new import_obsidian17.Notice(`\u5DF2\u63A2\u6D4B\uFF1A${describeCapability(result.capability)}`);
+            new import_obsidian19.Notice(`\u5DF2\u63A2\u6D4B\uFF1A${describeCapability(result.capability)}`);
           } else {
-            new import_obsidian17.Notice((_b = result.notes[0]) != null ? _b : "\u6CA1\u6709\u63A2\u6D4B\u5230\uFF0C\u4FDD\u7559\u5F53\u524D\u503C");
+            new import_obsidian19.Notice((_b = result.notes[0]) != null ? _b : "\u6CA1\u6709\u63A2\u6D4B\u5230\uFF0C\u4FDD\u7559\u5F53\u524D\u503C");
           }
         } catch (error) {
-          new import_obsidian17.Notice(`\u63A2\u6D4B\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`);
+          new import_obsidian19.Notice(`\u63A2\u6D4B\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`);
         } finally {
           this.probing = false;
           this.renderFields();
@@ -9011,7 +10361,7 @@ var AIProfileModal = class extends import_obsidian17.Modal {
       })
     );
     host.createEl("h4", { text: "\u8C03\u7528\u504F\u597D" });
-    new import_obsidian17.Setting(host).setName("\u601D\u8003\u6A21\u5F0F").setDesc(
+    new import_obsidian19.Setting(host).setName("\u601D\u8003\u6A21\u5F0F").setDesc(
       "\u81EA\u52A8\uFF1A\u4E0D\u53D1\u9001\u601D\u8003\u53C2\u6570\uFF0C\u6CBF\u7528\u6A21\u578B\u9ED8\u8BA4\u884C\u4E3A\u3002\u5F00\u542F\uFF1A\u663E\u5F0F\u8BF7\u6C42\u63A8\u7406\uFF0C\u4F1A\u6D88\u8017\u8F93\u51FA\u989D\u5EA6\u3002\u5173\u95ED\uFF1A\u8DF3\u8FC7\u63A8\u7406\uFF0C\u6B63\u6587\u66F4\u591A\u3001\u54CD\u5E94\u66F4\u5FEB\uFF0C\u5206\u6790\u6DF1\u5EA6\u53EF\u80FD\u4E0B\u964D\u3002"
     ).addDropdown(
       (dropdown) => {
@@ -9021,7 +10371,7 @@ var AIProfileModal = class extends import_obsidian17.Modal {
         });
       }
     );
-    new import_obsidian17.Setting(host).setName("\u7F13\u5B58\u524D\u7F00").setDesc(
+    new import_obsidian19.Setting(host).setName("\u7F13\u5B58\u524D\u7F00").setDesc(
       "\u4EC5 Anthropic \u534F\u8BAE\u751F\u6548\uFF1A\u7ED9\u767D\u677F\u5185\u5BB9\u6253\u7F13\u5B58\u6807\u8BB0\uFF0C\u8FDE\u7EED\u8FFD\u95EE\u65F6\u8F93\u5165\u8D39\u5927\u5E45\u4E0B\u964D\uFF08\u5B9E\u6D4B\u53EF\u7701 99%\uFF09\u3002\u7F51\u5173\u4E0D\u652F\u6301\u65F6\u4F1A\u81EA\u52A8\u53BB\u6389\u91CD\u8BD5\u3002"
     ).addToggle(
       (toggle) => toggle.setValue(this.draft.cache !== false).onChange((value) => {
@@ -9038,15 +10388,15 @@ var AIProfileModal = class extends import_obsidian17.Modal {
     var _a, _b;
     const baseUrl = sanitizeBaseUrl(this.draft.baseUrl);
     if (!this.draft.name.trim()) {
-      new import_obsidian17.Notice("\u8BF7\u586B\u5199\u540D\u79F0");
+      new import_obsidian19.Notice("\u8BF7\u586B\u5199\u540D\u79F0");
       return;
     }
     if (!baseUrl) {
-      new import_obsidian17.Notice("\u8BF7\u586B\u5199\u63A5\u53E3\u5730\u5740");
+      new import_obsidian19.Notice("\u8BF7\u586B\u5199\u63A5\u53E3\u5730\u5740");
       return;
     }
     if (!this.draft.model.trim()) {
-      new import_obsidian17.Notice("\u8BF7\u586B\u5199\u6A21\u578B\u540D");
+      new import_obsidian19.Notice("\u8BF7\u586B\u5199\u6A21\u578B\u540D");
       return;
     }
     const capability = (_a = this.draft.capability) != null ? _a : inferCapability(this.draft.model.trim());
@@ -9073,7 +10423,7 @@ function voidAsync(fn) {
     void fn();
   };
 }
-var VolisSettingTab = class extends import_obsidian18.PluginSettingTab {
+var VolisSettingTab = class extends import_obsidian20.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
@@ -9082,30 +10432,30 @@ var VolisSettingTab = class extends import_obsidian18.PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.addClass("volis-settings");
-    new import_obsidian18.Setting(containerEl).setName("\u5E38\u89C4").setHeading();
+    new import_obsidian20.Setting(containerEl).setName("\u5E38\u89C4").setHeading();
     this.divider(containerEl);
-    new import_obsidian18.Setting(containerEl).setName("\u89D2\u6807").setHeading();
-    new import_obsidian18.Setting(containerEl).setName("\u663E\u793A\u89D2\u6807").setDesc("\u5728\u5361\u7247\u8282\u70B9\u53F3\u4E0B\u89D2\u663E\u793A\u65E5\u671F\u3002\u4EC5\u5728\u753B\u5E03\u89C6\u56FE\u4E2D\u751F\u6548\uFF0C\u4E0D\u5F71\u54CD\u5361\u7247\u6B63\u6587\u3002").addToggle(
+    new import_obsidian20.Setting(containerEl).setName("\u89D2\u6807").setHeading();
+    new import_obsidian20.Setting(containerEl).setName("\u663E\u793A\u89D2\u6807").setDesc("\u5728\u5361\u7247\u8282\u70B9\u53F3\u4E0B\u89D2\u663E\u793A\u65E5\u671F\u3002\u4EC5\u5728\u753B\u5E03\u89C6\u56FE\u4E2D\u751F\u6548\uFF0C\u4E0D\u5F71\u54CD\u5361\u7247\u6B63\u6587\u3002").addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.showBadge).onChange(async (value) => {
         this.plugin.settings.showBadge = value;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian18.Setting(containerEl).setName("\u89D2\u6807\u5185\u5BB9").setDesc("\u7CBE\u7B80\u53EA\u663E\u793A\u65E5\u671F\uFF1B\u5B8C\u6574\u663E\u793A\u6807\u7B7E\u3001\u65E5\u671F\u548C\u65F6\u95F4\u3002").addDropdown(
+    new import_obsidian20.Setting(containerEl).setName("\u89D2\u6807\u5185\u5BB9").setDesc("\u7CBE\u7B80\u53EA\u663E\u793A\u65E5\u671F\uFF1B\u5B8C\u6574\u663E\u793A\u6807\u7B7E\u3001\u65E5\u671F\u548C\u65F6\u95F4\u3002").addDropdown(
       (dropdown) => dropdown.addOption("date", "\u7CBE\u7B80\uFF0811-11\uFF09").addOption("full", "\u5B8C\u6574\uFF08#\u6807\u7B7E 11-11 11:08\uFF09").setValue(this.plugin.settings.badgeFormat).onChange(async (value) => {
         this.plugin.settings.badgeFormat = value === "full" ? "full" : "date";
         await this.plugin.saveSettings();
       })
     );
     this.divider(containerEl);
-    new import_obsidian18.Setting(containerEl).setName("\u767D\u677F").setHeading();
-    new import_obsidian18.Setting(containerEl).setName("\u767D\u677F\u4FDD\u5B58\u4F4D\u7F6E").setDesc("\u65B0\u5EFA\u767D\u677F\u65F6\u628A\u6587\u4EF6\u5B58\u5230\u8FD9\u4E2A\u6587\u4EF6\u5939\uFF1B\u7559\u7A7A\u8868\u793A\u5E93\u6839\u76EE\u5F55\u3002\u6BCF\u6B21\u65B0\u5EFA\u90FD\u4F1A\u751F\u6210\u4E00\u4E2A\u72EC\u7ACB\u6587\u4EF6\u3002").addText(
+    new import_obsidian20.Setting(containerEl).setName("\u767D\u677F").setHeading();
+    new import_obsidian20.Setting(containerEl).setName("\u767D\u677F\u4FDD\u5B58\u4F4D\u7F6E").setDesc("\u65B0\u5EFA\u767D\u677F\u65F6\u628A\u6587\u4EF6\u5B58\u5230\u8FD9\u4E2A\u6587\u4EF6\u5939\uFF1B\u7559\u7A7A\u8868\u793A\u5E93\u6839\u76EE\u5F55\u3002\u6BCF\u6B21\u65B0\u5EFA\u90FD\u4F1A\u751F\u6210\u4E00\u4E2A\u72EC\u7ACB\u6587\u4EF6\u3002").addText(
       (text) => text.setPlaceholder("\u7559\u7A7A = \u5E93\u6839\u76EE\u5F55").setValue(this.plugin.settings.boardFolder).onChange(async (value) => {
         this.plugin.settings.boardFolder = value.trim();
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian18.Setting(containerEl).setName("\u5361\u7247\u7B14\u8BB0\u76EE\u5F55").setDesc("\u4ECE\u767D\u677F\u8F6C\u6210\u5361\u7247\u65F6\u5199\u5230\u8FD9\u91CC\u3002\u7559\u7A7A\u5219\u81EA\u52A8\u8BFB Collis \u7684\u8BBE\u7F6E\uFF0C\u8BFB\u4E0D\u5230\u7528 00-Inbox/\u901F\u8BB0\u3002").addText(
+    new import_obsidian20.Setting(containerEl).setName("\u5361\u7247\u7B14\u8BB0\u76EE\u5F55").setDesc("\u4ECE\u767D\u677F\u8F6C\u6210\u5361\u7247\u65F6\u5199\u5230\u8FD9\u91CC\u3002\u7559\u7A7A\u5219\u81EA\u52A8\u8BFB Collis \u7684\u8BBE\u7F6E\uFF0C\u8BFB\u4E0D\u5230\u7528 00-Inbox/\u901F\u8BB0\u3002").addText(
       (text) => text.setPlaceholder("\u7559\u7A7A = \u8DDF\u968F Collis").setValue(this.plugin.settings.cardFolder).onChange(async (value) => {
         this.plugin.settings.cardFolder = value.trim();
         await this.plugin.saveSettings();
@@ -9121,10 +10471,10 @@ var VolisSettingTab = class extends import_obsidian18.PluginSettingTab {
     host.createDiv({ cls: "volis-settings-divider" });
   }
   renderAI(containerEl) {
-    new import_obsidian18.Setting(containerEl).setName("AI").setHeading();
+    new import_obsidian20.Setting(containerEl).setName("AI").setHeading();
     const ai = this.plugin.settings.ai;
     const save = () => this.plugin.saveSettings();
-    new import_obsidian18.Setting(containerEl).setName("\u542F\u7528 AI").setDesc("\u5F00\u542F\u540E\u53EF\u5728\u767D\u677F\u4E2D\u9009\u4E2D\u8282\u70B9\u63D0\u95EE\uFF0C\u5185\u5BB9\u53D1\u9001\u81F3\u5F53\u524D\u542F\u7528\u7684\u6A21\u578B\u3002").addToggle(
+    new import_obsidian20.Setting(containerEl).setName("\u542F\u7528 AI").setDesc("\u5F00\u542F\u540E\u53EF\u5728\u767D\u677F\u4E2D\u9009\u4E2D\u8282\u70B9\u63D0\u95EE\uFF0C\u5185\u5BB9\u53D1\u9001\u81F3\u5F53\u524D\u542F\u7528\u7684\u6A21\u578B\u3002").addToggle(
       (toggle) => toggle.setValue(ai.enabled).onChange(async (value) => {
         ai.enabled = value;
         await save();
@@ -9134,7 +10484,7 @@ var VolisSettingTab = class extends import_obsidian18.PluginSettingTab {
       cls: "volis-ai-hint",
       text: "\u53D1\u9001\u91CF\u7531\u6A21\u578B\u81EA\u5DF1\u7684\u7A97\u53E3\u51B3\u5B9A\uFF0C\u63D2\u4EF6\u4E0D\u989D\u5916\u8BBE\u9650\uFF1B\u5B9E\u9645\u7528\u91CF\u89C1 AI \u9762\u677F\u9876\u90E8\u3002\u6279\u91CF\u5904\u7406\u4E0A\u767E\u6761\u5361\u7247\u65F6\u5EFA\u8BAE\u9009 200K \u4EE5\u4E0A\u7A97\u53E3\u7684\u6A21\u578B\u3002"
     });
-    new import_obsidian18.Setting(containerEl).setName("\u9ED8\u8BA4\u601D\u8003\u6A21\u5F0F").setDesc(
+    new import_obsidian20.Setting(containerEl).setName("\u9ED8\u8BA4\u601D\u8003\u6A21\u5F0F").setDesc(
       "\u65B0\u5EFA\u914D\u7F6E\u672A\u5355\u72EC\u6307\u5B9A\u65F6\u91C7\u7528\u3002\u5F00\u542F\uFF1A\u6A21\u578B\u5148\u63A8\u7406\u518D\u4F5C\u7B54\uFF0C\u5360\u7528\u8F93\u51FA\u989D\u5EA6\uFF0C\u5206\u6790\u66F4\u6DF1\u3002\u5173\u95ED\uFF1A\u8DF3\u8FC7\u63A8\u7406\uFF0C\u6B63\u6587\u66F4\u591A\u3001\u54CD\u5E94\u66F4\u5FEB\u3002\u81EA\u52A8\uFF1A\u6CBF\u7528\u6A21\u578B\u5382\u5546\u7684\u9ED8\u8BA4\u884C\u4E3A\u3002"
     ).addDropdown(
       (dropdown) => dropdown.addOption("auto", "\u81EA\u52A8\uFF08\u6CBF\u7528\u6A21\u578B\u9ED8\u8BA4\uFF09").addOption("on", "\u5F00\u542F\uFF08\u663E\u5F0F\u542F\u7528\u63A8\u7406\uFF09").addOption("off", "\u5173\u95ED\uFF08\u8DF3\u8FC7\u63A8\u7406\uFF09").setValue(ai.thinking).onChange(async (value) => {
@@ -9142,13 +10492,13 @@ var VolisSettingTab = class extends import_obsidian18.PluginSettingTab {
         await save();
       })
     );
-    new import_obsidian18.Setting(containerEl).setName("\u5185\u5BB9\u88C5\u4E0D\u4E0B\u65F6").setDesc("\u8D85\u51FA\u6A21\u578B\u7A97\u53E3\u65F6\u7684\u5904\u7406\u65B9\u5F0F\u3002\u4E24\u79CD\u65B9\u5F0F\u90FD\u4E0D\u4F1A\u9759\u9ED8\u5C11\u53D1\u3002").addDropdown(
+    new import_obsidian20.Setting(containerEl).setName("\u5185\u5BB9\u88C5\u4E0D\u4E0B\u65F6").setDesc("\u8D85\u51FA\u6A21\u578B\u7A97\u53E3\u65F6\u7684\u5904\u7406\u65B9\u5F0F\u3002\u4E24\u79CD\u65B9\u5F0F\u90FD\u4E0D\u4F1A\u9759\u9ED8\u5C11\u53D1\u3002").addDropdown(
       (dropdown) => dropdown.addOption("auto", "\u81EA\u52A8\u538B\u7F29\uFF08\u9762\u677F\u6807\u6CE8\u8C03\u6574\u5185\u5BB9\uFF09").addOption("ask", "\u5148\u8BE2\u95EE\u6211").setValue(ai.onOverflow).onChange(async (value) => {
         ai.onOverflow = value === "ask" ? "ask" : "auto";
         await save();
       })
     );
-    new import_obsidian18.Setting(containerEl).setName("\u6700\u591A\u7EED\u5199\u6BB5\u6570").setDesc("\u56DE\u7B54\u88AB\u8F93\u51FA\u4E0A\u9650\u622A\u65AD\u65F6\u81EA\u52A8\u7EED\u5199\u7684\u6BB5\u6570\uFF1B0 \u8868\u793A\u4E0D\u7EED\u5199\u3002").addSlider(
+    new import_obsidian20.Setting(containerEl).setName("\u6700\u591A\u7EED\u5199\u6BB5\u6570").setDesc("\u56DE\u7B54\u88AB\u8F93\u51FA\u4E0A\u9650\u622A\u65AD\u65F6\u81EA\u52A8\u7EED\u5199\u7684\u6BB5\u6570\uFF1B0 \u8868\u793A\u4E0D\u7EED\u5199\u3002").addSlider(
       (slider) => slider.setLimits(0, 6, 1).setValue(ai.continuations).setDynamicTooltip().onChange(async (value) => {
         ai.continuations = value;
         await save();
@@ -9162,7 +10512,7 @@ var VolisSettingTab = class extends import_obsidian18.PluginSettingTab {
     const ai = this.plugin.settings.ai;
     const details = containerEl.createEl("details", { cls: "volis-ai-advanced" });
     details.createEl("summary", { text: "\u9AD8\u7EA7 \xB7 \u5185\u5BB9\u5206\u914D\u89C4\u5219" });
-    new import_obsidian18.Setting(details).setName("\u7B14\u8BB0\u6BCF\u7BC7\u4FDD\u5E95\uFF08\u5B57\u7B26\uFF09").setDesc("\u957F\u7B14\u8BB0\u88AB\u538B\u7F29\u65F6\u81F3\u5C11\u4FDD\u7559\u8FD9\u4E48\u591A\u5B57\uFF0C\u907F\u514D\u53EA\u5269\u5F00\u5934\u4E00\u53E5\u3002").addText((text) => {
+    new import_obsidian20.Setting(details).setName("\u7B14\u8BB0\u6BCF\u7BC7\u4FDD\u5E95\uFF08\u5B57\u7B26\uFF09").setDesc("\u957F\u7B14\u8BB0\u88AB\u538B\u7F29\u65F6\u81F3\u5C11\u4FDD\u7559\u8FD9\u4E48\u591A\u5B57\uFF0C\u907F\u514D\u53EA\u5269\u5F00\u5934\u4E00\u53E5\u3002").addText((text) => {
       text.inputEl.type = "number";
       text.setPlaceholder(String(DEFAULT_CONTEXT_POLICY.noteFloorChars)).setValue(String(ai.policy.noteFloorChars)).onChange(async (value) => {
         const parsed = Number(value);
@@ -9172,7 +10522,7 @@ var VolisSettingTab = class extends import_obsidian18.PluginSettingTab {
         await save();
       });
     });
-    new import_obsidian18.Setting(details).setName("\u7B14\u8BB0\u5355\u7BC7\u4E0A\u9650\uFF08\u5B57\u7B26\uFF09").setDesc("\u5355\u7BC7\u6700\u591A\u53D1\u9001\u591A\u5C11\u5B57\uFF0C\u9632\u6B62\u4E00\u7BC7\u957F\u6587\u5403\u6389\u6574\u4E2A\u9884\u7B97\u3002").addText((text) => {
+    new import_obsidian20.Setting(details).setName("\u7B14\u8BB0\u5355\u7BC7\u4E0A\u9650\uFF08\u5B57\u7B26\uFF09").setDesc("\u5355\u7BC7\u6700\u591A\u53D1\u9001\u591A\u5C11\u5B57\uFF0C\u9632\u6B62\u4E00\u7BC7\u957F\u6587\u5403\u6389\u6574\u4E2A\u9884\u7B97\u3002").addText((text) => {
       text.inputEl.type = "number";
       text.setPlaceholder(String(DEFAULT_CONTEXT_POLICY.noteCapChars)).setValue(String(ai.policy.noteCapChars)).onChange(async (value) => {
         const parsed = Number(value);
@@ -9182,7 +10532,7 @@ var VolisSettingTab = class extends import_obsidian18.PluginSettingTab {
         await save();
       });
     });
-    new import_obsidian18.Setting(details).setName("\u666E\u901A\u8282\u70B9\u538B\u7F29\u9636\u68AF\uFF08\u5B57\u7B26\uFF09").setDesc("\u9884\u7B97\u4E0D\u591F\u65F6\u6309\u8FD9\u4E2A\u987A\u5E8F\u9010\u7EA7\u538B\u7F29\uFF0C\u9017\u53F7\u5206\u9694\uFF0C\u4ECE\u5BBD\u5230\u7A84\u3002").addText((text) => {
+    new import_obsidian20.Setting(details).setName("\u666E\u901A\u8282\u70B9\u538B\u7F29\u9636\u68AF\uFF08\u5B57\u7B26\uFF09").setDesc("\u9884\u7B97\u4E0D\u591F\u65F6\u6309\u8FD9\u4E2A\u987A\u5E8F\u9010\u7EA7\u538B\u7F29\uFF0C\u9017\u53F7\u5206\u9694\uFF0C\u4ECE\u5BBD\u5230\u7A84\u3002").addText((text) => {
       text.setPlaceholder(DEFAULT_CONTEXT_POLICY.ladder.join(", ")).setValue(ai.policy.ladder.join(", ")).onChange(async (value) => {
         const ladder = value.split(/[,，\s]+/).map((part) => Number(part)).filter((part) => Number.isFinite(part) && part >= 0);
         if (ladder.length === 0)
@@ -9191,7 +10541,7 @@ var VolisSettingTab = class extends import_obsidian18.PluginSettingTab {
         await save();
       });
     });
-    new import_obsidian18.Setting(details).setName("\u9884\u7B97\u5B89\u5168\u4F59\u91CF\uFF08token\uFF09").setDesc("\u6BCF\u6B21\u8BF7\u6C42\u9884\u7559\u8FD9\u4E48\u591A\uFF0C\u5438\u6536\u4F30\u7B97\u8BEF\u5DEE\u548C system \u63D0\u793A\u3002").addText((text) => {
+    new import_obsidian20.Setting(details).setName("\u9884\u7B97\u5B89\u5168\u4F59\u91CF\uFF08token\uFF09").setDesc("\u6BCF\u6B21\u8BF7\u6C42\u9884\u7559\u8FD9\u4E48\u591A\uFF0C\u5438\u6536\u4F30\u7B97\u8BEF\u5DEE\u548C system \u63D0\u793A\u3002").addText((text) => {
       text.inputEl.type = "number";
       text.setPlaceholder(String(DEFAULT_CONTEXT_POLICY.safetyTokens)).setValue(String(ai.policy.safetyTokens)).onChange(async (value) => {
         const parsed = Number(value);
@@ -9249,7 +10599,7 @@ var VolisSettingTab = class extends import_obsidian18.PluginSettingTab {
           cls: "volis-ai-icon",
           attr: { "aria-label": "\u7F16\u8F91" }
         });
-        (0, import_obsidian18.setIcon)(editBtn, "pencil");
+        (0, import_obsidian20.setIcon)(editBtn, "pencil");
         editBtn.addEventListener("click", () => {
           new AIProfileModal(this.app, profile, (next) => {
             void (async () => {
@@ -9266,7 +10616,7 @@ var VolisSettingTab = class extends import_obsidian18.PluginSettingTab {
           cls: "volis-ai-icon is-danger",
           attr: { "aria-label": "\u5220\u9664" }
         });
-        (0, import_obsidian18.setIcon)(delBtn, "trash-2");
+        (0, import_obsidian20.setIcon)(delBtn, "trash-2");
         delBtn.addEventListener("click", voidAsync(async () => {
           var _a2, _b;
           ai.profiles = ai.profiles.filter((item) => item.id !== profile.id);
@@ -9279,7 +10629,7 @@ var VolisSettingTab = class extends import_obsidian18.PluginSettingTab {
       }
     };
     renderCards();
-    new import_obsidian18.Setting(containerEl).setName("\u6DFB\u52A0\u914D\u7F6E").setDesc("\u6BCF\u4E2A\u914D\u7F6E\u53EF\u4EE5\u586B\u81EA\u5DF1\u7684\u7A97\u53E3\u548C\u8F93\u51FA\u4E0A\u9650\uFF0C\u4E92\u4E0D\u5F71\u54CD\u3002").addButton(
+    new import_obsidian20.Setting(containerEl).setName("\u6DFB\u52A0\u914D\u7F6E").setDesc("\u6BCF\u4E2A\u914D\u7F6E\u53EF\u4EE5\u586B\u81EA\u5DF1\u7684\u7A97\u53E3\u548C\u8F93\u51FA\u4E0A\u9650\uFF0C\u4E92\u4E0D\u5F71\u54CD\u3002").addButton(
       (button) => button.setButtonText("\u6DFB\u52A0\u914D\u7F6E").setCta().onClick(() => {
         new AIProfileModal(this.app, null, (profile) => {
           void (async () => {
@@ -9295,11 +10645,11 @@ var VolisSettingTab = class extends import_obsidian18.PluginSettingTab {
   }
   renderDiagnostics(containerEl) {
     var _a, _b;
-    new import_obsidian18.Setting(containerEl).setName("\u8BCA\u65AD").setHeading();
+    new import_obsidian20.Setting(containerEl).setName("\u8BCA\u65AD").setHeading();
     const stat = containerEl.createEl("p", {
       text: "\u5728\u753B\u5E03\u89C6\u56FE\u4E2D\u6253\u5F00\u672C\u9875\uFF0C\u53EF\u770B\u5230\u5F53\u524D\u8BC6\u522B\u5230\u7684\u5361\u7247\u6570\u91CF\u3002"
     });
-    new import_obsidian18.Setting(containerEl).setName("\u5F53\u524D\u753B\u5E03").addButton(
+    new import_obsidian20.Setting(containerEl).setName("\u5F53\u524D\u753B\u5E03").addButton(
       (button) => button.setButtonText("\u5237\u65B0\u8BC6\u522B").onClick(() => {
         this.plugin.scheduleRefresh(0);
         window.setTimeout(() => {
@@ -9311,7 +10661,7 @@ var VolisSettingTab = class extends import_obsidian18.PluginSettingTab {
       (profile) => profile.id === this.plugin.settings.ai.activeId
     );
     const capability = (_b = active == null ? void 0 : active.capability) != null ? _b : inferCapability((_a = active == null ? void 0 : active.model) != null ? _a : "");
-    new import_obsidian18.Setting(containerEl).setName("\u5F53\u524D\u6A21\u578B\u53EF\u7528\u8F93\u5165").setDesc(
+    new import_obsidian20.Setting(containerEl).setName("\u5F53\u524D\u6A21\u578B\u53EF\u7528\u8F93\u5165").setDesc(
       `\u7A97\u53E3 ${formatTokens(capability.contextWindow)} \u2212 \u8F93\u51FA ${formatTokens(capability.maxOutput)} \u2212 \u4F59\u91CF ${formatTokens(
         this.plugin.settings.ai.policy.safetyTokens
       )}`
@@ -9320,9 +10670,52 @@ var VolisSettingTab = class extends import_obsidian18.PluginSettingTab {
 };
 
 // src/main.ts
-var SVG_NS = "http://www.w3.org/2000/svg";
+var SVG_NS2 = "http://www.w3.org/2000/svg";
+var LEGACY_WORKBENCH_FOLDER = "\u767D\u677F";
+var RenameBoardFolderModal = class extends import_obsidian21.Modal {
+  constructor(app, from, to, count2, onResult) {
+    super(app);
+    this.from = from;
+    this.to = to;
+    this.count = count2;
+    this.onResult = onResult;
+  }
+  onOpen() {
+    const el = this.contentEl;
+    while (el.firstChild)
+      el.removeChild(el.firstChild);
+    const heading2 = document.createElement("h2");
+    heading2.textContent = `\u628A\u300C${this.from}\u300D\u6539\u540D\u4E3A\u300C${this.to}\u300D\uFF1F`;
+    const detail = document.createElement("p");
+    detail.textContent = this.count ? `\u91CC\u9762\u7684 ${this.count} \u4E2A\u6587\u4EF6\u4F1A\u4E00\u8D77\u79FB\u52A8\uFF0C\u5185\u5BB9\u4E0D\u53D8\u3002\u4E5F\u53EF\u4EE5\u4FDD\u7559\u65E7\u6587\u4EF6\u5939\uFF0C\u7A0D\u540E\u81EA\u5DF1\u6574\u7406\u3002` : "\u8FD9\u4E2A\u6587\u4EF6\u5939\u662F\u7A7A\u7684\uFF0C\u6539\u540D\u4E0D\u4F1A\u5F71\u54CD\u4EFB\u4F55\u5185\u5BB9\u3002";
+    const row = document.createElement("div");
+    row.className = "volis-rename-actions";
+    const cancel = document.createElement("button");
+    cancel.textContent = "\u6682\u65F6\u4E0D\u6539";
+    cancel.addEventListener("click", () => {
+      this.close();
+      this.onResult(false);
+    });
+    const confirm = document.createElement("button");
+    confirm.className = "mod-cta";
+    confirm.textContent = "\u6539\u540D\u5E76\u7EE7\u7EED";
+    confirm.addEventListener("click", () => {
+      this.close();
+      this.onResult(true);
+    });
+    row.appendChild(cancel);
+    row.appendChild(confirm);
+    el.appendChild(heading2);
+    el.appendChild(detail);
+    el.appendChild(row);
+  }
+  onClose() {
+    while (this.contentEl.firstChild)
+      this.contentEl.removeChild(this.contentEl.firstChild);
+  }
+};
 function svgEl(tag, attrs) {
-  const el = document.createElementNS(SVG_NS, tag);
+  const el = document.createElementNS(SVG_NS2, tag);
   for (const [key, value] of Object.entries(attrs))
     el.setAttribute(key, value);
   return el;
@@ -9330,7 +10723,7 @@ function svgEl(tag, attrs) {
 function paintRibbonIcon(host) {
   host.empty();
   const svg = svgEl("svg", {
-    xmlns: SVG_NS,
+    xmlns: SVG_NS2,
     viewBox: "0 0 24 24",
     width: "18",
     height: "18",
@@ -9362,9 +10755,11 @@ function paintRibbonIcon(host) {
   );
   host.appendChild(svg);
 }
-var VolisPlugin = class extends import_obsidian19.Plugin {
+var VolisPlugin = class extends import_obsidian21.Plugin {
   constructor() {
     super(...arguments);
+    this.workbenchStyleEl = null;
+    this.workbenchViewRef = null;
     this.observer = null;
     this.observedContainer = null;
     this.timer = null;
@@ -9394,13 +10789,144 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
     this.installInlineEditing();
     this.registerView(VIEW_TYPE_VOLIS_BOARD, (leaf) => new BoardView(leaf, this));
     this.registerExtensions(["volis"], VIEW_TYPE_VOLIS_BOARD);
+    this.installWorkbench();
     const ribbon = this.addRibbonIcon("dot", "Volis", () => {
-      void this.createBoard();
+      void this.openBoardGallery();
     });
     paintRibbonIcon(ribbon);
     this.app.workspace.onLayoutReady(() => {
       this.scheduleRefresh(300);
     });
+  }
+  /** Installs the board wall. volis's own board view, paths and commands stay
+   *  exactly as they were; this only adds one view and one folder entry point. */
+  installWorkbench() {
+    const style = document.createElement("style");
+    style.id = "volis-workbench-styles";
+    style.textContent = WORKBENCH_CSS;
+    document.head.appendChild(style);
+    this.workbenchStyleEl = style;
+    this.register(() => {
+      style.remove();
+      this.workbenchStyleEl = null;
+    });
+    this.registerView(VIEW_TYPE_WORKBENCH, (leaf) => {
+      const view = new BoardGalleryView(leaf, this);
+      this.workbenchViewRef = view;
+      return view;
+    });
+    this.addCommand({
+      id: "open-workbench",
+      name: "\u6253\u5F00\u753B\u5E03\u96C6",
+      callback: () => {
+        void this.openBoardGallery();
+      }
+    });
+  }
+  /** Single folder used by the wall. Users can change it in data.json. */
+  get workbenchFolder() {
+    var _a;
+    return ((_a = this.settings.workbench) == null ? void 0 : _a.boardFolder) || "\u753B\u5E03";
+  }
+  async ensureBoardFolder() {
+    const path = this.workbenchFolder;
+    const existing = this.app.vault.getAbstractFileByPath(path);
+    if (existing instanceof import_obsidian21.TFolder)
+      return;
+    if (existing) {
+      new import_obsidian21.Notice(`\u300C${path}\u300D\u5DF2\u662F\u4E00\u4E2A\u6587\u4EF6\uFF0C\u4E0D\u80FD\u4F5C\u4E3A\u753B\u5E03\u6587\u4EF6\u5939\u3002`);
+      return;
+    }
+    const legacy = this.app.vault.getAbstractFileByPath(LEGACY_WORKBENCH_FOLDER);
+    if (legacy instanceof import_obsidian21.TFolder && path !== LEGACY_WORKBENCH_FOLDER) {
+      const confirmed = await new Promise((resolve) => {
+        new RenameBoardFolderModal(
+          this.app,
+          LEGACY_WORKBENCH_FOLDER,
+          path,
+          legacy.children.length,
+          resolve
+        ).open();
+      });
+      if (confirmed) {
+        try {
+          await this.app.vault.rename(legacy, path);
+          return;
+        } catch (error) {
+          new import_obsidian21.Notice(error instanceof Error ? error.message : "\u6587\u4EF6\u5939\u6539\u540D\u5931\u8D25");
+        }
+      }
+    }
+    try {
+      await this.app.vault.createFolder(path);
+    } catch (error) {
+      new import_obsidian21.Notice(error instanceof Error ? error.message : "\u521B\u5EFA\u753B\u5E03\u6587\u4EF6\u5939\u5931\u8D25");
+    }
+  }
+  /** Ribbon / command entry: make the folder exist, then open or focus the
+   *  one board wall on the right. Never creates a second one. */
+  async openBoardGallery() {
+    var _a, _b, _c;
+    this.debugLog("openBoardGallery: start");
+    await this.ensureBoardFolder();
+    this.debugLog(`openBoardGallery: folder="${this.workbenchFolder}"`);
+    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_WORKBENCH);
+    this.debugLog(`openBoardGallery: existing leaves=${leaves.length}`);
+    const existing = leaves[0];
+    if (existing) {
+      await this.app.workspace.revealLeaf(existing);
+      this.app.workspace.setActiveLeaf(existing, { focus: true });
+      if (existing.view instanceof BoardGalleryView) {
+        existing.view.refreshWall();
+        this.debugLog("openBoardGallery: repainted existing view");
+      } else {
+        this.debugLog(
+          `openBoardGallery: existing view is ${(_c = (_b = (_a = existing.view) == null ? void 0 : _a.getViewType) == null ? void 0 : _b.call(_a)) != null ? _c : "unknown"}`
+        );
+        await existing.setViewState({ type: VIEW_TYPE_WORKBENCH, active: true });
+      }
+      return;
+    }
+    const leaf = this.app.workspace.getLeaf("tab");
+    try {
+      await leaf.setViewState({ type: VIEW_TYPE_WORKBENCH, active: true });
+      await this.app.workspace.revealLeaf(leaf);
+      this.app.workspace.setActiveLeaf(leaf, { focus: true });
+      this.debugLog("openBoardGallery: new tab created");
+    } catch (error) {
+      this.debugLog(`openBoardGallery: setViewState failed ${String(error)}`);
+      new import_obsidian21.Notice(
+        `\u65E0\u6CD5\u6253\u5F00\u753B\u5E03\u96C6\uFF1A${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+  /** Temporary runtime trace for the board wall. Writes inside the plugin
+   *  folder, never into notes, and never throws. */
+  debugLog(message) {
+    const line = `${(/* @__PURE__ */ new Date()).toISOString()} ${message}
+`;
+    const path = ".obsidian/plugins/volis/volis-debug.log";
+    const adapter = this.app.vault.adapter;
+    void (async () => {
+      try {
+        if (await adapter.exists(path))
+          await adapter.append(path, line);
+        else
+          await adapter.write(path, line);
+      } catch (e) {
+      }
+    })();
+  }
+  /** Create from inside the wall, so the file always lands in its folder. */
+  async createGalleryBoard() {
+    await this.ensureBoardFolder();
+    const file = await createBoardItem(this.app, this.workbenchFolder);
+    await this.openBoardFile(file.path);
+    this.refreshWorkbench();
+  }
+  refreshWorkbench() {
+    var _a;
+    (_a = this.workbenchViewRef) == null ? void 0 : _a.refreshWall();
   }
   async openBoard() {
     const boards = listBoards(this.app);
@@ -9425,7 +10951,7 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
   async openBoardFile(path) {
     var _a;
     const file = this.app.vault.getAbstractFileByPath(path);
-    if (!(file instanceof import_obsidian19.TFile))
+    if (!(file instanceof import_obsidian21.TFile))
       return;
     for (const leaf2 of this.app.workspace.getLeavesOfType(VIEW_TYPE_VOLIS_BOARD)) {
       const view = leaf2.view;
@@ -9457,7 +10983,8 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
       ...DEFAULT_SETTINGS,
       ...loaded != null ? loaded : {},
       ai: normalizeAISettings(loaded == null ? void 0 : loaded.ai),
-      conversations: Array.isArray(loaded == null ? void 0 : loaded.conversations) ? loaded.conversations : []
+      conversations: Array.isArray(loaded == null ? void 0 : loaded.conversations) ? loaded.conversations : [],
+      workbench: normalizeWorkbenchSettings(loaded == null ? void 0 : loaded.workbench)
     };
   }
   async saveSettings() {
@@ -9563,7 +11090,7 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
         nodeElClass: (_c = (_b = first.nodeEl) == null ? void 0 : _b.className) != null ? _c : null
       });
     }
-    new import_obsidian19.Notice(
+    new import_obsidian21.Notice(
       `Volis \u81EA\u68C0 \xB7 \u753B\u5E03:${view ? "\u6709" : "\u65E0"} \xB7 \u8282\u70B9:${nodes.length} \xB7 \u8BC6\u522B:${this.index.size}`,
       1e4
     );
@@ -9613,9 +11140,9 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
         const view = this.getCanvasView();
         if (!view)
           return;
-        const node = this.findNodeByElement(view, nodeEl);
-        const nodeId = (_c = (_b = (_a = node == null ? void 0 : node.getData) == null ? void 0 : _a.call(node)) == null ? void 0 : _b.id) != null ? _c : node == null ? void 0 : node.id;
-        if (!node || !nodeId)
+        const node2 = this.findNodeByElement(view, nodeEl);
+        const nodeId = (_c = (_b = (_a = node2 == null ? void 0 : node2.getData) == null ? void 0 : _a.call(node2)) == null ? void 0 : _b.id) != null ? _c : node2 == null ? void 0 : node2.id;
+        if (!node2 || !nodeId)
           return;
         const meta = (_d = this.index.get(nodeId)) == null ? void 0 : _d.meta;
         if (!meta || meta.stale)
@@ -9625,7 +11152,7 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
           nodeEl,
           x: evt.clientX,
           y: evt.clientY,
-          wasSelected: isNodeSelected(view, node, nodeId)
+          wasSelected: isNodeSelected(view, node2, nodeId)
         };
       },
       true
@@ -9679,12 +11206,12 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
   }
   findNodeByElement(view, el) {
     var _a;
-    for (const node of collectNodes((_a = view.canvas) == null ? void 0 : _a.nodes)) {
-      const nodeEl = node.nodeEl;
+    for (const node2 of collectNodes((_a = view.canvas) == null ? void 0 : _a.nodes)) {
+      const nodeEl = node2.nodeEl;
       if (!nodeEl)
         continue;
       if (nodeEl === el || nodeEl.contains(el))
-        return node;
+        return node2;
     }
     return null;
   }
@@ -9696,7 +11223,7 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
       meta.editable,
       async (value) => {
         if (!value.trim()) {
-          new import_obsidian19.Notice("\u5185\u5BB9\u4E3A\u7A7A\uFF0C\u672A\u4FDD\u5B58");
+          new import_obsidian21.Notice("\u5185\u5BB9\u4E3A\u7A7A\uFF0C\u672A\u4FDD\u5B58");
           this.scheduleRefresh(0);
           return;
         }
@@ -9705,7 +11232,7 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
           return;
         const ok = await writeCard(this.app, meta.ref, next);
         if (!ok) {
-          new import_obsidian19.Notice("\u4FDD\u5B58\u5931\u8D25\uFF1A\u5361\u7247\u53EF\u80FD\u5DF2\u79FB\u52A8\u6216\u5220\u9664");
+          new import_obsidian21.Notice("\u4FDD\u5B58\u5931\u8D25\uFF1A\u5361\u7247\u53EF\u80FD\u5DF2\u79FB\u52A8\u6216\u5220\u9664");
           return;
         }
         this.index.clear();
@@ -9728,7 +11255,7 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
     this.registerEvent(this.app.workspace.on("file-open", () => this.scheduleRefresh(150)));
     this.registerEvent(
       this.app.metadataCache.on("changed", (file) => {
-        if (file instanceof import_obsidian19.TFile)
+        if (file instanceof import_obsidian21.TFile)
           this.sync.handleModify(file);
       })
     );
@@ -9873,7 +11400,7 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
           return false;
         if (!checking) {
           void navigator.clipboard.writeText(makeBlockLink(meta.ref)).then(() => {
-            new import_obsidian19.Notice("\u5DF2\u590D\u5236\u5757\u94FE\u63A5");
+            new import_obsidian21.Notice("\u5DF2\u590D\u5236\u5757\u94FE\u63A5");
           });
         }
         return true;
@@ -9913,7 +11440,7 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
         if (!ctx.entry.meta)
           return;
         await navigator.clipboard.writeText(makeBlockLink(ctx.entry.meta.ref));
-        new import_obsidian19.Notice("\u5DF2\u590D\u5236\u5757\u94FE\u63A5");
+        new import_obsidian21.Notice("\u5DF2\u590D\u5236\u5757\u94FE\u63A5");
       }
     });
     this.registry.register({
@@ -9939,18 +11466,18 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
     var _a, _b, _c, _d, _e, _f, _g;
     const view = this.getCanvasView();
     const canvas = view == null ? void 0 : view.canvas;
-    let node = nodeId ? (_b = (_a = canvas == null ? void 0 : canvas.get) == null ? void 0 : _a.call(canvas, nodeId)) != null ? _b : null : null;
-    if (!node) {
+    let node2 = nodeId ? (_b = (_a = canvas == null ? void 0 : canvas.get) == null ? void 0 : _a.call(canvas, nodeId)) != null ? _b : null : null;
+    if (!node2) {
       for (const candidate of collectNodes(canvas == null ? void 0 : canvas.nodes)) {
         const entry = this.index.get((_f = (_e = (_d = (_c = candidate.getData) == null ? void 0 : _c.call(candidate)) == null ? void 0 : _d.id) != null ? _e : candidate.id) != null ? _f : "");
         const ref = (_g = entry == null ? void 0 : entry.meta) == null ? void 0 : _g.ref;
         if (ref && ref.file === meta.ref.file && ref.blockId === meta.ref.blockId) {
-          node = candidate;
+          node2 = candidate;
           break;
         }
       }
     }
-    const nodeEl = node == null ? void 0 : node.nodeEl;
+    const nodeEl = node2 == null ? void 0 : node2.nodeEl;
     if (nodeEl) {
       this.openInline(nodeEl, meta);
       return;
@@ -9965,8 +11492,8 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
   async locateCard(meta) {
     var _a, _b, _c, _d, _e;
     const file = this.app.vault.getAbstractFileByPath(meta.ref.file);
-    if (!(file instanceof import_obsidian19.TFile)) {
-      new import_obsidian19.Notice("\u627E\u4E0D\u5230\u6E90\u6587\u4EF6");
+    if (!(file instanceof import_obsidian21.TFile)) {
+      new import_obsidian21.Notice("\u627E\u4E0D\u5230\u6E90\u6587\u4EF6");
       return;
     }
     const cache = this.app.metadataCache.getFileCache(file);
@@ -9977,27 +11504,27 @@ var VolisPlugin = class extends import_obsidian19.Plugin {
   removeNode(ctx) {
     var _a, _b;
     const canvas = ctx.canvasView.canvas;
-    const node = (_b = (_a = canvas == null ? void 0 : canvas.get) == null ? void 0 : _a.call(canvas, ctx.nodeId)) != null ? _b : null;
+    const node2 = (_b = (_a = canvas == null ? void 0 : canvas.get) == null ? void 0 : _a.call(canvas, ctx.nodeId)) != null ? _b : null;
     try {
-      if (node && (canvas == null ? void 0 : canvas.removeNode)) {
-        canvas.removeNode(node);
-      } else if (node == null ? void 0 : node.remove) {
-        node.remove();
+      if (node2 && (canvas == null ? void 0 : canvas.removeNode)) {
+        canvas.removeNode(node2);
+      } else if (node2 == null ? void 0 : node2.remove) {
+        node2.remove();
       } else {
         return;
       }
       this.scheduleRefresh(150);
     } catch (error) {
-      new import_obsidian19.Notice("\u65E0\u6CD5\u79FB\u9664\u8BE5\u8282\u70B9");
+      new import_obsidian21.Notice("\u65E0\u6CD5\u79FB\u9664\u8BE5\u8282\u70B9");
     }
   }
 };
-function isNodeSelected(view, node, nodeId) {
+function isNodeSelected(view, node2, nodeId) {
   var _a, _b, _c, _d;
   const selection = (_a = view.canvas) == null ? void 0 : _a.selection;
   if (!selection)
     return false;
-  if (selection instanceof Set && selection.has(node))
+  if (selection instanceof Set && selection.has(node2))
     return true;
   for (const item of Array.from(selection)) {
     const id = (_d = item.id) != null ? _d : (_c = (_b = item.getData) == null ? void 0 : _b.call(item)) == null ? void 0 : _c.id;
